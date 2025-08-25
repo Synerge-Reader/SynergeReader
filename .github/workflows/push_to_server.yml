@@ -1,0 +1,26 @@
+name: Push Repo to Server
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: self-hosted  # ensures it uses your NVIDIA runner
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+
+      - name: Copy Repo Files to Server Folder
+        run: |
+          # Path where you want the repo files on the server
+          TARGET_DIR="/home/legal-read-2025/julian_test/repo"
+
+          # Create the folder if it doesn't exist
+          mkdir -p $TARGET_DIR
+
+          # Copy all files from runner workspace to target
+          rsync -av --exclude='.github' ./ $TARGET_DIR/
+
+      - name: Confirm
+        run: ls -l /home/ubuntu/deployed-repo
