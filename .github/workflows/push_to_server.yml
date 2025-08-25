@@ -11,10 +11,14 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v3
 
-      - name: Copy Repo Files to Server Folder
+      - name: Delete Old Repo Files & Copy New Repo Files to Server Folder
         run: |
           # Path where you want the repo files on the server
           TARGET_DIR="/home/legal-read-2025/julian_test/repo"
+
+          rm -rf $TARGET_DIR/*
+          mkdir -p $TARGET_DIR
+          rsync -av ./ $TARGET_DIR/
 
           # Create the folder if it doesn't exist
           mkdir -p $TARGET_DIR
@@ -23,4 +27,4 @@ jobs:
           rsync -av --exclude='.github' ./ $TARGET_DIR/
 
       - name: Confirm
-        run: ls -l /home/ubuntu/deployed-repo
+        run: ls -l /home/legal-read-2025/julian_test/repo
