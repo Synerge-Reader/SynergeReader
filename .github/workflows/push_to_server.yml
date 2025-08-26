@@ -6,25 +6,27 @@ on:
 
 jobs:
   deploy:
-    runs-on: self-hosted  # ensures it uses your NVIDIA runner
+    runs-on: self-hosted  # this runs directly on your server
+
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v3
 
-      - name: Delete Old Repo Files & Copy New Repo Files to Server Folder
+      - name: Sync Repo to Target Directory
         run: |
-          # Path where you want the repo files on the server
           TARGET_DIR="/home/legal-read-2025/julian_test/repo"
 
+          # clean up and re-copy
           rm -rf $TARGET_DIR/*
           mkdir -p $TARGET_DIR
-          rsync -av ./ $TARGET_DIR/
-
-          # Create the folder if it doesn't exist
-          mkdir -p $TARGET_DIR
-
-          # Copy all files from runner workspace to target
           rsync -av --exclude='.github' ./ $TARGET_DIR/
 
-      - name: Confirm
+      - name: Confirm Files
         run: ls -l /home/legal-read-2025/julian_test/repo
+
+      - name: Deploy with Docker Compose
+        run: |
+          cd /home/legal-read-2025/julian_test/repo
+          docker compose down         # stop old containers
+          docker compose build        # rebuild images
+          docker compose up -d        # start fresh in background
