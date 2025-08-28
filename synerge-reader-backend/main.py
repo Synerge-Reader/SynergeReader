@@ -12,8 +12,8 @@ app = FastAPI(title="SynergeReader API", version="1.0.0")
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origin_regex=".*",  # allows all origins
+    allow_credentials=True,   # allows cookies/headers if needed
     allow_methods=["*"],
     allow_headers=["*"],
 )
