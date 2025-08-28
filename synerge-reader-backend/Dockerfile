@@ -24,4 +24,4 @@ RUN mkdir -p chroma_db uploads
 EXPOSE 5000
 
 # Run the application
-CMD ["uvicorn", "main:app", "--port", "5000", "--reload"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5000", "--reload"]
