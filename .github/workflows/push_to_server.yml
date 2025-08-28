@@ -11,25 +11,27 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v3
 
-      # 1️⃣ Sync repository to target directory, preserving .env
+      # 1️⃣ Sync repository to target directory, preserving frontend .env
       - name: Sync Repo to Target Directory
         run: |
           TARGET_DIR="/home/legal-read-2025/julian_test/repo"
+          FRONTEND_DIR="$TARGET_DIR/synerge-reader-frontend"
 
-          # Remove everything EXCEPT .env
+          # Remove everything EXCEPT frontend/.env
           shopt -s extglob
-          rm -rf $TARGET_DIR/!(".env")
+          rm -rf $TARGET_DIR/!(synerge-reader-frontend)
+          rm -rf $FRONTEND_DIR/!(".env")
           mkdir -p $TARGET_DIR
           rsync -av --exclude='.github' ./ $TARGET_DIR/
 
       # 2️⃣ Confirm files
       - name: Confirm Files
-        run: ls -l /home/legal-read-2025/julian_test/repo
+        run: ls -lR /home/legal-read-2025/julian_test/repo
 
       # 3️⃣ Deploy with Docker Compose
       - name: Deploy with Docker Compose
         run: |
           cd /home/legal-read-2025/julian_test/repo
           docker compose down         # stop old containers
-          docker compose build        # rebuild images (frontend sees updated .env)
+          docker compose build        # rebuild images (frontend sees preserved .env)
           docker compose up -d        # start fresh in background
