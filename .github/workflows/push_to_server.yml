@@ -1,6 +1,5 @@
 name: Deploy SynergeReader
 
-# 1️⃣ Manual trigger
 on:
   workflow_dispatch:
 
@@ -12,36 +11,22 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v3
 
-      # 2️⃣ Get runner IP and set as environment variable
-      - name: Get Runner IP
-        id: get_ip
-        run: |
-          IP=$(hostname -I | awk '{print $1}')
-          echo "RUNNER_IP=$IP" >> $GITHUB_ENV
-
-      # 3️⃣ Sync repository to target directory
+      # 1️⃣ Sync repository to target directory, preserving .env
       - name: Sync Repo to Target Directory
         run: |
           TARGET_DIR="/home/legal-read-2025/julian_test/repo"
 
-          # clean up and re-copy
-          rm -rf $TARGET_DIR/*
+          # Remove everything EXCEPT .env
+          shopt -s extglob
+          rm -rf $TARGET_DIR/!(".env")
           mkdir -p $TARGET_DIR
           rsync -av --exclude='.github' ./ $TARGET_DIR/
 
-      # 4️⃣ Create frontend .env for React
-      - name: Create Frontend .env
-        run: |
-          FRONTEND_DIR="/home/legal-read-2025/julian_test/repo/synerge-reader-frontend"
-          mkdir -p $FRONTEND_DIR
-          echo "REACT_APP_BACKEND_URL=http://$RUNNER_IP" > $FRONTEND_DIR/.env
-          cat $FRONTEND_DIR/.env
-
-      # 5️⃣ Confirm files
+      # 2️⃣ Confirm files
       - name: Confirm Files
         run: ls -l /home/legal-read-2025/julian_test/repo
 
-      # 6️⃣ Deploy with Docker Compose
+      # 3️⃣ Deploy with Docker Compose
       - name: Deploy with Docker Compose
         run: |
           cd /home/legal-read-2025/julian_test/repo
