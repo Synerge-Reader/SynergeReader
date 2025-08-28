@@ -16,7 +16,9 @@ function App() {
   const [history, setHistory] = useState([]);
 
   useEffect(() => {
-    fetch(`${process.env.REACT_APP_BACKEND_URL}/test`)
+    fetch(`${process.env.REACT_APP_BACKEND_URL}/test`), {
+      mode: "cors",
+    }
       .then((res) => res.json())
       .then((data) => setBackendMsg(data.message))
       .catch(() => setBackendMsg("Could not connect to backend."));
