@@ -16,11 +16,11 @@ function App() {
   const [history, setHistory] = useState([]);
 
   useEffect(() => {
-    fetch("http://localhost:5000/test")
+    fetch(`${process.env.REACT_APP_BACKEND_URL}/test`)
       .then((res) => res.json())
       .then((data) => setBackendMsg(data.message))
       .catch(() => setBackendMsg("Could not connect to backend."));
-    fetch("http://localhost:5000/history")
+    fetch(`${process.env.REACT_APP_BACKEND_URL}/history`)
       .then((res) => res.json())
       .then((data) => setHistory(data))
       .catch(() => setHistory([]));
@@ -40,7 +40,7 @@ function App() {
     }
 
     setIsLoading(true);
-    fetch("http://localhost:5000/ask", {
+    fetch(`${process.env.REACT_APP_BACKEND_URL}/ask`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ 
@@ -54,7 +54,7 @@ function App() {
         setIsLoading(false);
         setAskOpen(false);
         // Refresh history
-        fetch("http://localhost:5000/history")
+        fetch(`${process.env.REACT_APP_BACKEND_URL}/history`)
           .then((res) => res.json())
           .then((data) => setHistory(data));
       })
