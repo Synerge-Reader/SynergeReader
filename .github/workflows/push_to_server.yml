@@ -34,7 +34,7 @@ jobs:
         run: |
           FRONTEND_DIR="/home/legal-read-2025/julian_test/repo/synerge-reader-frontend"
           mkdir -p $FRONTEND_DIR
-          echo "REACT_APP_BACKEND_URL=http://$RUNNER_IP:5000" > $FRONTEND_DIR/.env
+          echo "REACT_APP_BACKEND_URL=http://$RUNNER_IP" > $FRONTEND_DIR/.env
           cat $FRONTEND_DIR/.env
 
       # 5️⃣ Confirm files
