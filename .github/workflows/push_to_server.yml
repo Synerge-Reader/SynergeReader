@@ -49,9 +49,18 @@ jobs:
           cd /home/legal-read-2025/julian_test/repo/synerge-reader-frontend
           npm install
 
-      # 5️⃣ Restart systemd services
+      # 5️⃣ Stop any processes using the ports and restart services
       - name: Restart Services
         run: |
+          # Kill any processes using port 5000 (backend) and 3000 (frontend)
+          sudo pkill -f "uvicorn.*5000" || true
+          sudo pkill -f "npm.*start" || true
+          sudo pkill -f "node.*3000" || true
+          
+          # Wait a moment for processes to fully stop
+          sleep 2
+          
+          # Restart services
           sudo systemctl daemon-reload
           sudo systemctl restart synerge-backend
           sudo systemctl restart synerge-frontend
