@@ -16,6 +16,7 @@ function App() {
   const [history, setHistory] = useState([]);
 
   useEffect(() => {
+    console.log(process.env.REACT_APP_BACKEND_URL)
     fetch(`${process.env.REACT_APP_BACKEND_URL}/test`)
       .then((res) => res.json())
       .then((data) => setBackendMsg(data.message))
