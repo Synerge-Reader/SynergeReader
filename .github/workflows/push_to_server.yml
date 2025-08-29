@@ -29,9 +29,7 @@ jobs:
         run: ls -lR /home/legal-read-2025/julian_test/repo
 
       # 3️⃣ Deploy with Docker Compose
-      - name: Deploy with Docker Compose
+      - name: Restart Services
         run: |
-          cd /home/legal-read-2025/julian_test/repo
-          docker compose down         # stop old containers
-          docker compose build        # rebuild images (frontend sees preserved .env)
-          docker compose up -d        # start fresh in background
+          sudo systemctl restart synerge-backend
+          sudo systemctl restart synerge-frontend

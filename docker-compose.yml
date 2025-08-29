@@ -25,8 +25,7 @@ services:
       - ./synerge-reader-frontend:/app
       - /app/node_modules
     environment:
-      - REACT_APP_BACKEND_TEST=http://backend:5000
-
+      - REACT_APP_API_URL=http://localhost:5000
     depends_on:
       - backend
     restart: unless-stopped
