@@ -14,7 +14,7 @@ jobs:
       # 1️⃣ Sync repository to target directory, preserving frontend .env
       - name: Sync Repo to Target Directory
         run: |
-          TARGET_DIR="/home/legal-read-2025/julian_test/repo"
+          TARGET_DIR="/home/legal-read-2025/repo"
           FRONTEND_DIR="$TARGET_DIR/synerge-reader-frontend"
           BACKEND_DIR="$TARGET_DIR/synerge-reader-backend"
 
@@ -27,12 +27,12 @@ jobs:
 
       # 2️⃣ Confirm files
       - name: Confirm Files
-        run: ls -lR /home/legal-read-2025/julian_test/repo
+        run: ls -lR /home/legal-read-2025/repo
 
       # 3️⃣ Remove old venv if exists, create new one, install dependencies
       - name: Rebuild Backend Venv
         run: |
-          cd /home/legal-read-2025/julian_test/repo/synerge-reader-backend
+          cd /home/legal-read-2025/repo/synerge-reader-backend
           # Remove old venv if it exists
           if [ -d "venv" ]; then
             rm -rf venv
@@ -46,7 +46,7 @@ jobs:
       # 4️⃣ Ensure frontend dependencies are installed
       - name: Setup Frontend
         run: |
-          cd /home/legal-read-2025/julian_test/repo/synerge-reader-frontend
+          cd /home/legal-read-2025/repo/synerge-reader-frontend
           npm install
 
       # 5️⃣ Stop any processes using the ports and restart services
