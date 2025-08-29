@@ -16,6 +16,7 @@ jobs:
         run: |
           TARGET_DIR="/home/legal-read-2025/julian_test/repo"
           FRONTEND_DIR="$TARGET_DIR/synerge-reader-frontend"
+          BACKEND_DIR="$TARGET_DIR/synerge-reader-backend"
 
           # Remove everything EXCEPT frontend/.env
           shopt -s extglob
@@ -28,8 +29,31 @@ jobs:
       - name: Confirm Files
         run: ls -lR /home/legal-read-2025/julian_test/repo
 
-      # 3️⃣ Deploy with Docker Compose
+      # 3️⃣ Remove old venv if exists, create new one, install dependencies
+      - name: Rebuild Backend Venv
+        run: |
+          cd /home/legal-read-2025/julian_test/repo/synerge-reader-backend
+          # Remove old venv if it exists
+          if [ -d "venv" ]; then
+            rm -rf venv
+          fi
+          # Create fresh venv
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requiredInstall.txt
+
+      # 4️⃣ Ensure frontend dependencies are installed
+      - name: Setup Frontend
+        run: |
+          cd /home/legal-read-2025/julian_test/repo/synerge-reader-frontend
+          npm install
+
+      # 5️⃣ Restart systemd services
       - name: Restart Services
         run: |
+          sudo systemctl daemon-reload
           sudo systemctl restart synerge-backend
           sudo systemctl restart synerge-frontend
+          sudo systemctl status synerge-backend
+          sudo systemctl status synerge-frontend
