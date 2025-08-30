@@ -5,62 +5,48 @@ on:
 
 jobs:
   deploy:
-    runs-on: self-hosted  # runs on your self-hosted runner
+    runs-on: self-hosted
 
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v3
 
-      # 1️⃣ Sync repository to target directory, preserving frontend .env
-      - name: Sync Repo to Target Directory
+      - name: Ensure Directories Exist & Ownership
+        run: |
+          TARGET_DIR="/home/legal-read-2025/repo"
+          BACKEND_DIR="$TARGET_DIR/synerge-reader-backend"
+          FRONTEND_DIR="$TARGET_DIR/synerge-reader-frontend"
+          mkdir -p $BACKEND_DIR $FRONTEND_DIR
+          sudo chown -R legal-read-2025:legal-read-2025 $TARGET_DIR
+
+      - name: Sync Repo (Preserve .env)
         run: |
           TARGET_DIR="/home/legal-read-2025/repo"
           FRONTEND_DIR="$TARGET_DIR/synerge-reader-frontend"
-          BACKEND_DIR="$TARGET_DIR/synerge-reader-backend"
-
-          # Remove everything EXCEPT frontend/.env
           shopt -s extglob
           rm -rf $TARGET_DIR/!(synerge-reader-frontend)
           rm -rf $FRONTEND_DIR/!(".env")
-          mkdir -p $TARGET_DIR
           rsync -av --exclude='.github' ./ $TARGET_DIR/
 
-      # 2️⃣ Confirm files
-      - name: Confirm Files
-        run: ls -lR /home/legal-read-2025/repo
-
-      # 3️⃣ Remove old venv if exists, create new one, install dependencies
-      - name: Rebuild Backend Venv
+      - name: Rebuild Backend
         run: |
           cd /home/legal-read-2025/repo/synerge-reader-backend
-          # Remove old venv if it exists
-          if [ -d "venv" ]; then
-            rm -rf venv
-          fi
-          # Create fresh venv
+          rm -rf venv || true
           python3 -m venv venv
           source venv/bin/activate
           pip install --upgrade pip
           pip install -r requiredInstall.txt
 
-      # 4️⃣ Ensure frontend dependencies are installed
       - name: Setup Frontend
         run: |
           cd /home/legal-read-2025/repo/synerge-reader-frontend
           npm install
 
-      # 5️⃣ Stop any processes using the ports and restart services
       - name: Restart Services
         run: |
-          # Kill any processes using port 5000 (backend) and 3000 (frontend)
           sudo pkill -f "uvicorn.*5000" || true
           sudo pkill -f "npm.*start" || true
-          sudo pkill -f "node.*3000" || true
-          
-          # Wait a moment for processes to fully stop
           sleep 2
-          
-          # Restart services
           sudo systemctl daemon-reload
           sudo systemctl restart synerge-backend
           sudo systemctl restart synerge-frontend
