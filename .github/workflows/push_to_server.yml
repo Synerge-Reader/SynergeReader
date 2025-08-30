@@ -41,6 +41,7 @@ jobs:
         run: |
           cd /home/legal-read-2025/repo/synerge-reader-frontend
           npm install
+          sudo chown -R legal-read-2025:legal-read-2025 node_modules
 
       - name: Restart Services
         run: |
