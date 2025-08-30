@@ -17,7 +17,6 @@ jobs:
           BACKEND_DIR="$TARGET_DIR/synerge-reader-backend"
           FRONTEND_DIR="$TARGET_DIR/synerge-reader-frontend"
           mkdir -p $BACKEND_DIR $FRONTEND_DIR
-          sudo chown -R legal-read-2025:legal-read-2025 $TARGET_DIR
 
       - name: Sync Repo (Preserve .env)
         run: |
@@ -41,7 +40,6 @@ jobs:
         run: |
           cd /home/legal-read-2025/repo/synerge-reader-frontend
           npm install
-          sudo chown -R legal-read-2025:legal-read-2025 node_modules
 
       - name: Restart Services
         run: |
