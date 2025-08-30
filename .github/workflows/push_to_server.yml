@@ -1,29 +1,19 @@
-name: Deploy SynergeReader
+- name: Check Running User
+  run: whoami
 
-on:
-  workflow_dispatch:
+- name: Ensure Repo Directory
+  run: |
+    whoami
+    TARGET_DIR="/home/legal-read-2025/repo"
+    mkdir -p $TARGET_DIR
+    rsync -av --exclude='.github' ./ $TARGET_DIR/
+    whoami
 
-jobs:
-  deploy:
-    runs-on: self-hosted
-
-    steps:
-      - name: Checkout Repo
-        uses: actions/checkout@v3
-
-      - name: Ensure Repo Directory
-        run: |
-          TARGET_DIR="/home/legal-read-2025/repo"
-          mkdir -p $TARGET_DIR
-          rsync -av --exclude='.github' ./ $TARGET_DIR/
-
-      - name: Build & Start Containers
-        run: |
-          cd /home/legal-read-2025/repo
-          docker-compose down
-          docker-compose build --no-cache
-          docker-compose up -d
-          
-      - name: Show Container Status
-        run: |
-          docker ps
+- name: Build & Start Containers
+  run: |
+    whoami
+    cd /home/legal-read-2025/repo
+    docker-compose down
+    docker-compose build --no-cache
+    docker-compose up -d
+    whoami
