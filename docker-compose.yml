@@ -8,9 +8,9 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      - ./synerge-reader-backend:/app
-      - chroma_data:/app/chroma_db
-      - sqlite_data:/app
+      - ./synerge-reader-backend:/app          # host code
+      - chroma_data:/app/chroma_db             # persistent Chroma DB
+      - sqlite_data:/app/db                     # persistent SQLite DB
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
