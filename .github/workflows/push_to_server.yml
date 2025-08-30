@@ -11,43 +11,19 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v3
 
-      - name: Ensure Directories Exist & Ownership
+      - name: Ensure Repo Directory
         run: |
           TARGET_DIR="/home/legal-read-2025/repo"
-          BACKEND_DIR="$TARGET_DIR/synerge-reader-backend"
-          FRONTEND_DIR="$TARGET_DIR/synerge-reader-frontend"
-          mkdir -p $BACKEND_DIR $FRONTEND_DIR
+          mkdir -p $TARGET_DIR
+          rsync -av --exclude='.github' ./ $TARGET_DIR/
 
-      - name: Sync Repo (Preserve .env)
+      - name: Build & Start Containers
         run: |
-          TARGET_DIR="/home/legal-read-2025/repo"
-          FRONTEND_DIR="$TARGET_DIR/synerge-reader-frontend"
-          shopt -s extglob
-          rm -rf $TARGET_DIR/!(synerge-reader-frontend)
-          rm -rf $FRONTEND_DIR/!(".env")
-          rsync -av --chown=legal-read-2025:legal-read-2025 --exclude='.github' ./ $TARGET_DIR/
-
-      - name: Rebuild Backend
+          cd /home/legal-read-2025/repo
+          docker-compose down
+          docker-compose build --no-cache
+          docker-compose up -d
+          
+      - name: Show Container Status
         run: |
-          cd /home/legal-read-2025/repo/synerge-reader-backend
-          rm -rf venv || true
-          python3 -m venv venv
-          source venv/bin/activate
-          pip install --upgrade pip
-          pip install -r requiredInstall.txt
-
-      - name: Setup Frontend
-        run: |
-          cd /home/legal-read-2025/repo/synerge-reader-frontend
-          npm install
-
-      - name: Restart Services
-        run: |
-          sudo pkill -f "uvicorn.*5000" || true
-          sudo pkill -f "npm.*start" || true
-          sleep 2
-          sudo systemctl daemon-reload
-          sudo systemctl restart synerge-backend
-          sudo systemctl restart synerge-frontend
-          sudo systemctl status synerge-backend
-          sudo systemctl status synerge-frontend
+          docker ps
