@@ -26,7 +26,7 @@ jobs:
           shopt -s extglob
           rm -rf $TARGET_DIR/!(synerge-reader-frontend)
           rm -rf $FRONTEND_DIR/!(".env")
-          rsync -av --exclude='.github' ./ $TARGET_DIR/
+          rsync -av --chown=legal-read-2025:legal-read-2025 --exclude='.github' ./ $TARGET_DIR/
 
       - name: Rebuild Backend
         run: |
