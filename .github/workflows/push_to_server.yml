@@ -1,12 +1,13 @@
 name: Deploy SynergeReader
 
+# 1️⃣ Manual trigger
 on:
   workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: self-hosted
-
+    
     steps:
       - name: Check Runner User
         run: whoami
@@ -14,7 +15,15 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v3
 
-      - name: Ensure Repo Directory
+      # 2️⃣ Get runner IP and set as environment variable
+      - name: Get Runner IP
+        id: get_ip
+        run: |
+          IP=$(hostname -I | awk '{print $1}')
+          echo "RUNNER_IP=$IP" >> $GITHUB_ENV
+
+      # 3️⃣ Sync repository to target directory
+      - name: Sync Repo to Target Directory
         run: |
           echo "Before step: $(whoami)"
           TARGET_DIR="/home/legal-read-2025/repo"
