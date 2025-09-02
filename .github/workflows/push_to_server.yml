@@ -6,9 +6,12 @@ on:
 
 jobs:
   deploy:
-    runs-on: self-hosted  # runs on your self-hosted runner
-
+    runs-on: self-hosted
+    
     steps:
+      - name: Check Runner User
+        run: whoami
+
       - name: Checkout Repo
         uses: actions/checkout@v3
 
@@ -22,29 +25,23 @@ jobs:
       # 3️⃣ Sync repository to target directory
       - name: Sync Repo to Target Directory
         run: |
-          TARGET_DIR="/home/legal-read-2025/julian_test/repo"
-
-          # clean up and re-copy
-          rm -rf $TARGET_DIR/*
+          echo "Before step: $(whoami)"
+          TARGET_DIR="/home/legal-read-2025/repo"
           mkdir -p $TARGET_DIR
           rsync -av --exclude='.github' ./ $TARGET_DIR/
+          echo "After step: $(whoami)"
 
-      # 4️⃣ Create frontend .env for React
-      - name: Create Frontend .env
+      - name: Build & Start Containers
         run: |
-          FRONTEND_DIR="/home/legal-read-2025/julian_test/repo/synerge-reader-frontend"
-          mkdir -p $FRONTEND_DIR
-          echo "REACT_APP_BACKEND_URL=http://$RUNNER_IP" > $FRONTEND_DIR/.env
-          cat $FRONTEND_DIR/.env
+          echo "Before step: $(whoami)"
+          cd /home/legal-read-2025/repo
+          docker-compose down
+          docker-compose build --no-cache
+          docker-compose up -d
+          echo "After step: $(whoami)"
 
-      # 5️⃣ Confirm files
-      - name: Confirm Files
-        run: ls -l /home/legal-read-2025/julian_test/repo
-
-      # 6️⃣ Deploy with Docker Compose
-      - name: Deploy with Docker Compose
+      - name: Show Container Status
         run: |
-          cd /home/legal-read-2025/julian_test/repo
-          docker compose down         # stop old containers
-          docker compose build        # rebuild images (frontend sees updated .env)
-          docker compose up -d        # start fresh in background
+          echo "Before step: $(whoami)"
+          docker ps
+          echo "After step: $(whoami)"
