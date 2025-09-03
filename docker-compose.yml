@@ -1,5 +1,9 @@
 version: '3.8'
 
+networks:
+  default:
+    external: true
+    name: agent_network
 services:
   backend:
     build:
