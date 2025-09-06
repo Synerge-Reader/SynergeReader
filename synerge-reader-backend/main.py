@@ -33,6 +33,7 @@ class AskRequest(BaseModel):
 
 class AskResponse(BaseModel):
     answer: str
+    question: str
     context_chunks: List[str]
     relevant_history: List[dict]
 
