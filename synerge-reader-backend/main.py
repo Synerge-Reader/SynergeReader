@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import sqlite3
 import os
 import datetime
@@ -383,58 +384,65 @@ async def upload_document(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
 
-@app.post("/ask", response_model=AskResponse)
+@app.post("/ask")
 async def ask_question(request: AskRequest):
-    """Ask a question and get LLM answer with context from uploaded documents"""
+    """Ask a question and stream LLM answer with context from uploaded documents"""
     try:
-        # Analyze the question
-        question_analysis = analyze_question(request.question, request.selected_text)
-        
         # Get relevant chunks from uploaded documents
         context_chunks = get_relevant_chunks(request.question, top_k=3)
-        
-        # If no uploaded documents, fall back to selected text as context
         if not context_chunks and request.selected_text:
             context_chunks = [request.selected_text]
         elif not context_chunks:
             context_chunks = ["No relevant context found in uploaded documents."]
-        
+
         # Get relevant history
         relevant_history = get_relevant_history(request.question, request.selected_text)
-        
-        # Call LLM with enhanced context
-        answer = call_llm(
-            request.question, 
-            context_chunks, 
-            request.selected_text, 
-            relevant_history,
-            request.model
-        )
-        
-        # Store in SQLite history
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO chat_history (ts, selected_text, question, answer) 
-            VALUES (?, ?, ?, ?)
-        ''', (
-            datetime.datetime.now().isoformat(),
-            request.selected_text,
-            request.question,
-            answer
-        ))
-        conn.commit()
-        conn.close()
-        
-        return AskResponse(
-            answer=answer,
-            context_chunks=context_chunks,
-            relevant_history=relevant_history,
-            question=request.question
-        )
-        
+
+        # Build prompt
+        prompt_parts = []
+        if relevant_history:
+            history_text = "\n".join(
+                f"Previous Q: {h['question']}\nPrevious A: {h['answer']}"
+                for h in relevant_history
+            )
+            prompt_parts.append(f"Relevant History:\n{history_text}")
+
+        if context_chunks:
+            prompt_parts.append(f"Document Context:\n" + "\n\n".join(context_chunks))
+
+        if request.selected_text:
+            prompt_parts.append(f"Selected Text:\n{request.selected_text}")
+
+        prompt_parts.append(f"Question:\n{request.question}")
+        prompt = "\n\n".join(prompt_parts) + "\n\nPlease provide a comprehensive answer based on the context provided."
+
+        # Generator to stream from Ollama
+        def stream_generate():
+            api_url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/generate"
+            payload = {
+                "model": request.model,
+                "prompt": prompt,
+                "max_tokens": 1000,
+                "temperature": 0.7,
+                "stream": True
+            }
+
+            with requests.post(api_url, json=payload, stream=True) as r:
+                r.raise_for_status()
+                for line in r.iter_lines():
+                    if line:
+                        try:
+                            parsed = json.loads(line.decode("utf-8"))
+                            token = parsed.get("response", "")
+                            if token:
+                                yield token
+                        except Exception:
+                            continue
+
+        return StreamingResponse(stream_generate(), media_type="text/plain")
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error streaming answer: {str(e)}")
 
 @app.get("/history", response_model=List[HistoryItem])
 async def get_history():

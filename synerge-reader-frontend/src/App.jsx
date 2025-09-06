@@ -35,36 +35,61 @@ function App() {
     setError("");
   };
 
-  const handleAsk = (question) => {
+  const handleAsk = async (question) => {
     if (!selectedText.trim()) {
       setError("Please select some text from the document before asking a question.");
       return;
     }
 
     setIsLoading(true);
-    fetch(process.env.REACT_APP_BACKEND_URL + "/ask", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        selected_text: selectedText,
-        question: question,
-        model: model
-      })
-    })
-      .then(res => res.json())
-      .then(data => {
-        setAnswer(data);
-        setIsLoading(false);
-        setAskOpen(false);
-        // Refresh history
-        fetch(process.env.REACT_APP_BACKEND_URL + "/history")
-          .then((res) => res.json())
-          .then((data) => setHistory(data));
-      })
-      .catch(() => {
-        setError("Could not get answer from backend.");
-        setIsLoading(false);
+    setAnswer({ question, answer: "" }); // initialize with empty answer
+
+    try {
+      const response = await fetch(process.env.REACT_APP_BACKEND_URL + "/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          selected_text: selectedText,
+          question: question,
+          model: model
+        })
       });
+
+      if (!response.ok) {
+        throw new Error("Backend error");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+
+      let fullText = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        fullText += chunk;
+
+        // update progressively
+        setAnswer((prev) => ({
+          ...prev,
+          question,
+          answer: fullText
+        }));
+      }
+
+      setIsLoading(false);
+      setAskOpen(false);
+
+      // refresh history after streaming completes
+      fetch(process.env.REACT_APP_BACKEND_URL + "/history")
+        .then((res) => res.json())
+        .then((data) => setHistory(data));
+    } catch (err) {
+      setError("Could not get answer from backend.");
+      setIsLoading(false);
+    }
   };
 
   const handleTextSelection = (text) => {
