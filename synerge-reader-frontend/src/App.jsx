@@ -175,11 +175,13 @@ function App() {
       </main>
     
         
-      <footer>
-  <div>© {new Date().getFullYear()} Synergy Reader. All rights reserved.</div>
-  <div style={{ marginTop: 5, color: "#2b926e", fontWeight: 500 }}>
-    Backend status: {backendMsg}
-  </div>
+      <footer>  
+  <hr/>     
+ <div className="footContents">
+  <div style={{color: "#2b926e", fontWeight: 500 }}><p>Status: {backendMsg} </p></div>
+   <div><p>© {new Date().getFullYear()} Synergy Reader. All rights reserved. </p> </div>
+   <div> <p>Report An Issue</p>  </div>
+   </div>
 </footer>
     </div>
   );

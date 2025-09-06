@@ -18,6 +18,7 @@ body {
   flex-direction: column;
   align-items: center;
  min-height: 100vh;
+
 }
 
 main {
@@ -25,21 +26,32 @@ main {
 }
 
 footer {
-text-align: center;
-padding: 10px;
-border-top: 1px solid #e2e8f0;
-background-color: white;
-color: "#555";
-font-size: 0.9em;
+display: flex;
+flex-direction: column;
+
+font-size: 0.8em;
 width: 100%;
-background-color: #3a3a3a;
-color: #f3e7e9
-  
+align-items: center;
+
 }
 
-footer { 
-color: white; 
+
+.footContents{
+  width: 100%;
+padding: 15px;
+  display: flex;
+flex-direction: row;
+text-align: center;
+justify-content: center;
+gap: 40px;
+
+
 }
+
+footer hr{
+margin-bottom: 0px
+}
+
 /* Header Styles */
 
 .headingInfo{
@@ -70,7 +82,6 @@ hr{
 
 .alpha-upload-card img{
   width: 200px;
- 
   width: 140px;
   filter: brightness(0) invert(1)
 }
@@ -105,6 +116,20 @@ hr{
   font-weight: 500;
   font-family: "Public Sans", sans-serif;
   color: #000;
+}
+
+.headingInfo{
+  display: flex;
+  align-items: center;
+}
+
+
+.headingInfo img{
+
+  width: 40px;
+  align-items: center;
+  justify-content: center;
+  filter: brightness(0) invert(0);
 }
 
 /* Upload Card Styles */
