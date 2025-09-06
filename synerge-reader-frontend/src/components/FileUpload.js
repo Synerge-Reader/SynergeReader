@@ -21,7 +21,7 @@ const FileUpload = ({ onFileParsed, setIsLoading, setError, model, setModel }) =
       const blob = new Blob([textContent], { type: 'text/plain' });
       formData.append('file', blob, fileName);
 
-      const response = await fetch(process.env.REACT_APP_BACKEND_URL + '/upload', {
+      const response = await fetch(`${process.env.REACT_APP_BACKEND_URL}/upload`, {
         method: 'POST',
         body: formData
       });
