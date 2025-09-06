@@ -149,7 +149,7 @@ function App() {
               <strong>Question:</strong> {answer.question}
             </div>
             <div style={{ marginBottom: 16 }}>
-              <strong>Answer:</strong> <ReactMarkdown>answer.answer</ReactMarkdown>
+              <strong>Answer:</strong> <ReactMarkdown>{answer.answer}</ReactMarkdown>
             </div>
             {answer.context_chunks && answer.context_chunks.length > 0 && (
               <div style={{ marginBottom: 16 }}>
