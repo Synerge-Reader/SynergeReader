@@ -200,7 +200,7 @@ const FileUpload = ({ onFileParsed, setIsLoading, setError, model, setModel }) =
 
       <Dropdown
         title={`Selected Model: ${model}`}
-        options={["gpt-oss:20b"]}
+        options={["llama3.1:8b", "gpt-oss:20b"]}
         onSelect={(option) => {
           setModel(option);
           console.log("Selected:", option);

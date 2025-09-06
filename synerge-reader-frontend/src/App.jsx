@@ -15,7 +15,7 @@ function App() {
   const [askOpen, setAskOpen] = useState(false);
   const [answer, setAnswer] = useState(null);
   const [history, setHistory] = useState([]);
-  const [model, setModel] = useState('gpt-oss:20b');
+  const [model, setModel] = useState('llama3.1:8b');
 
   useEffect(() => {
     fetch(process.env.REACT_APP_BACKEND_URL + "/test")
