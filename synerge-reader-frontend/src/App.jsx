@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import FileUpload from "./components/FileUpload";
 import TextPreview from "./components/TextPreview";
 import AskModal from "./components/AskModal";
+import ReactMarkdown from "react-markdown";
 // import axios from "axios";
 import "./App.css";
 
@@ -42,6 +43,7 @@ function App() {
     }
 
     setIsLoading(true);
+    setAskOpen(false);
     setAnswer({ question, answer: "" }); // initialize with empty answer
 
     try {
@@ -80,7 +82,6 @@ function App() {
       }
 
       setIsLoading(false);
-      setAskOpen(false);
 
       // refresh history after streaming completes
       fetch(process.env.REACT_APP_BACKEND_URL + "/history")
@@ -148,7 +149,7 @@ function App() {
               <strong>Question:</strong> {answer.question}
             </div>
             <div style={{ marginBottom: 16 }}>
-              <strong>Answer:</strong> {answer.answer}
+              <strong>Answer:</strong> <ReactMarkdown>answer.answer</ReactMarkdown>
             </div>
             {answer.context_chunks && answer.context_chunks.length > 0 && (
               <div style={{ marginBottom: 16 }}>
