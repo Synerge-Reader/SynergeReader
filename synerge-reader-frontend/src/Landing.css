@@ -1,12 +1,49 @@
+
+* {
+    margin: 0;
+    padding: 0;
+}
+
 .LandingView{
     display: flex;
     flex-direction: column;
     align-items: center;
     min-height: 100vh;
+ 
 }
 
 hr{
     margin-top: 8px;
     margin-bottom: 20px
 }
+
+footer{
+    margin-top: auto;
+}
+
+.main-view{
+    display: flex;
+    flex-direction: row;
+   align-items: center;
+}
+
+.box-1{
+    align-items: start;
+    text-align: start;
+    justify-content: start;
+  
+}
+
+.topView{
+    margin-bottom: auto;
+}
+
+.actionButton{
+    width: 70px;
+    padding: 4px;
+    background-color: black;
+    color: white;
+    border-radius: 10px;
+}
+
 
