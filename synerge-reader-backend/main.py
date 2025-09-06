@@ -113,7 +113,7 @@ def chunk_text(text: str, max_chunk_size: int = 500) -> list:
     
     return chunks
 
-def embed_chunks(chunks: List[str], model: str = "qwen2.5:0.5b") -> List[List[float]]:
+def embed_chunks(chunks: List[str], model: str = "DC1LEX/Qwen3-Embedding-0.6B-f16:latest") -> List[List[float]]:
     """
     Generate embeddings for text chunks using Ollama API.
     
