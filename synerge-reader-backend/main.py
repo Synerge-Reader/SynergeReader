@@ -19,6 +19,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+OLLAMA_HOST = os.getenv('OLLAMA_HOST', '172.18.0.1')  # Use the gateway IP as default
+OLLAMA_PORT = os.getenv('OLLAMA_PORT', '11434')
+
 # Configuration
 DB_PATH = os.path.join(os.path.dirname(__file__), 'synerge_reader.db')
 
@@ -125,7 +128,7 @@ def embed_chunks(chunks: List[str], model: str = "qwen2.5:0.5b") -> List[List[fl
         return []
     
     embeddings = []
-    ollama_url = "http://129.120.58.55:11434/api/embeddings"
+    ollama_url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/embeddings"
     
     for chunk in chunks:
         try:
@@ -285,7 +288,7 @@ def call_llm(
     prompt = "\n\n".join(prompt_parts) + "\n\nPlease provide a comprehensive answer based on the context provided."
 
     # Ollama API call with streaming
-    api_url = "http://129.120.58.55:11434/api/generate"
+    api_url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/generate"
     payload = {
         "model": model,
         "prompt": prompt,
