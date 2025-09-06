@@ -4,10 +4,9 @@ import TextPreview from "./components/TextPreview";
 import AskModal from "./components/AskModal";
 import TitleLogo from "./components/TitleLogo";
 import Top from "./components/Top";
-// import axios from "axios";
-import "./App.css";
+import './GridApp.css'
 
-function App() {
+function GridApp(){
   const [parsedText, setParsedText] = useState("");
   const [selectedText, setSelectedText] = useState("");
   const [fileName, setFileName] = useState("");
@@ -74,14 +73,80 @@ function App() {
     }
   };
 
-  return (
-    <div className="app-bg"> 
-    <Top></Top>
-    <hr/>
-        <TitleLogo></TitleLogo>
-          <div className="alpha-subtitle">
+
+
+
+    return(<>
+
+
+<div class="parent">
+
+ <div class="div4">
+      <Top></Top>
+         <hr/>
+           <TitleLogo></TitleLogo>
+             <div className="alpha-subtitle">
           Transforming research papers into interactive  AI analysis
         </div>
+    </div>
+
+<div class="div1">
+<div className="doc-section">
+   <FileUpload
+          onFileParsed={handleFileParsed}
+          setIsLoading={setIsLoading}
+          setError={setError}
+        />
+        {error && <div className="error-message">{error}</div>}
+        {isLoading && <div className="loading-spinner">Processing...</div>}
+        {fileName && (
+          <div className="file-info">
+            Uploaded: <span>{fileName}</span>
+          </div>
+        )}
+         {fileName &&(
+        <TextPreview text={parsedText} onSelect={handleTextSelection} />
+)}
+        {selectedText && (
+          <div style={{margin: '12px auto', maxWidth: 600, color: '#3b4ca0', background: '#f0f4ff', padding: 12, borderRadius: 6}}>
+            <strong>Selected Context:</strong> {selectedText.substring(0, 200)}{selectedText.length > 200 ? '...' : ''}
+          </div>
+        )}
+    </div>
+    </div>
+    <div class="div2">
+    <p>2</p>
+    <p>ABC</p>
+    <p>ABC</p></div>
+    <div class="div3">
+       <footer>  
+  <hr/>     
+ <div className="footContents">
+  <div style={{color: "#2b926e", fontWeight: 500 }}><p>Status: {backendMsg} </p></div>
+   <div><p>© {new Date().getFullYear()} Synergy Reader. All rights reserved. </p> </div>
+   <div> <p>Report An Issue</p>  </div>
+   </div>
+</footer>
+   </div>
+   
+</div>
+
+
+
+
+
+
+
+
+
+{/*    
+
+
+
+
+
+
+         
       <main>
         <div></div>
         <FileUpload
@@ -186,7 +251,11 @@ function App() {
    </div>
 </footer>
     </div>
-  );
+  
+
+    */}
+
+    </>)
 }
 
-export default App;
+export default GridApp;

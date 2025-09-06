@@ -6,14 +6,11 @@ function Top(){
     <div className="head">
     <div className="headingInfo">
 <img src="/menuBar.svg"></img>
-<h3>How it works</h3>
-<h3>Report An issue</h3>
-
+ <h3>Community Papers</h3>
+    <h3>Browse</h3>
+   
     </div>
     </div>
-    
-    
-    
     </>)
 
 
