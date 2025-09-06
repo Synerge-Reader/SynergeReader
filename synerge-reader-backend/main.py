@@ -261,7 +261,7 @@ def call_llm(
     relevant_history: List[dict],
     model: str
 ) -> str:
-    """Call Ollama LLM and return the full answer after completion"""
+    """Call Ollama LLM and return the full answer after completion using streaming"""
 
     # Build prompt
     prompt_parts = []
@@ -284,7 +284,7 @@ def call_llm(
 
     prompt = "\n\n".join(prompt_parts) + "\n\nPlease provide a comprehensive answer based on the context provided."
 
-    # Ollama API call
+    # Ollama API call with streaming
     api_url = "http://127.0.0.1:11434/api/generate"
     payload = {
         "model": model,
@@ -296,9 +296,20 @@ def call_llm(
     try:
         response = requests.post(api_url, json=payload, timeout=60)
         response.raise_for_status()
-        data = response.json()
-        # Ollama typically returns 'completion' or 'response'
-        return data.get("completion") or data.get("response") or "No completion returned"
+        
+        # Process streaming response
+        full_answer = ""
+        for line in response.text.splitlines():
+            if line.strip():
+                try:
+                    parsed = json.loads(line)
+                    full_answer += parsed.get("response", "")
+                except json.JSONDecodeError:
+                    # Skip invalid JSON lines
+                    continue
+        
+        return full_answer if full_answer else "No response received from LLM"
+        
     except Exception as e:
         return f"Error calling Ollama LLM: {str(e)}"
 
