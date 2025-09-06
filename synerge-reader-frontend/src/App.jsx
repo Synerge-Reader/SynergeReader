@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import FileUpload from "./components/FileUpload";
 import TextPreview from "./components/TextPreview";
 import AskModal from "./components/AskModal";
+import TitleLogo from "./components/TitleLogo";
 // import axios from "axios";
 import "./App.css";
 
@@ -17,11 +18,11 @@ function App() {
   const [history, setHistory] = useState([]);
 
   useEffect(() => {
-    fetch(process.env.REACT_APP_BACKEND_URL + "/test")
+    fetch(process.env.REACT_APP_BACKEND_URL || "http://localhost:5000" + "/test")
       .then((res) => res.json())
       .then((data) => setBackendMsg(data.message))
       .catch(() => setBackendMsg("Could not connect to backend."));
-    fetch(process.env.REACT_APP_BACKEND_URL + "/history")
+    fetch(process.env.REACT_APP_BACKEND_URL || "http://localhost:5000" + "/history")
       .then((res) => res.json())
       .then((data) => setHistory(data))
       .catch(() => setHistory([]));
@@ -41,7 +42,7 @@ function App() {
     }
 
     setIsLoading(true);
-    fetch(process.env.REACT_APP_BACKEND_URL + "/ask", {
+    fetch(process.env.REACT_APP_BACKEND_URL || "http://localhost:5000" + "/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ 
@@ -55,7 +56,7 @@ function App() {
         setIsLoading(false);
         setAskOpen(false);
         // Refresh history
-        fetch(process.env.REACT_APP_BACKEND_URL + "/history")
+        fetch(process.env.REACT_APP_BACKEND_URL || "http://localhost:5000" + "/history")
           .then((res) => res.json())
           .then((data) => setHistory(data));
       })
@@ -73,19 +74,11 @@ function App() {
   };
 
   return (
-    <div className="app-bg">
-      <header className="alpha-header">
-        <h1>SynergeReader</h1>
-        <div className="alpha-subtitle">
-          Upload & Preview PDF, DOCX, or TXT documents
+    <div className="app-bg"> 
+        <TitleLogo></TitleLogo>
+          <div className="alpha-subtitle">
+          Transforming research papers into interactive  AI analysis
         </div>
-        <div style={{ marginTop: 8, color: '#2b926e', fontWeight: 500 }}>
-          Backend status: {backendMsg}
-        </div>
-        <div style={{ marginTop: 8, fontSize: '0.9em', color: '#666' }}>
-          Select text from the document to ask questions
-        </div>
-      </header>
       <main>
         <FileUpload
           onFileParsed={handleFileParsed}
@@ -99,7 +92,9 @@ function App() {
             Uploaded: <span>{fileName}</span>
           </div>
         )}
+        {fileName &&(
         <TextPreview text={parsedText} onSelect={handleTextSelection} />
+)}
         {selectedText && (
           <div style={{margin: '12px auto', maxWidth: 600, color: '#3b4ca0', background: '#f0f4ff', padding: 12, borderRadius: 6}}>
             <strong>Selected Context:</strong> {selectedText.substring(0, 200)}{selectedText.length > 200 ? '...' : ''}
@@ -147,6 +142,7 @@ function App() {
             )}
           </div>
         )}
+        {fileName && (
         <div style={{margin: '32px auto', maxWidth: 800}}>
           <h3>Chat History</h3>
           {history.length === 0 ? <div>No history yet.</div> : (
@@ -171,7 +167,13 @@ function App() {
             </div>
           )}
         </div>
+        )}
+             
       </main>
+        
+       <div style={{ marginTop: 8, color: '#2b926e', fontWeight: 500 }}>
+          Backend status: {backendMsg}
+        </div>
     </div>
   );
 }

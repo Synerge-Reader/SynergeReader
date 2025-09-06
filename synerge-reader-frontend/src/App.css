@@ -2,52 +2,67 @@
 * {
   margin: 0;
   padding: 0;
-  box-sizing: border-box;
+
 }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-    sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background-image: linear-gradient(to top, #f3e7e9 0%, #e3eeff 99%, #e3eeff 100%);
+    min-height: 100vh;
   min-height: 100vh;
 }
 
 .app-bg {
-  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
   padding: 20px;
 }
 
 /* Header Styles */
-.alpha-header {
-  text-align: center;
-  margin-bottom: 40px;
-  color: white;
-}
 
-.alpha-header h1 {
-  font-size: 3rem;
-  font-weight: 700;
-  margin-bottom: 10px;
-  text-shadow: 0 2px 4px rgba(0,0,0,0.3);
-}
+
+
 
 .alpha-subtitle {
   font-size: 1.2rem;
   opacity: 0.9;
   margin-bottom: 10px;
+  font-style: italic;
+  margin-bottom: 40px
+}
+
+.TitleLogo {
+  display: flex;
+  flex-direction: row;
+  justify-content: center;
+  align-items: center;
+  gap: 15px;
+}
+
+.TitleLogo img {
+  width: 70px;
+  height: 70px;
+}
+
+.TitleLogo h1 {
+  font-size: 4rem;
+  margin-bottom: 10px;
+  font-weight: 500;
+  font-family: "Public Sans", sans-serif;
+  color: #000;
 }
 
 /* Upload Card Styles */
 .alpha-upload-card {
-  background: white;
+  background: none;
   border-radius: 16px;
   padding: 40px;
   text-align: center;
-  box-shadow: 0 8px 32px rgba(0,0,0,0.1);
-  border: 2px dashed #e2e8f0;
+
+  border: 2px dashed black;
   transition: all 0.3s ease;
   margin-bottom: 30px;
   max-width: 600px;
@@ -56,13 +71,14 @@ body {
 }
 
 .alpha-upload-card:hover {
-  border-color: #667eea;
+  border-color: #B9E5FC;
   transform: translateY(-2px);
-  box-shadow: 0 12px 40px rgba(0,0,0,0.15);
+  border: 3px dashed black;
+
 }
 
 .alpha-upload-card.dragging {
-  border-color: #667eea;
+  border-color: #B9E5FC;
   background: #f8faff;
   transform: scale(1.02);
 }

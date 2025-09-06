@@ -20,16 +20,16 @@ const FileUpload = ({ onFileParsed, setIsLoading, setError }) => {
       const formData = new FormData();
       const blob = new Blob([textContent], { type: 'text/plain' });
       formData.append('file', blob, fileName);
-      
-      const response = await fetch(process.env.REACT_APP_BACKEND_URL + '/upload', {
+
+      const response = await fetch(process.env.REACT_APP_BACKEND_URL || "http://localhost:5000" + '/upload', {
         method: 'POST',
         body: formData
       });
-      
+
       if (!response.ok) {
         throw new Error(`Upload failed: ${response.statusText}`);
       }
-      
+
       const result = await response.json();
       console.log('Document uploaded successfully:', result);
       return result;
@@ -52,10 +52,10 @@ const FileUpload = ({ onFileParsed, setIsLoading, setError }) => {
 
     setIsLoading(true);
     setError("");
-    
+
     try {
       let textContent = "";
-      
+
       if (file.type === "application/pdf") {
         textContent = await processPDF(file);
       } else if (file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
@@ -63,13 +63,13 @@ const FileUpload = ({ onFileParsed, setIsLoading, setError }) => {
       } else if (file.type === "text/plain") {
         textContent = await processTXT(file);
       }
-      
+
       // Upload to backend for processing
       await uploadToBackend(textContent, file.name);
-      
+
       // Call the callback with parsed text
       onFileParsed(textContent, file.name);
-      
+
     } catch (error) {
       setError(`Error processing file: ${error.message}`);
       setIsLoading(false);
