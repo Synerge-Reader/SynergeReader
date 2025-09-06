@@ -125,7 +125,7 @@ def embed_chunks(chunks: List[str], model: str = "qwen2.5:0.5b") -> List[List[fl
         return []
     
     embeddings = []
-    ollama_url = "http://127.0.0.1:11434/api/embeddings"
+    ollama_url = "http://129.120.58.55:11434/api/embeddings"
     
     for chunk in chunks:
         try:
@@ -285,7 +285,7 @@ def call_llm(
     prompt = "\n\n".join(prompt_parts) + "\n\nPlease provide a comprehensive answer based on the context provided."
 
     # Ollama API call with streaming
-    api_url = "http://127.0.0.1:11434/api/generate"
+    api_url = "http://129.120.58.55:11434/api/generate"
     payload = {
         "model": model,
         "prompt": prompt,
