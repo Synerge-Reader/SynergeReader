@@ -428,7 +428,8 @@ async def ask_question(request: AskRequest):
         return AskResponse(
             answer=answer,
             context_chunks=context_chunks,
-            relevant_history=relevant_history
+            relevant_history=relevant_history,
+            question=request.question
         )
         
     except Exception as e:
