@@ -9,19 +9,71 @@ body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   background-image: linear-gradient(to top, #f3e7e9 0%, #e3eeff 99%, #e3eeff 100%);
-    min-height: 100vh;
-  min-height: 100vh;
+
+  margin-top: 10px;
 }
 
 .app-bg {
   display: flex;
   flex-direction: column;
-  justify-content: center;
   align-items: center;
-  padding: 20px;
+ min-height: 100vh;
 }
 
+main {
+  flex: 1;
+}
+
+footer {
+text-align: center;
+padding: 10px;
+border-top: 1px solid #e2e8f0;
+background-color: white;
+color: "#555";
+font-size: 0.9em;
+width: 100%;
+background-color: #3a3a3a;
+color: #f3e7e9
+  
+}
+
+footer { 
+color: white; 
+}
 /* Header Styles */
+
+.headingInfo{
+display: flex;
+flex-direction: row ;
+gap: 40px;
+
+}
+
+.head{
+  display: flex;
+  flex-direction: column;
+}
+
+.headingInfo h3 {
+  display: flex;
+  flex-direction: row;
+  gap: 40px;
+  font-weight: 300;
+
+}
+
+hr{
+  margin-top: 6px;
+  margin-bottom: 5px;
+  width: 100%;
+}
+
+.alpha-upload-card img{
+  width: 200px;
+ 
+  width: 140px;
+  filter: brightness(0) invert(1)
+}
 
 
 

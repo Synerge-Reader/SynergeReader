@@ -3,6 +3,7 @@ import FileUpload from "./components/FileUpload";
 import TextPreview from "./components/TextPreview";
 import AskModal from "./components/AskModal";
 import TitleLogo from "./components/TitleLogo";
+import Top from "./components/Top";
 // import axios from "axios";
 import "./App.css";
 
@@ -75,6 +76,8 @@ function App() {
 
   return (
     <div className="app-bg"> 
+    <Top></Top>
+    <hr/>
         <TitleLogo></TitleLogo>
           <div className="alpha-subtitle">
           Transforming research papers into interactive  AI analysis
@@ -170,10 +173,14 @@ function App() {
         )}
              
       </main>
+    
         
-       <div style={{ marginTop: 8, color: '#2b926e', fontWeight: 500 }}>
-          Backend status: {backendMsg}
-        </div>
+      <footer>
+  <div>© {new Date().getFullYear()} Synergy Reader. All rights reserved.</div>
+  <div style={{ marginTop: 5, color: "#2b926e", fontWeight: 500 }}>
+    Backend status: {backendMsg}
+  </div>
+</footer>
     </div>
   );
 }
