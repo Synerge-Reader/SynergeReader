@@ -2,17 +2,17 @@ import React, { useRef, useState } from "react";
 import * as pdfjsLib from "pdfjs-dist/build/pdf";
 import { GlobalWorkerOptions } from "pdfjs-dist/build/pdf";
 import mammoth from "mammoth";
+import Dropdown from "./Dropdown";
 
 GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
   import.meta.url
 ).toString();
 
-const FileUpload = ({ onFileParsed, setIsLoading, setError }) => {
+const FileUpload = ({ onFileParsed, setIsLoading, setError, model, setModel }) => {
   const fileInputRef = useRef();
   const [isDragging, setIsDragging] = useState(false);
   const allowedTypes = ["application/pdf", "text/plain", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"];
-
   const setDefault = () => setIsDragging(false);
 
   const uploadToBackend = async (textContent, fileName) => {
@@ -20,16 +20,16 @@ const FileUpload = ({ onFileParsed, setIsLoading, setError }) => {
       const formData = new FormData();
       const blob = new Blob([textContent], { type: 'text/plain' });
       formData.append('file', blob, fileName);
-      
+
       const response = await fetch(process.env.REACT_APP_BACKEND_URL + '/upload', {
         method: 'POST',
         body: formData
       });
-      
+
       if (!response.ok) {
         throw new Error(`Upload failed: ${response.statusText}`);
       }
-      
+
       const result = await response.json();
       console.log('Document uploaded successfully:', result);
       return result;
@@ -52,10 +52,10 @@ const FileUpload = ({ onFileParsed, setIsLoading, setError }) => {
 
     setIsLoading(true);
     setError("");
-    
+
     try {
       let textContent = "";
-      
+
       if (file.type === "application/pdf") {
         textContent = await processPDF(file);
       } else if (file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
@@ -63,13 +63,13 @@ const FileUpload = ({ onFileParsed, setIsLoading, setError }) => {
       } else if (file.type === "text/plain") {
         textContent = await processTXT(file);
       }
-      
+
       // Upload to backend for processing
       await uploadToBackend(textContent, file.name);
-      
+
       // Call the callback with parsed text
       onFileParsed(textContent, file.name);
-      
+
     } catch (error) {
       setError(`Error processing file: ${error.message}`);
       setIsLoading(false);
@@ -197,6 +197,16 @@ const FileUpload = ({ onFileParsed, setIsLoading, setError }) => {
       >
         Browse Files
       </button>
+
+      <Dropdown
+        title={`Selected Model: ${model}`}
+        options={["gpt-oss:20b"]}
+        onSelect={(option) => {
+          setModel(option);
+          console.log("Selected:", option);
+        }}
+      />
+
     </div>
   );
 };

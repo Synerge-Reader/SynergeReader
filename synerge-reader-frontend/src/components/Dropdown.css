@@ -1,0 +1,71 @@
+/* Centers the dropdown in the middle of the screen */
+.dropdown-container {
+    display: flex;
+    justify-content: center;
+    /* centers horizontally */
+    margin-top: 20px;
+    /* small spacing from top */
+}
+
+
+/* Dropdown styles */
+.dropdown {
+    position: relative;
+    display: inline-block;
+}
+
+.dropdown-btn {
+    padding: 10px 16px;
+    width: 200px;
+    font-weight: 500;
+    color: white;
+    background: linear-gradient(to right, #3b82f6, #1d4ed8);
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.dropdown-btn:hover {
+    background: linear-gradient(to right, #2563eb, #1e40af);
+}
+
+.dropdown-menu {
+    position: absolute;
+    margin-top: 6px;
+    width: 200px;
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+    animation: dropdown-fade 0.2s ease-out;
+    z-index: 10;
+}
+
+.dropdown-item {
+    display: block;
+    width: 100%;
+    padding: 10px;
+    text-align: left;
+    background: none;
+    border: none;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+}
+
+.dropdown-item:hover {
+    background: #f3f4f6;
+    color: #2563eb;
+}
+
+@keyframes dropdown-fade {
+    from {
+        opacity: 0;
+        transform: scale(0.95);
+    }
+
+    to {
+        opacity: 1;
+        transform: scale(1);
+    }
+}

@@ -5,6 +5,7 @@ import os
 import datetime
 from typing import List
 import requests
+import json
 from pydantic import BaseModel
 
 app = FastAPI(title="SynergeReader API", version="1.0.0")
@@ -25,6 +26,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), 'synerge_reader.db')
 class AskRequest(BaseModel):
     selected_text: str
     question: str
+    model: str
 
 class AskResponse(BaseModel):
     answer: str
@@ -123,98 +125,58 @@ def get_relevant_history(question: str, selected_text: str, limit: int = 3) -> L
     relevant_history.sort(key=lambda x: x["relevance_score"], reverse=True)
     return relevant_history[:limit]
 
-def call_llm(question: str, context_chunks: List[str], selected_text: str, relevant_history: List[dict]) -> str:
-    """Call LLM with enhanced prompt including context and history"""
-    # Build comprehensive prompt
+import requests
+from typing import List
+
+def call_llm(
+    question: str,
+    context_chunks: List[str],
+    selected_text: str,
+    relevant_history: List[dict],
+    model: str
+) -> str:
+    """Call Ollama LLM and return the full answer after completion"""
+
+    # Build prompt
     prompt_parts = []
-    
-    # Add relevant history
+
     if relevant_history:
         history_text = "\n".join([
             f"Previous Q: {h['question']}\nPrevious A: {h['answer']}"
             for h in relevant_history
         ])
         prompt_parts.append(f"Relevant History:\n{history_text}")
-    
-    # Add context chunks
+
     if context_chunks:
         context_text = "\n\n".join(context_chunks)
         prompt_parts.append(f"Document Context:\n{context_text}")
-    
-    # Add selected text
+
     if selected_text:
         prompt_parts.append(f"Selected Text:\n{selected_text}")
-    
-    # Add question
+
     prompt_parts.append(f"Question:\n{question}")
-    
-    # Build final prompt
+
     prompt = "\n\n".join(prompt_parts) + "\n\nPlease provide a comprehensive answer based on the context provided."
-    
-    # Call OpenRouter API
-    api_url = "https://openrouter.ai/api/v1/chat/completions"
-    api_key = "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"
-    model = "meta-llama/llama-3.3-70b-instruct:free"
-    
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    
+
+    # Ollama API call
+    api_url = "http://127.0.0.1:11434/api/generate"
     payload = {
         "model": model,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
+        "prompt": prompt,
         "max_tokens": 1000,
         "temperature": 0.7
     }
-    
+
     try:
-        response = requests.post(api_url, headers=headers, json=payload, timeout=60)
+        response = requests.post(api_url, json=payload, timeout=60)
         response.raise_for_status()
         data = response.json()
-        return data["choices"][0]["message"]["content"]
+        # Ollama typically returns 'completion' or 'response'
+        return data.get("completion") or data.get("response") or "No completion returned"
     except Exception as e:
-        return f"Error calling LLM: {str(e)}"
+        return f"Error calling Ollama LLM: {str(e)}"
 
-# Initialize database on startup
-init_db()
 
-@app.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
-    """Upload and process document for chunking and embedding"""
-    try:
-        # Validate file type
-        if not file.filename.lower().endswith(('.pdf', '.txt', '.docx')):
-            raise HTTPException(status_code=400, detail="Unsupported file type. Please upload PDF, TXT, or DOCX files.")
-        
-        # Check file size (20MB limit)
-        if file.size > 20 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="File too large. Maximum size is 20MB.")
-        
-        # Read file content
-        content = await file.read()
-        
-        # For now, we'll assume text content is passed directly
-        if file.filename.lower().endswith('.txt'):
-            text_content = content.decode('utf-8')
-        else:
-            # For PDF/DOCX, we'll need to implement parsing
-            # For now, assume text content
-            text_content = content.decode('utf-8', errors='ignore')
-        
-        # Generate document ID
-        document_id = f"doc_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        
-        return {
-            "message": "Document uploaded and processed successfully",
-            "document_id": document_id,
-            "text_length": len(text_content)
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
 
 @app.post("/ask", response_model=AskResponse)
 async def ask_question(request: AskRequest):
@@ -237,7 +199,8 @@ async def ask_question(request: AskRequest):
             request.question, 
             context_chunks, 
             request.selected_text, 
-            relevant_history
+            relevant_history,
+            request.model
         )
         
         # Store in SQLite history
