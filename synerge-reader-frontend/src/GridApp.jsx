@@ -119,12 +119,6 @@ function GridApp(){
 <div className="box-contents">
 <h2>Chat Box </h2>
 <h2>History</h2>
-<select name="cars" id="cars">
-  <option value="volvo">Gemeni 2.5</option>
-  <option value="saab">Open AI</option>
-  <option value="mercedes">Claude</option>
-  <option value="audi">Siri</option>
-</select>
 </div>
 <hr/>
 <div className="main-action-box">
@@ -172,12 +166,14 @@ function GridApp(){
         )}
 </div>
 <div className="main-text-Box">
+  
   <AskModal 
-          open={askOpen} 
+          open
           onClose={() => setAskOpen(false)} 
           onAsk={handleAsk}
           selectedText={selectedText}
         />
+
 </div>
 
 
