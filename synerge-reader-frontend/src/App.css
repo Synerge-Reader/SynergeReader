@@ -71,7 +71,15 @@ gap: 40px;
   flex-direction: row;
   gap: 40px;
   font-weight: 300;
+  transition: font-weight 0.3s ease;
 
+
+}
+
+.headingInfo h3:hover{
+
+  cursor: pointer;
+ font-weight: 400;
 }
 
 hr{
@@ -82,6 +90,10 @@ hr{
 
 .accLogo{
 margin-left: auto;
+
+}
+
+.accLogo:hover{
 
 }
 

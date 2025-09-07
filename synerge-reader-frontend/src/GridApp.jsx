@@ -16,6 +16,7 @@ function GridApp(){
   const [askOpen, setAskOpen] = useState(false);
   const [answer, setAnswer] = useState(null);
   const [history, setHistory] = useState([]);
+  const [openHistory, setOpenHistory] = useState(false);
 
   useEffect(() => {
     fetch(process.env.REACT_APP_BACKEND_URL || "http://localhost:5000" + "/test")
@@ -212,6 +213,36 @@ function GridApp(){
 
 
 {/*    
+{fileName && (
+        <div style={{margin: '32px auto', maxWidth: 800}}>
+          <h3>Chat History</h3>
+          {history.length === 0 ? <div>No history yet.</div> : (
+            <div style={{maxHeight: 400, overflowY: 'auto'}}>
+              {history.map((h, idx) => (
+                <div key={idx} style={{background: '#f8fafc', marginBottom: 12, padding: 16, borderRadius: 8, border: '1px solid #e2e8f0'}}>
+                  <div style={{marginBottom: 8}}>
+                    <strong>Selected Text:</strong> 
+                    <div style={{background: '#fff', padding: 8, borderRadius: 4, marginTop: 4, fontSize: '0.9em'}}>
+                      {h.selected_text.substring(0, 200)}{h.selected_text.length > 200 ? '...' : ''}
+                    </div>
+                  </div>
+                  <div style={{marginBottom: 8}}>
+                    <strong>Q:</strong> {h.question}
+                  </div>
+                  <div style={{marginBottom: 8}}>
+                    <strong>A:</strong> {h.answer}
+                  </div>
+                  <div style={{fontSize: '0.8em', color: '#888'}}>{h.timestamp}</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        )}
+
+
+
+
 
 
 
@@ -259,32 +290,10 @@ function GridApp(){
             )}
           </div>
         )}
-        {fileName && (
-        <div style={{margin: '32px auto', maxWidth: 800}}>
-          <h3>Chat History</h3>
-          {history.length === 0 ? <div>No history yet.</div> : (
-            <div style={{maxHeight: 400, overflowY: 'auto'}}>
-              {history.map((h, idx) => (
-                <div key={idx} style={{background: '#f8fafc', marginBottom: 12, padding: 16, borderRadius: 8, border: '1px solid #e2e8f0'}}>
-                  <div style={{marginBottom: 8}}>
-                    <strong>Selected Text:</strong> 
-                    <div style={{background: '#fff', padding: 8, borderRadius: 4, marginTop: 4, fontSize: '0.9em'}}>
-                      {h.selected_text.substring(0, 200)}{h.selected_text.length > 200 ? '...' : ''}
-                    </div>
-                  </div>
-                  <div style={{marginBottom: 8}}>
-                    <strong>Q:</strong> {h.question}
-                  </div>
-                  <div style={{marginBottom: 8}}>
-                    <strong>A:</strong> {h.answer}
-                  </div>
-                  <div style={{fontSize: '0.8em', color: '#888'}}>{h.timestamp}</div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-        )}
+
+
+
+        
              
       </main>
     
