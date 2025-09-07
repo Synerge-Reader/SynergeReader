@@ -131,7 +131,7 @@ function GridApp(){
 
     {answer && (
           <div style={{margin: '32px auto', maxWidth: 800, background: '#fff', borderRadius: 8, boxShadow: '0 2px 8px rgba(0,0,0,0.07)', padding: 20}}>
-            <h3>Answer</h3>
+            <h3>Response</h3>
             <div style={{marginBottom: 16}}>
               <strong>Question:</strong> {answer.question}
             </div>
