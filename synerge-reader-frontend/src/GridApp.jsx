@@ -92,57 +92,49 @@ function GridApp(){
 
 <div class="div1">
 <div className="doc-section">
+  {!fileName && (
    <FileUpload
           onFileParsed={handleFileParsed}
           setIsLoading={setIsLoading}
           setError={setError}
         />
+  )}
         {error && <div className="error-message">{error}</div>}
         {isLoading && <div className="loading-spinner">Processing...</div>}
-        {fileName && (
+       
+
+         {fileName &&(
+        <TextPreview text={parsedText} onSelect={handleTextSelection} />
+)}
+ {fileName && (
           <div className="file-info">
             Uploaded: <span>{fileName}</span>
           </div>
         )}
-         {fileName &&(
-        <TextPreview text={parsedText} onSelect={handleTextSelection} />
-)}
-        {selectedText && (
-          <div style={{margin: '12px auto', maxWidth: 600, color: '#3b4ca0', background: '#f0f4ff', padding: 12, borderRadius: 6}}>
-            <strong>Selected Context:</strong> {selectedText.substring(0, 200)}{selectedText.length > 200 ? '...' : ''}
-          </div>
-        )}
+        
     </div>
     </div>
     <div class="div2">
   <div className="action-box">
 <div className="box-contents">
 <h2>Chat Box </h2>
-<h2>History </h2>
+<h2>History</h2>
+<select name="cars" id="cars">
+  <option value="volvo">Gemeni 2.5</option>
+  <option value="saab">Open AI</option>
+  <option value="mercedes">Claude</option>
+  <option value="audi">Siri</option>
+</select>
 </div>
 <hr/>
-
-
-
-  </div>
-
-
-
-
-
-
-      {selectedText && (
+<div className="main-action-box">
+{selectedText && (
           <div style={{margin: '12px auto', maxWidth: 600, color: '#3b4ca0', background: '#f0f4ff', padding: 12, borderRadius: 6}}>
             <strong>Selected Context:</strong> {selectedText.substring(0, 200)}{selectedText.length > 200 ? '...' : ''}
           </div>
         )}
-        <AskModal 
-          open={askOpen} 
-          onClose={() => setAskOpen(false)} 
-          onAsk={handleAsk}
-          selectedText={selectedText}
-        />
-        {answer && (
+
+    {answer && (
           <div style={{margin: '32px auto', maxWidth: 800, background: '#fff', borderRadius: 8, boxShadow: '0 2px 8px rgba(0,0,0,0.07)', padding: 20}}>
             <h3>Answer</h3>
             <div style={{marginBottom: 16}}>
@@ -178,6 +170,22 @@ function GridApp(){
             )}
           </div>
         )}
+</div>
+<div className="main-text-Box">
+  <AskModal 
+          open={askOpen} 
+          onClose={() => setAskOpen(false)} 
+          onAsk={handleAsk}
+          selectedText={selectedText}
+        />
+</div>
+
+
+
+
+  </div>
+
+    
   </div>
     <div class="div3">
        <footer>  
@@ -211,21 +219,7 @@ function GridApp(){
       <main>
         <div></div>
         
-       
-        {fileName &&(
-        <TextPreview text={parsedText} onSelect={handleTextSelection} />
-)}
-        {selectedText && (
-          <div style={{margin: '12px auto', maxWidth: 600, color: '#3b4ca0', background: '#f0f4ff', padding: 12, borderRadius: 6}}>
-            <strong>Selected Context:</strong> {selectedText.substring(0, 200)}{selectedText.length > 200 ? '...' : ''}
-          </div>
-        )}
-        <AskModal 
-          open={askOpen} 
-          onClose={() => setAskOpen(false)} 
-          onAsk={handleAsk}
-          selectedText={selectedText}
-        />
+      
         {answer && (
           <div style={{margin: '32px auto', maxWidth: 800, background: '#fff', borderRadius: 8, boxShadow: '0 2px 8px rgba(0,0,0,0.07)', padding: 20}}>
             <h3>Answer</h3>
@@ -291,16 +285,7 @@ function GridApp(){
              
       </main>
     
-        
-      <footer>  
-  <hr/>     
- <div className="footContents">
-  <div style={{color: "#2b926e", fontWeight: 500 }}><p>Status: {backendMsg} </p></div>
-   <div><p>© {new Date().getFullYear()} Synergy Reader. All rights reserved. </p> </div>
-   <div> <p>Report An Issue</p>  </div>
-   </div>
-</footer>
-    </div>
+      
   
 
     */}
