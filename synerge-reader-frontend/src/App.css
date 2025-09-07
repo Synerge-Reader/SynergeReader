@@ -343,33 +343,27 @@ margin-left: auto;
 
 /* Modal Styles */
 .modal-overlay {
+ margin-top: -339px;
   position: absolute;
-  top: 3;
-  left: 0;
-  right: 0;
-  bottom: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 1000;
+  
 }
 
 .modal-content {
+  
   background: white;
-  border-radius: 16px;
+  border-radius: 8px;
   padding: 30px;
-  max-width: 600px;
+  min-width: 400px;
   width: 90%;
-  max-height: 80vh;
   overflow-y: auto;
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
   animation: modalSlideIn 0.3s ease-out;
 }
 
-.modal-content h2{
-color: #059669;
-  right: 0;
-}
+
 
 @keyframes modalSlideIn {
   from {

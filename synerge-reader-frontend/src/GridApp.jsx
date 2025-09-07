@@ -55,6 +55,7 @@ function GridApp(){
         setAnswer(data);
         setIsLoading(false);
         setAskOpen(false);
+        
         // Refresh history
         fetch(process.env.REACT_APP_BACKEND_URL || "http://localhost:5000" + "/history")
           .then((res) => res.json())

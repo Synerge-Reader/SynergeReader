@@ -15,10 +15,10 @@ const AskModal = ({ open, onClose, onAsk, selectedText }) => {
 
   return (
     <div className="modal-overlay">
-      <div className="modal-content" style={{ background: '#fff', padding: 24, borderRadius: 8, maxWidth: 600, margin: '40px auto', maxHeight: '80vh', overflowY: 'auto', boxShadow: '0 2px 16px rgba(0,0,0,0.15)' }}>
-        <h2 style={{ marginLeft: "50%" }}>Ask a Question</h2>
+      <div className="modal-content">
+        <h2>Ask a Question</h2>
         <form onSubmit={handleSubmit}>
-          <div style={{ marginBottom: 16 }}>
+          <div style={{ marginBottom: 5 }}>
             <textarea
               id="question"
               value={question}
@@ -26,6 +26,7 @@ const AskModal = ({ open, onClose, onAsk, selectedText }) => {
               rows={4}
               style={{
                 width: '100%',
+                justifyContent: 'center',
                 padding: 12,
                 border: '1px solid #ddd',
                 borderRadius: 4,
