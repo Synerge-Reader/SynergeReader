@@ -125,13 +125,14 @@ function GridApp(){
 <div className="main-action-box">
 {selectedText && (
           <div style={{margin: '12px auto', maxWidth: 600, color: '#3b4ca0', background: '#f0f4ff', padding: 12, borderRadius: 6}}>
-            <strong>Selected Context:</strong> {selectedText.substring(0, 200)}{selectedText.length > 200 ? '...' : ''}
+            <strong>Selected Text:</strong> {selectedText.substring(0, 200)}{selectedText.length > 200 ? '...' : ''}
           </div>
         )}
 
     {answer && (
           <div style={{margin: '32px auto', maxWidth: 800, background: '#fff', borderRadius: 8, boxShadow: '0 2px 8px rgba(0,0,0,0.07)', padding: 20}}>
             <h3>Response</h3>
+           
             <div style={{marginBottom: 16}}>
               <strong>Question:</strong> {answer.question}
             </div>
@@ -139,20 +140,25 @@ function GridApp(){
               <strong>Answer:</strong> {answer.answer}
             </div>
             {answer.context_chunks && answer.context_chunks.length > 0 && (
-              <div style={{marginBottom: 16}}>
-                <strong>Relevant Context:</strong>
-                <div style={{background: '#f8f9fa', padding: 12, borderRadius: 4, marginTop: 8}}>
+              <details style={{marginBottom: 16}}>
+                 <summary style={{cursor: "pointer", fontWeight: "bold"}}>
+               Relevant Context
+                </summary>
+                <div style={{background: '#f0f8ff', padding: 12, borderRadius: 4, marginTop: 8}}>
                   {answer.context_chunks.map((chunk, idx) => (
                     <div key={idx} style={{marginBottom: 8, fontSize: '0.9em'}}>
                       {chunk.substring(0, 150)}...
                     </div>
                   ))}
                 </div>
-              </div>
+              </details>
+            
             )}
             {answer.relevant_history && answer.relevant_history.length > 0 && (
-              <div>
-                <strong>Relevant History:</strong>
+              <details>
+                 <summary style={{cursor: "pointer", fontWeight: "bold"}}>
+                Relevant History
+                </summary>
                 <div style={{background: '#f0f8ff', padding: 12, borderRadius: 4, marginTop: 8}}>
                   {answer.relevant_history.map((hist, idx) => (
                     <div key={idx} style={{marginBottom: 8, fontSize: '0.9em'}}>
@@ -161,7 +167,7 @@ function GridApp(){
                     </div>
                   ))}
                 </div>
-              </div>
+              </details>
             )}
           </div>
         )}

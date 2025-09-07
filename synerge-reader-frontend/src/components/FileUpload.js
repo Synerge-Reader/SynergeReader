@@ -165,11 +165,11 @@ const FileUpload = ({ onFileParsed, setIsLoading, setError }) => {
     >
       <img src="/uploadIcon.svg" />
       <div className="alpha-upload-hint">
-        <strong>Upload a Document</strong> a <span className="pdf-accent">PDF</span>,{" "}
+        <strong>Upload a document</strong><br /> <span className="pdf-accent">PDF</span>,{" "}
         <span className="docx-accent">DOCX</span>, or{" "}
-        <span className="txt-accent">TXT</span> file here{" "}
+        <span className="txt-accent">TXT</span> File{" "}<br />
         <span className="dim">(max 20MB)</span>
-        <br /> or
+        <br />
       </div>
       <input
         type="file"

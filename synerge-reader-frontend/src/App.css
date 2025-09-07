@@ -143,14 +143,23 @@ margin-left: auto;
   border-radius: 16px;
   padding: 40px;
   text-align: center;
-
+  height: 720px;
   border: 2px dashed black;
   transition: all 0.3s ease;
   margin-bottom: 30px;
 
-  min-width: auto;
-  margin-left: auto;
-  margin-right: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+
+
+
+}
+
+.alpha-upload-card img {
+width: 200px;
+
 }
 
 .alpha-upload-card:hover {
