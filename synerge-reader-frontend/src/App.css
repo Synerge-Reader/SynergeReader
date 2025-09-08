@@ -2,67 +2,187 @@
 * {
   margin: 0;
   padding: 0;
-  box-sizing: border-box;
+
 }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-    sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  min-height: 100vh;
+  background-image: linear-gradient(to top, #f3e7e9 0%, #e3eeff 99%, #e3eeff 100%);
+  margin-top: 10px;
 }
 
 .app-bg {
-  min-height: 100vh;
-  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+ min-height: 100vh;
+
+}
+
+main {
+  flex: 1;
+}
+
+footer {
+display: flex;
+flex-direction: column;
+
+font-size: 0.8em;
+width: 100%;
+align-items: center;
+
+}
+
+
+.footContents{
+  width: 100%;
+padding: 15px;
+  display: flex;
+flex-direction: row;
+text-align: center;
+justify-content: center;
+gap: 40px;
+
+
+}
+
+footer hr{
+margin-bottom: 0px
 }
 
 /* Header Styles */
-.alpha-header {
-  text-align: center;
-  margin-bottom: 40px;
-  color: white;
+
+.headingInfo{
+display: flex;
+flex-direction: row ;
+gap: 40px;
+
 }
 
-.alpha-header h1 {
-  font-size: 3rem;
-  font-weight: 700;
-  margin-bottom: 10px;
-  text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+.head{
+  display: flex;
+  flex-direction: column;
+  padding: 3px;
 }
+
+.headingInfo h3 {
+  display: flex;
+  flex-direction: row;
+  gap: 40px;
+  font-weight: 300;
+  transition: font-weight 0.3s ease;
+
+
+}
+
+.headingInfo h3:hover{
+
+  cursor: pointer;
+ font-weight: 400;
+}
+
+hr{
+  margin-top: 6px;
+  margin-bottom: 5px;
+  width: 100%;
+}
+
+.accLogo{
+margin-left: auto;
+
+}
+
+.accLogo:hover{
+
+}
+
+.alpha-upload-card img{
+  width: 200px;
+  width: 140px;
+  filter: brightness(0) invert(1)
+}
+
+
+
 
 .alpha-subtitle {
   font-size: 1.2rem;
   opacity: 0.9;
   margin-bottom: 10px;
+  font-style: italic;
+  margin-bottom: 40px
+}
+
+.TitleLogo {
+  display: flex;
+  flex-direction: row;
+  justify-content: center;
+  align-items: center;
+  gap: 15px;
+}
+
+.TitleLogo img {
+  width: 70px;
+  height: 70px;
+}
+
+.TitleLogo h1 {
+  font-size: 4rem;
+  margin-bottom: 10px;
+  font-weight: 500;
+  font-family: "Public Sans", sans-serif;
+  color: #000;
+}
+
+.headingInfo{
+  display: flex;
+  align-items: center;
+}
+
+
+.headingInfo img{
+
+  width: 40px;
+  align-items: center;
+  justify-content: center;
+  filter: brightness(0) invert(0);
 }
 
 /* Upload Card Styles */
 .alpha-upload-card {
-  background: white;
+  background: none;
   border-radius: 16px;
   padding: 40px;
   text-align: center;
-  box-shadow: 0 8px 32px rgba(0,0,0,0.1);
-  border: 2px dashed #e2e8f0;
+  height: 720px;
+  border: 2px dashed black;
   transition: all 0.3s ease;
   margin-bottom: 30px;
-  max-width: 600px;
-  margin-left: auto;
-  margin-right: auto;
+
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+
+
+
+}
+
+.alpha-upload-card img {
+width: 200px;
+
 }
 
 .alpha-upload-card:hover {
-  border-color: #667eea;
+  border-color: #B9E5FC;
   transform: translateY(-2px);
-  box-shadow: 0 12px 40px rgba(0,0,0,0.15);
+  border: 3px dashed black;
+
 }
 
 .alpha-upload-card.dragging {
-  border-color: #667eea;
+  border-color: #B9E5FC;
   background: #f8faff;
   transform: scale(1.02);
 }
@@ -124,7 +244,7 @@ body {
 /* Preview Card Styles */
 .alpha-preview-card {
   background: white;
-  border-radius: 16px;
+  border-radius: 10px;
   padding: 30px;
   box-shadow: 0 8px 32px rgba(0,0,0,0.1);
   margin-bottom: 30px;
@@ -135,7 +255,8 @@ body {
 
 .alpha-preview-title {
   font-size: 1.5rem;
-  font-weight: 600;
+  font-weight: 400;
+  letter-spacing: 3px;
   color: #334155;
   margin-bottom: 20px;
   text-align: center;
@@ -144,12 +265,12 @@ body {
 .alpha-preview-text {
   background: #f8fafc;
   border: 1px solid #e2e8f0;
-  border-radius: 8px;
+  border-radius: 2px;
   padding: 20px;
   font-size: 1rem;
   line-height: 1.6;
-  color: #334155;
-  max-height: 400px;
+  color: black;
+  max-height: 650px;
   overflow-y: auto;
   white-space: pre-wrap;
   word-wrap: break-word;
@@ -243,30 +364,31 @@ body {
 
 /* Modal Styles */
 .modal-overlay {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: rgba(0, 0, 0, 0.5);
+  /* for responsive text box make sure to change width here */
+ margin-top: -339px;
+  position: absolute;
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 1000;
-  backdrop-filter: blur(4px);
+ 
+  
 }
 
 .modal-content {
+ 
   background: white;
-  border-radius: 16px;
+  border-radius: 8px;
   padding: 30px;
-  max-width: 600px;
+  min-width: 400px;
   width: 90%;
-  max-height: 80vh;
   overflow-y: auto;
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
   animation: modalSlideIn 0.3s ease-out;
+
+
 }
+
+
 
 @keyframes modalSlideIn {
   from {
@@ -381,4 +503,111 @@ button:focus {
     background: #000;
     color: #fff;
   }
+}
+
+
+@media (min-width: 768px) {
+
+  .modal-content {
+  
+      background: white;
+      border-radius: 8px;
+      padding: 30px;
+      min-width: 265px;
+      height: 176px;
+      overflow-y: hidden;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+      animation: modalSlideIn 0.3s ease-out;
+  
+  
+    }
+
+    
+
+
+}
+
+
+
+@media (min-width: 1024px) {
+
+  .modal-content {
+
+    background: white;
+    border-radius: 8px;
+    padding: 30px;
+    min-width: 332px;
+    height: 190px;
+    overflow-y: hidden;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+    animation: modalSlideIn 0.3s ease-out;
+
+
+  }
+
+
+}
+
+
+@media (min-width: 1440px) {
+
+  .modal-content {
+
+    background: white;
+    border-radius: 8px;
+    padding: 30px;
+    min-width: 498px;
+    height: 190px;
+    overflow-y: hidden;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+    animation: modalSlideIn 0.3s ease-out;
+
+
+  }
+
+
+}
+
+
+@media (min-width: 2560px) {
+
+  .modal-content {
+
+    background: white;
+    border-radius: 8px;
+    padding: 30px;
+    min-width: 946px;
+    height: 190px;
+    overflow-y: hidden;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+    animation: modalSlideIn 0.3s ease-out;
+
+
+  }
+
+
+  
+
+}
+
+@media (min-width: 768px) {
+  
+}
+.alpha-upload-card {
+  background: none;
+  border-radius: 16px;
+  padding: 40px;
+  text-align: center;
+  height: 707px;
+  border: 2px dashed black;
+  transition: all 0.3s ease;
+  margin-bottom: 30px;
+
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+
+
+
 }

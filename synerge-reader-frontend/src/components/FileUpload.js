@@ -20,16 +20,16 @@ const FileUpload = ({ onFileParsed, setIsLoading, setError }) => {
       const formData = new FormData();
       const blob = new Blob([textContent], { type: 'text/plain' });
       formData.append('file', blob, fileName);
-      
-      const response = await fetch(process.env.REACT_APP_BACKEND_URL + '/upload', {
+
+      const response = await fetch(process.env.REACT_APP_BACKEND_URL || "http://localhost:5000" + '/upload', {
         method: 'POST',
         body: formData
       });
-      
+
       if (!response.ok) {
         throw new Error(`Upload failed: ${response.statusText}`);
       }
-      
+
       const result = await response.json();
       console.log('Document uploaded successfully:', result);
       return result;
@@ -52,10 +52,10 @@ const FileUpload = ({ onFileParsed, setIsLoading, setError }) => {
 
     setIsLoading(true);
     setError("");
-    
+
     try {
       let textContent = "";
-      
+
       if (file.type === "application/pdf") {
         textContent = await processPDF(file);
       } else if (file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
@@ -63,13 +63,13 @@ const FileUpload = ({ onFileParsed, setIsLoading, setError }) => {
       } else if (file.type === "text/plain") {
         textContent = await processTXT(file);
       }
-      
+
       // Upload to backend for processing
       await uploadToBackend(textContent, file.name);
-      
+
       // Call the callback with parsed text
       onFileParsed(textContent, file.name);
-      
+
     } catch (error) {
       setError(`Error processing file: ${error.message}`);
       setIsLoading(false);
@@ -163,24 +163,13 @@ const FileUpload = ({ onFileParsed, setIsLoading, setError }) => {
       role="region"
       aria-label="File upload area"
     >
-      <svg
-        className="alpha-upload-icon"
-        width="40"
-        height="40"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="#5563d7"
-        strokeWidth="2"
-      >
-        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-        <polyline points="14 2 14 8 20 8" />
-      </svg>
+      <img src="/uploadIcon.svg" />
       <div className="alpha-upload-hint">
-        <strong>Drag & Drop</strong> a <span className="pdf-accent">PDF</span>,{" "}
+        <strong>Upload a document</strong><br /> <span className="pdf-accent">PDF</span>,{" "}
         <span className="docx-accent">DOCX</span>, or{" "}
-        <span className="txt-accent">TXT</span> file here{" "}
+        <span className="txt-accent">TXT</span> File{" "}<br />
         <span className="dim">(max 20MB)</span>
-        <br /> or
+        <br />
       </div>
       <input
         type="file"
