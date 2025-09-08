@@ -504,3 +504,110 @@ button:focus {
     color: #fff;
   }
 }
+
+
+@media (min-width: 768px) {
+
+  .modal-content {
+  
+      background: white;
+      border-radius: 8px;
+      padding: 30px;
+      min-width: 265px;
+      height: 176px;
+      overflow-y: hidden;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+      animation: modalSlideIn 0.3s ease-out;
+  
+  
+    }
+
+    
+
+
+}
+
+
+
+@media (min-width: 1024px) {
+
+  .modal-content {
+
+    background: white;
+    border-radius: 8px;
+    padding: 30px;
+    min-width: 332px;
+    height: 190px;
+    overflow-y: hidden;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+    animation: modalSlideIn 0.3s ease-out;
+
+
+  }
+
+
+}
+
+
+@media (min-width: 1440px) {
+
+  .modal-content {
+
+    background: white;
+    border-radius: 8px;
+    padding: 30px;
+    min-width: 498px;
+    height: 190px;
+    overflow-y: hidden;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+    animation: modalSlideIn 0.3s ease-out;
+
+
+  }
+
+
+}
+
+
+@media (min-width: 2560px) {
+
+  .modal-content {
+
+    background: white;
+    border-radius: 8px;
+    padding: 30px;
+    min-width: 946px;
+    height: 190px;
+    overflow-y: hidden;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+    animation: modalSlideIn 0.3s ease-out;
+
+
+  }
+
+
+  
+
+}
+
+@media (min-width: 768px) {
+  
+}
+.alpha-upload-card {
+  background: none;
+  border-radius: 16px;
+  padding: 40px;
+  text-align: center;
+  height: 707px;
+  border: 2px dashed black;
+  transition: all 0.3s ease;
+  margin-bottom: 30px;
+
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+
+
+
+}

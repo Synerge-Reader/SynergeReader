@@ -116,81 +116,119 @@ function GridApp(){
         
     </div>
     </div>
-    <div class="div2">
-  <div className="action-box">
-<div className="box-contents">
-<h2>Chat Box </h2>
-<h2>History</h2>
-</div>
-<hr/>
-<div className="main-action-box">
-{selectedText && (
-          <div style={{margin: '12px auto', maxWidth: 600, color: '#3b4ca0', background: '#f0f4ff', padding: 12, borderRadius: 6}}>
-            <strong>Selected Text:</strong> {selectedText.substring(0, 200)}{selectedText.length > 200 ? '...' : ''}
-          </div>
-        )}
+     <div class="div2">
+    <div className="action-box">
+      <div className="box-contents">
+        <h2
+          onClick={() => setOpenHistory(false)}
+          style={{ cursor: 'pointer', fontWeight: openHistory ? 400 : 700, marginRight: 16 }}
+          aria-selected={!openHistory}
+        >
+          Chat Box
+        </h2>
 
-    {answer && (
-          <div style={{margin: '32px auto', maxWidth: 800, background: '#fff', borderRadius: 8, boxShadow: '0 2px 8px rgba(0,0,0,0.07)', padding: 20}}>
-            <h3>Response</h3>
-           
-            <div style={{marginBottom: 16}}>
-              <strong>Question:</strong> {answer.question}
-            </div>
-            <div style={{marginBottom: 16}}>
-              <strong>Answer:</strong> {answer.answer}
-            </div>
-            {answer.context_chunks && answer.context_chunks.length > 0 && (
-              <details style={{marginBottom: 16}}>
-                 <summary style={{cursor: "pointer", fontWeight: "bold"}}>
-               Relevant Context
-                </summary>
-                <div style={{background: '#f0f8ff', padding: 12, borderRadius: 4, marginTop: 8}}>
-                  {answer.context_chunks.map((chunk, idx) => (
-                    <div key={idx} style={{marginBottom: 8, fontSize: '0.9em'}}>
-                      {chunk.substring(0, 150)}...
-                    </div>
-                  ))}
-                </div>
-              </details>
-            
+        <h2
+          onClick={() => setOpenHistory(true)}
+          style={{ cursor: 'pointer', fontWeight: openHistory ? 700 : 400 }}
+        >
+          History
+        </h2>
+      </div>
+
+      <hr/>
+
+      <div className="main-action-box">
+        {openHistory ? (
+          <>
+            {fileName && (
+              <div style={{margin: '32px auto', maxWidth: 800, padding: '10px', marginTop: '-10px'}}>
+                {history.length === 0 ? <div>No history yet.</div> : (
+                  <div style={{maxHeight: 400, overflowY: 'auto'}}>
+                    {history.map((h, idx) => (
+                      <div key={idx} style={{background: '#f8fafc', marginBottom: 12, padding: 16, borderRadius: 8, border: '1px solid #e2e8f0'}}>
+                        <div style={{marginBottom: 8}}>
+                          <strong>Selected Text:</strong> 
+                          <div style={{background: '#fff', padding: 8, borderRadius: 4, marginTop: 4, fontSize: '0.9em'}}>
+                            {h.selected_text.substring(0, 200)}{h.selected_text.length > 200 ? '...' : ''}
+                          </div>
+                        </div>
+                        <div style={{marginBottom: 8}}>
+                          <strong>Q:</strong> {h.question}
+                        </div>
+                        <div style={{marginBottom: 8}}>
+                          <strong>A:</strong> {h.answer}
+                        </div>
+                        <div style={{fontSize: '0.8em', color: '#888'}}>{h.timestamp}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             )}
-            {answer.relevant_history && answer.relevant_history.length > 0 && (
-              <details>
-                 <summary style={{cursor: "pointer", fontWeight: "bold"}}>
-                Relevant History
-                </summary>
-                <div style={{background: '#f0f8ff', padding: 12, borderRadius: 4, marginTop: 8}}>
-                  {answer.relevant_history.map((hist, idx) => (
-                    <div key={idx} style={{marginBottom: 8, fontSize: '0.9em'}}>
-                      <strong>Q:</strong> {hist.question}<br/>
-                      <strong>A:</strong> {hist.answer.substring(0, 100)}...
-                    </div>
-                  ))}
-                </div>
-              </details>
+          </>
+        ) : (
+          <>
+            {selectedText && (
+              <div style={{margin: '12px auto', maxWidth: 600, color: '#3b4ca0', background: '#f0f4ff', padding: 12, borderRadius: 6}}>
+                <strong>Selected Text:</strong> {selectedText.substring(0, 200)}{selectedText.length > 200 ? '...' : ''}
+              </div>
             )}
-          </div>
+
+            {answer && (
+              <div style={{margin: '32px auto', maxWidth: 800, background: '#fff', borderRadius: 8, boxShadow: '0 2px 8px rgba(0,0,0,0.07)', padding: 20}}>
+                <h3>Response</h3>
+                <div style={{marginBottom: 16}}>
+                  <strong>Question:</strong> {answer.question}
+                </div>
+                <div style={{marginBottom: 16}}>
+                  <strong>Answer:</strong> {answer.answer}
+                </div>
+                {answer.context_chunks && answer.context_chunks.length > 0 && (
+                  <details style={{marginBottom: 16}}>
+                    <summary style={{cursor: "pointer", fontWeight: "bold"}}>
+                      Relevant Context
+                    </summary>
+                    <div style={{background: '#f0f8ff', padding: 12, borderRadius: 4, marginTop: 8}}>
+                      {answer.context_chunks.map((chunk, idx) => (
+                        <div key={idx} style={{marginBottom: 8, fontSize: '0.9em'}}>
+                          {chunk.substring(0, 150)}...
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                )}
+                {answer.relevant_history && answer.relevant_history.length > 0 && (
+                  <details>
+                    <summary style={{cursor: "pointer", fontWeight: "bold"}}>
+                      Relevant History
+                    </summary>
+                    <div style={{background: '#f0f8ff', padding: 12, borderRadius: 4, marginTop: 8}}>
+                      {answer.relevant_history.map((hist, idx) => (
+                        <div key={idx} style={{marginBottom: 8, fontSize: '0.9em'}}>
+                          <strong>Q:</strong> {hist.question}<br/>
+                          <strong>A:</strong> {hist.answer.substring(0, 100)}...
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                )}
+              </div>
+            )}
+          </>
         )}
-</div>
-<div className="main-text-Box">
-  
-  <AskModal 
+      </div>
+
+      <div className="main-text-Box">
+        <AskModal 
           open
           onClose={() => setAskOpen(false)} 
           onAsk={handleAsk}
           selectedText={selectedText}
         />
-
-</div>
-
-
-
-
+      </div>
+    </div>
   </div>
 
-    
-  </div>
     <div class="div3">
        <footer>  
   <hr/>     
@@ -213,32 +251,7 @@ function GridApp(){
 
 
 {/*    
-{fileName && (
-        <div style={{margin: '32px auto', maxWidth: 800}}>
-          <h3>Chat History</h3>
-          {history.length === 0 ? <div>No history yet.</div> : (
-            <div style={{maxHeight: 400, overflowY: 'auto'}}>
-              {history.map((h, idx) => (
-                <div key={idx} style={{background: '#f8fafc', marginBottom: 12, padding: 16, borderRadius: 8, border: '1px solid #e2e8f0'}}>
-                  <div style={{marginBottom: 8}}>
-                    <strong>Selected Text:</strong> 
-                    <div style={{background: '#fff', padding: 8, borderRadius: 4, marginTop: 4, fontSize: '0.9em'}}>
-                      {h.selected_text.substring(0, 200)}{h.selected_text.length > 200 ? '...' : ''}
-                    </div>
-                  </div>
-                  <div style={{marginBottom: 8}}>
-                    <strong>Q:</strong> {h.question}
-                  </div>
-                  <div style={{marginBottom: 8}}>
-                    <strong>A:</strong> {h.answer}
-                  </div>
-                  <div style={{fontSize: '0.8em', color: '#888'}}>{h.timestamp}</div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-        )}
+
 
 
 
