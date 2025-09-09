@@ -14,24 +14,11 @@ const AskModal = ({ open, onClose, onAsk, selectedText }) => {
   };
 
   return (
-    <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.3)', zIndex: 1000 }}>
-      <div className="modal-content" style={{ background: '#fff', padding: 24, borderRadius: 8, maxWidth: 600, margin: '40px auto', maxHeight: '80vh', overflowY: 'auto', boxShadow: '0 2px 16px rgba(0,0,0,0.15)' }}>
+    <div className="modal-overlay">
+      <div className="modal-content">
         <h2>Ask a Question</h2>
-
-        {selectedText && (
-          <div style={{ marginBottom: 16, background: '#f8f9fa', padding: 12, borderRadius: 4, border: '1px solid #e9ecef' }}>
-            <strong>Selected Context:</strong>
-            <div style={{ marginTop: 8, fontSize: '0.9em', lineHeight: 1.4 }}>
-              {selectedText}
-            </div>
-          </div>
-        )}
-
         <form onSubmit={handleSubmit}>
-          <div style={{ marginBottom: 16 }}>
-            <label htmlFor="question" style={{ display: 'block', marginBottom: 8, fontWeight: 500 }}>
-              Your Question:
-            </label>
+          <div style={{ marginBottom: 5 }}>
             <textarea
               id="question"
               value={question}
@@ -39,6 +26,7 @@ const AskModal = ({ open, onClose, onAsk, selectedText }) => {
               rows={4}
               style={{
                 width: '100%',
+                justifyContent: 'center',
                 padding: 12,
                 border: '1px solid #ddd',
                 borderRadius: 4,
