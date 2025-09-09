@@ -26,7 +26,7 @@ jobs:
       - name: Sync Repo to Target Directory
         run: |
           echo "Before step: $(whoami)"
-          TARGET_DIR="/home/legal-read-2025/repo"
+          TARGET_DIR="/mnt/shared_disk/2025-legalread/repo"
           mkdir -p $TARGET_DIR
           rsync -av --exclude='.github' ./ $TARGET_DIR/
           echo "After step: $(whoami)"
@@ -34,7 +34,7 @@ jobs:
       - name: Build & Start Containers
         run: |
           echo "Before step: $(whoami)"
-          cd /home/legal-read-2025/repo
+          cd /mnt/shared_disk/2025-legalread/repo
           docker-compose down
           docker-compose build --no-cache
           docker-compose up -d
