@@ -2,17 +2,17 @@ import React, { useRef, useState } from "react";
 import * as pdfjsLib from "pdfjs-dist/build/pdf";
 import { GlobalWorkerOptions } from "pdfjs-dist/build/pdf";
 import mammoth from "mammoth";
+import Dropdown from "./Dropdown";
 
 GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
   import.meta.url
 ).toString();
 
-const FileUpload = ({ onFileParsed, setIsLoading, setError }) => {
+export default function FileUpload ({ onFileParsed, setIsLoading, setError, model, setModel }) {
   const fileInputRef = useRef();
   const [isDragging, setIsDragging] = useState(false);
   const allowedTypes = ["application/pdf", "text/plain", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"];
-
   const setDefault = () => setIsDragging(false);
 
   const uploadToBackend = async (textContent, fileName) => {
@@ -21,7 +21,7 @@ const FileUpload = ({ onFileParsed, setIsLoading, setError }) => {
       const blob = new Blob([textContent], { type: 'text/plain' });
       formData.append('file', blob, fileName);
 
-      const response = await fetch(process.env.REACT_APP_BACKEND_URL || "http://localhost:5000" + '/upload', {
+      const response = await fetch((process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + '/upload', {
         method: 'POST',
         body: formData
       });
@@ -186,8 +186,16 @@ const FileUpload = ({ onFileParsed, setIsLoading, setError }) => {
       >
         Browse Files
       </button>
+
+      <Dropdown
+        title={`Selected Model: ${model}`}
+        options={["llama3.1:8b", "gpt-oss:20b"]}
+        onSelect={(option) => {
+          setModel(option);
+          console.log("Selected:", option);
+        }}
+      />
+
     </div>
   );
 };
-
-export default FileUpload;

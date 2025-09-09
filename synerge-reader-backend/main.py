@@ -1,10 +1,12 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import sqlite3
 import os
 import datetime
 from typing import List
 import requests
+import json
 from pydantic import BaseModel
 
 app = FastAPI(title="SynergeReader API", version="1.0.0")
@@ -18,6 +20,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+OLLAMA_HOST = os.getenv('OLLAMA_HOST', '172.18.0.1')  # Use the gateway IP as default
+OLLAMA_PORT = os.getenv('OLLAMA_PORT', '11434')
+
 # Configuration
 DB_PATH = os.path.join(os.path.dirname(__file__), 'synerge_reader.db')
 
@@ -25,9 +30,11 @@ DB_PATH = os.path.join(os.path.dirname(__file__), 'synerge_reader.db')
 class AskRequest(BaseModel):
     selected_text: str
     question: str
+    model: str
 
 class AskResponse(BaseModel):
     answer: str
+    question: str
     context_chunks: List[str]
     relevant_history: List[dict]
 
@@ -42,6 +49,8 @@ def init_db():
     """Initialize SQLite database with proper schema"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    
+    # Existing chat_history table
     c.execute('''CREATE TABLE IF NOT EXISTS chat_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts TEXT NOT NULL,
@@ -49,8 +58,101 @@ def init_db():
         question TEXT NOT NULL,
         answer TEXT NOT NULL
     )''')
+    
+    # New documents table
+    c.execute('''CREATE TABLE IF NOT EXISTS documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        filename TEXT NOT NULL,
+        upload_timestamp TEXT NOT NULL,
+        content TEXT NOT NULL
+    )''')
+    
+    # New document_chunks table
+    c.execute('''CREATE TABLE IF NOT EXISTS document_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id INTEGER,
+        chunk_text TEXT NOT NULL,
+        chunk_index INTEGER,
+        embedding_json TEXT,
+        FOREIGN KEY (document_id) REFERENCES documents (id)
+    )''')
+    
     conn.commit()
     conn.close()
+
+def chunk_text(text: str, max_chunk_size: int = 500) -> list:
+    """
+    Split text into chunks based on word count and character limit.
+    
+    Args:
+        text: The input text to chunk
+        max_chunk_size: Maximum character size per chunk
+    
+    Returns:
+        List of text chunks
+    """
+    if not text or not text.strip():
+        return []
+    
+    words = text.split()
+    chunks = []
+    current_chunk = []
+    
+    for word in words:
+        # Calculate current chunk size if we add this word
+        current_size = sum(len(w) for w in current_chunk) + len(current_chunk) - 1  # -1 for spaces
+        
+        if current_size + len(word) + 1 <= max_chunk_size:  # +1 for space
+            current_chunk.append(word)
+        else:
+            if current_chunk:  # Only append if there's content
+                chunks.append(" ".join(current_chunk))
+            current_chunk = [word]
+    
+    # Add the last chunk if it has content
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+    
+    return chunks
+
+def embed_chunks(chunks: List[str], model: str = "DC1LEX/Qwen3-Embedding-0.6B-f16:latest") -> List[List[float]]:
+    """
+    Generate embeddings for text chunks using Ollama API.
+    
+    Args:
+        chunks: List of text chunks to embed
+        model: Ollama model to use for embeddings
+    
+    Returns:
+        List of embedding vectors
+    """
+    if not chunks:
+        return []
+    
+    embeddings = []
+    ollama_url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/embeddings"
+    
+    for chunk in chunks:
+        try:
+            payload = {
+                "model": model,
+                "prompt": chunk
+            }
+            
+            response = requests.post(ollama_url, json=payload, timeout=30)
+            response.raise_for_status()
+            
+            data = response.json()
+            # Ollama returns embeddings in 'embedding' field
+            embedding = data.get("embedding", [])
+            embeddings.append(embedding)
+            
+        except Exception as e:
+            print(f"Error generating embedding for chunk: {str(e)}")
+            # Return zero vector as fallback
+            embeddings.append([0.0] * 384)  # Default embedding size
+    
+    return embeddings
 
 def analyze_question(question: str, selected_text: str) -> str:
     """Simple question analysis"""
@@ -123,146 +225,224 @@ def get_relevant_history(question: str, selected_text: str, limit: int = 3) -> L
     relevant_history.sort(key=lambda x: x["relevance_score"], reverse=True)
     return relevant_history[:limit]
 
-def call_llm(question: str, context_chunks: List[str], selected_text: str, relevant_history: List[dict]) -> str:
-    """Call LLM with enhanced prompt including context and history"""
-    # Build comprehensive prompt
-    prompt_parts = []
+def get_relevant_chunks(question: str, top_k: int = 3) -> List[str]:
+    """
+    Get relevant document chunks based on question similarity.
+    This is a simple implementation - you might want to use vector similarity later.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
     
-    # Add relevant history
+    # Simple keyword matching for now
+    question_words = set(question.lower().split())
+    
+    c.execute('''
+        SELECT chunk_text, embedding_json 
+        FROM document_chunks
+    ''')
+    
+    chunks_data = c.fetchall()
+    conn.close()
+    
+    if not chunks_data:
+        return []
+    
+    # Score chunks based on keyword overlap
+    scored_chunks = []
+    for chunk_text, embedding_json in chunks_data:
+        chunk_words = set(chunk_text.lower().split())
+        overlap_score = len(question_words.intersection(chunk_words))
+        if overlap_score > 0:
+            scored_chunks.append((chunk_text, overlap_score))
+    
+    # Sort by score and return top results
+    scored_chunks.sort(key=lambda x: x[1], reverse=True)
+    return [chunk[0] for chunk in scored_chunks[:top_k]]
+
+def call_llm(
+    question: str,
+    context_chunks: List[str],
+    selected_text: str,
+    relevant_history: List[dict],
+    model: str
+) -> str:
+    """Call Ollama LLM and return the full answer after completion using streaming"""
+
+    # Build prompt
+    prompt_parts = []
+
     if relevant_history:
         history_text = "\n".join([
             f"Previous Q: {h['question']}\nPrevious A: {h['answer']}"
             for h in relevant_history
         ])
         prompt_parts.append(f"Relevant History:\n{history_text}")
-    
-    # Add context chunks
+
     if context_chunks:
         context_text = "\n\n".join(context_chunks)
         prompt_parts.append(f"Document Context:\n{context_text}")
-    
-    # Add selected text
+
     if selected_text:
         prompt_parts.append(f"Selected Text:\n{selected_text}")
-    
-    # Add question
+
     prompt_parts.append(f"Question:\n{question}")
-    
-    # Build final prompt
+
     prompt = "\n\n".join(prompt_parts) + "\n\nPlease provide a comprehensive answer based on the context provided."
-    
-    # Call OpenRouter API
-    api_url = "https://openrouter.ai/api/v1/chat/completions"
-    api_key = "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"
-    model = "meta-llama/llama-3.3-70b-instruct:free"
-    
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    
+
+    # Ollama API call with streaming
+    api_url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/generate"
     payload = {
         "model": model,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
+        "prompt": prompt,
         "max_tokens": 1000,
         "temperature": 0.7
     }
-    
-    try:
-        response = requests.post(api_url, headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"Error calling LLM: {str(e)}"
 
-# Initialize database on startup
-init_db()
+    try:
+        response = requests.post(api_url, json=payload, timeout=60)
+        response.raise_for_status()
+        
+        # Process streaming response
+        full_answer = ""
+        for line in response.text.splitlines():
+            if line.strip():
+                try:
+                    parsed = json.loads(line)
+                    full_answer += parsed.get("response", "")
+                except json.JSONDecodeError:
+                    # Skip invalid JSON lines
+                    continue
+        
+        return full_answer if full_answer else "No response received from LLM"
+        
+    except Exception as e:
+        return f"Error calling Ollama LLM: {str(e)}"
+
+# API Endpoints
 
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
-    """Upload and process document for chunking and embedding"""
+    """Upload and process a document for embedding storage"""
     try:
-        # Validate file type
-        if not file.filename.lower().endswith(('.pdf', '.txt', '.docx')):
-            raise HTTPException(status_code=400, detail="Unsupported file type. Please upload PDF, TXT, or DOCX files.")
-        
-        # Check file size (20MB limit)
-        if file.size > 20 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="File too large. Maximum size is 20MB.")
-        
         # Read file content
         content = await file.read()
         
-        # For now, we'll assume text content is passed directly
-        if file.filename.lower().endswith('.txt'):
-            text_content = content.decode('utf-8')
-        else:
-            # For PDF/DOCX, we'll need to implement parsing
-            # For now, assume text content
-            text_content = content.decode('utf-8', errors='ignore')
+        # Decode text (handle different file types as needed)
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            # Try other encodings if UTF-8 fails
+            try:
+                text = content.decode("latin-1")
+            except UnicodeDecodeError:
+                raise HTTPException(status_code=400, detail="Could not decode file content")
         
-        # Generate document ID
-        document_id = f"doc_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="File appears to be empty")
         
-        return {
-            "message": "Document uploaded and processed successfully",
-            "document_id": document_id,
-            "text_length": len(text_content)
-        }
+        # Chunk the text
+        chunks = chunk_text(text, max_chunk_size=500)
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
-
-@app.post("/ask", response_model=AskResponse)
-async def ask_question(request: AskRequest):
-    """Ask a question and get LLM answer with context"""
-    try:
-        # Analyze the question
-        question_analysis = analyze_question(request.question, request.selected_text)
+        if not chunks:
+            raise HTTPException(status_code=400, detail="No valid chunks generated from document")
         
-        # For demo purposes, create dummy context chunks
-        context_chunks = [
-            "This is a sample context chunk from the document that might be relevant to your question.",
-            "Another relevant piece of information from the document that could help answer your question."
-        ]
+        # Generate embeddings
+        embeddings = embed_chunks(chunks)
         
-        # Get relevant history
-        relevant_history = get_relevant_history(request.question, request.selected_text)
-        
-        # Call LLM with enhanced context
-        answer = call_llm(
-            request.question, 
-            context_chunks, 
-            request.selected_text, 
-            relevant_history
-        )
-        
-        # Store in SQLite history
+        # Store in database
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
+        
+        # Insert document
         c.execute('''
-            INSERT INTO chat_history (ts, selected_text, question, answer) 
-            VALUES (?, ?, ?, ?)
-        ''', (
-            datetime.datetime.now().isoformat(),
-            request.selected_text,
-            request.question,
-            answer
-        ))
+            INSERT INTO documents (filename, upload_timestamp, content) 
+            VALUES (?, ?, ?)
+        ''', (file.filename, datetime.datetime.now().isoformat(), text))
+        
+        document_id = c.lastrowid
+        
+        # Insert chunks with embeddings
+        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+            c.execute('''
+                INSERT INTO document_chunks (document_id, chunk_text, chunk_index, embedding_json) 
+                VALUES (?, ?, ?, ?)
+            ''', (document_id, chunk, i, json.dumps(embedding)))
+        
         conn.commit()
         conn.close()
         
-        return AskResponse(
-            answer=answer,
-            context_chunks=context_chunks,
-            relevant_history=relevant_history
-        )
+        return {
+            "message": "Document uploaded and processed successfully",
+            "filename": file.filename,
+            "document_id": document_id,
+            "chunks_count": len(chunks),
+            "embeddings_count": len(embeddings)
+        }
         
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
+
+@app.post("/ask")
+async def ask_question(request: AskRequest):
+    """Ask a question and stream LLM answer with context from uploaded documents"""
+    try:
+        # Get relevant chunks from uploaded documents
+        context_chunks = get_relevant_chunks(request.question, top_k=3)
+        if not context_chunks and request.selected_text:
+            context_chunks = [request.selected_text]
+        elif not context_chunks:
+            context_chunks = ["No relevant context found in uploaded documents."]
+
+        # Get relevant history
+        relevant_history = get_relevant_history(request.question, request.selected_text)
+
+        # Build prompt
+        prompt_parts = []
+        if relevant_history:
+            history_text = "\n".join(
+                f"Previous Q: {h['question']}\nPrevious A: {h['answer']}"
+                for h in relevant_history
+            )
+            prompt_parts.append(f"Relevant History:\n{history_text}")
+
+        if context_chunks:
+            prompt_parts.append(f"Document Context:\n" + "\n\n".join(context_chunks))
+
+        if request.selected_text:
+            prompt_parts.append(f"Selected Text:\n{request.selected_text}")
+
+        prompt_parts.append(f"Question:\n{request.question}")
+        prompt = "\n\n".join(prompt_parts) + "\n\nPlease provide a comprehensive answer based on the context provided."
+
+        # Generator to stream from Ollama
+        def stream_generate():
+            api_url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/generate"
+            payload = {
+                "model": request.model,
+                "prompt": prompt,
+                "max_tokens": 1000,
+                "temperature": 0.7,
+                "stream": True
+            }
+
+            with requests.post(api_url, json=payload, stream=True) as r:
+                r.raise_for_status()
+                for line in r.iter_lines():
+                    if line:
+                        try:
+                            parsed = json.loads(line.decode("utf-8"))
+                            token = parsed.get("response", "")
+                            if token:
+                                yield token
+                        except Exception:
+                            continue
+
+        return StreamingResponse(stream_generate(), media_type="text/plain")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error streaming answer: {str(e)}")
 
 @app.get("/history", response_model=List[HistoryItem])
 async def get_history():
@@ -293,10 +473,41 @@ async def get_history():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving history: {str(e)}")
 
+@app.get("/documents")
+async def get_documents():
+    """Get list of uploaded documents"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            SELECT id, filename, upload_timestamp,
+                   (SELECT COUNT(*) FROM document_chunks WHERE document_id = documents.id) as chunks_count
+            FROM documents 
+            ORDER BY upload_timestamp DESC
+        ''')
+        rows = c.fetchall()
+        conn.close()
+        
+        return [
+            {
+                "id": row[0],
+                "filename": row[1],
+                "upload_timestamp": row[2],
+                "chunks_count": row[3]
+            }
+            for row in rows
+        ]
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving documents: {str(e)}")
+
 @app.get("/test")
 async def test_endpoint():
     """Test endpoint to verify API is working"""
     return {"message": "SynergeReader API is working!"}
+
+# Initialize database when app starts
+init_db()
 
 if __name__ == "__main__":
     import uvicorn

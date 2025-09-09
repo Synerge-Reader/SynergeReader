@@ -17,6 +17,7 @@ function GridApp(){
   const [answer, setAnswer] = useState(null);
   const [history, setHistory] = useState([]);
   const [openHistory, setOpenHistory] = useState(false);
+  const [model, setModel] = useState("llama3.1:8b");
 
   useEffect(() => {
     fetch(process.env.REACT_APP_BACKEND_URL || "http://localhost:5000" + "/test")
@@ -99,6 +100,8 @@ function GridApp(){
           onFileParsed={handleFileParsed}
           setIsLoading={setIsLoading}
           setError={setError}
+          model={model}
+          setModel={setModel}
         />
   )}
         {error && <div className="error-message">{error}</div>}
