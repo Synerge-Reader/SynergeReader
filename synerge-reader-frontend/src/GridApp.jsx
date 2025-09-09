@@ -4,7 +4,9 @@ import TextPreview from "./components/TextPreview";
 import AskModal from "./components/AskModal";
 import TitleLogo from "./components/TitleLogo";
 import Top from "./components/Top";
+import ReactMarkdown from "react-markdown";
 import './GridApp.css'
+import Markdown from "react-markdown";
 
 function GridApp(){
   const [parsedText, setParsedText] = useState("");
@@ -197,7 +199,7 @@ function GridApp(){
                   <strong>Question:</strong> {answer.question}
                 </div>
                 <div style={{marginBottom: 16}}>
-                  <strong>Answer:</strong> {answer.answer}
+                  <strong>Answer:</strong> <Markdown>{answer.answer}</Markdown>
                 </div>
                 {answer.context_chunks && answer.context_chunks.length > 0 && (
                   <details style={{marginBottom: 16}}>
