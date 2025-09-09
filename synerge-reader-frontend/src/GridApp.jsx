@@ -4,7 +4,9 @@ import TextPreview from "./components/TextPreview";
 import AskModal from "./components/AskModal";
 import TitleLogo from "./components/TitleLogo";
 import Top from "./components/Top";
+import ReactMarkdown from "react-markdown";
 import './GridApp.css'
+import Markdown from "react-markdown";
 
 function GridApp(){
   const [parsedText, setParsedText] = useState("");
@@ -20,11 +22,11 @@ function GridApp(){
   const [model, setModel] = useState("llama3.1:8b");
 
   useEffect(() => {
-    fetch(process.env.REACT_APP_BACKEND_URL || "http://localhost:5000" + "/test")
+    fetch((process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/test")
       .then((res) => res.json())
       .then((data) => setBackendMsg(data.message))
       .catch(() => setBackendMsg("Could not connect to backend."));
-    fetch(process.env.REACT_APP_BACKEND_URL || "http://localhost:5000" + "/history")
+    fetch((process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/history")
       .then((res) => res.json())
       .then((data) => setHistory(data))
       .catch(() => setHistory([]));
@@ -37,37 +39,50 @@ function GridApp(){
     setError("");
   };
 
-  const handleAsk = (question) => {
-    if (!selectedText.trim()) {
-      setError("Please select some text from the document before asking a question.");
-      return;
-    }
+  const handleAsk = async (question) => {
+  if (!selectedText.trim()) {
+    setError("Please select some text first.");
+    return;
+  }
 
-    setIsLoading(true);
-    fetch(process.env.REACT_APP_BACKEND_URL || "http://localhost:5000" + "/ask", {
+  setIsLoading(true);
+  try {
+    const res = await fetch((process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ 
+      body: JSON.stringify({
         selected_text: selectedText,
-        question: question 
-      })
-    })
-      .then(res => res.json())
-      .then(data => {
-        setAnswer(data);
-        setIsLoading(false);
-        setAskOpen(false);
-        
-        // Refresh history
-        fetch(process.env.REACT_APP_BACKEND_URL || "http://localhost:5000" + "/history")
-          .then((res) => res.json())
-          .then((data) => setHistory(data));
-      })
-      .catch(() => {
-        setError("Could not get answer from backend.");
-        setIsLoading(false);
-      });
-  };
+        question,
+        model,
+      }),
+    });
+
+    if (!res.ok) throw new Error("Backend error");
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let fullText = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      fullText += decoder.decode(value, { stream: true });
+      // optionally: set partial streaming text here
+    }
+
+    setAnswer({
+      question,
+      answer: fullText,
+      context_chunks: [],
+      relevant_history: []
+    });
+  } catch (err) {
+    setError("Could not get answer from backend.");
+  } finally {
+    setIsLoading(false);
+    setAskOpen(false);
+  }
+};
 
   const handleTextSelection = (text) => {
     setSelectedText(text);
@@ -184,7 +199,7 @@ function GridApp(){
                   <strong>Question:</strong> {answer.question}
                 </div>
                 <div style={{marginBottom: 16}}>
-                  <strong>Answer:</strong> {answer.answer}
+                  <strong>Answer:</strong> <Markdown>{answer.answer}</Markdown>
                 </div>
                 {answer.context_chunks && answer.context_chunks.length > 0 && (
                   <details style={{marginBottom: 16}}>
