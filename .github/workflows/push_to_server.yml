@@ -1,70 +1,47 @@
 name: Deploy SynergeReader
 
-
-
-
 # 1️⃣ Manual trigger
-
 on:
-
   workflow_dispatch:
 
-
-
 jobs:
-
   deploy:
-
     runs-on: self-hosted
-
-
-
+    
     steps:
-
       - name: Check Runner User
-
         run: whoami
 
-
-
       - name: Checkout Repo
-
         uses: actions/checkout@v3
 
-
-
-
       # 2️⃣ Get runner IP and set as environment variable
-
       - name: Get Runner IP
-
         id: get_ip
-
         run: |
-
           IP=$(hostname -I | awk '{print $1}')
-
           echo "RUNNER_IP=$IP" >> $GITHUB_ENV
 
-
-
-
       # 3️⃣ Sync repository to target directory
-
-
       - name: Sync Repo to Target Directory
-
         run: |
-
-
           echo "Before step: $(whoami)"
-
           TARGET_DIR="/mnt/2025-legalread/repo"
-
           mkdir -p $TARGET_DIR
-
-
           rsync -av --exclude='.github' ./ $TARGET_DIR/
+          echo "After step: $(whoami)"
 
+      - name: Build & Start Containers
+        run: |
+          echo "Before step: $(whoami)"
+          cd /mnt/2025-legalread/repo
+          docker-compose down
+          docker-compose build --no-cache
+          docker-compose up -d
+          echo "After step: $(whoami)"
 
+      - name: Show Container Status
+        run: |
+          echo "Before step: $(whoami)"
+          docker ps
           echo "After step: $(whoami)"
