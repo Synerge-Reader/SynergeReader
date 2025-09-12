@@ -1,6 +1,5 @@
 name: Deploy SynergeReader
 
-# 1️⃣ Manual trigger
 on:
   workflow_dispatch:
 
@@ -15,33 +14,44 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v3
 
-      # 2️⃣ Get runner IP and set as environment variable
       - name: Get Runner IP
         id: get_ip
         run: |
           IP=$(hostname -I | awk '{print $1}')
           echo "RUNNER_IP=$IP" >> $GITHUB_ENV
 
-      # 3️⃣ Sync repository to target directory
-      - name: Sync Repo to Target Directory
+      - name: Prepare Target Directory
         run: |
-          echo "Before step: $(whoami)"
           TARGET_DIR="/mnt/2025-legalread/repo"
           mkdir -p $TARGET_DIR
-          rsync -av --exclude='.github' ./ $TARGET_DIR/
-          echo "After step: $(whoami)"
+          # Set owner/group to runner user
+          chown -R $(whoami):$(whoami) $TARGET_DIR
+          # Set directories to rwx for user/group + setgid
+          chmod 2775 $TARGET_DIR
+          # Default ACLs for new files/directories
+          setfacl -d -m u::rwx,g::rwx,o::--- $TARGET_DIR
+
+      - name: Sync Repo to Target Directory
+        run: |
+          TARGET_DIR="/mnt/2025-legalread/repo"
+          # rsync with permissions: directories and files get rwx for user/group
+          rsync -av --exclude='.github' \
+            --chmod=Du=rwx,Dg=rwx,Do=---,Fu=rwx,Fg=rwx,Fo=--- \
+            ./ $TARGET_DIR/
 
       - name: Build & Start Containers
         run: |
-          echo "Before step: $(whoami)"
           cd /mnt/2025-legalread/repo
           docker-compose down
           docker-compose build --no-cache
           docker-compose up -d
-          echo "After step: $(whoami)"
+
+      - name: Fix Permissions After Docker
+        run: |
+          TARGET_DIR="/mnt/2025-legalread/repo"
+          # Ensure all files and directories are rwx for user/group
+          find $TARGET_DIR -type d -exec chmod u+rwx,g+rwx {} \;
+          find $TARGET_DIR -type f -exec chmod u+rwx,g+rwx {} \;
 
       - name: Show Container Status
-        run: |
-          echo "Before step: $(whoami)"
-          docker ps
-          echo "After step: $(whoami)"
+        run: docker ps
