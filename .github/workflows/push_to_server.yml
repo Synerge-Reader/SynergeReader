@@ -24,8 +24,6 @@ jobs:
         run: |
           TARGET_DIR="/mnt/2025-legalread/repo"
           mkdir -p $TARGET_DIR
-          # Set owner/group to runner user
-          chown -R $(whoami):$(whoami) $TARGET_DIR
           # Set directories to rwx for user/group + setgid
           chmod 2775 $TARGET_DIR
           # Default ACLs for new files/directories
