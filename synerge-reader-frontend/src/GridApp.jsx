@@ -5,8 +5,9 @@ import AskModal from "./components/AskModal";
 import TitleLogo from "./components/TitleLogo";
 import Top from "./components/Top";
 import ReactMarkdown from "react-markdown";
-import './GridApp.css'
 import Markdown from "react-markdown";
+import RatingModal from "./components/RatingModal.jsx";
+import './GridApp.css'
 
 function GridApp(){
   const [parsedText, setParsedText] = useState("");
@@ -20,6 +21,8 @@ function GridApp(){
   const [history, setHistory] = useState([]);
   const [openHistory, setOpenHistory] = useState(false);
   const [model, setModel] = useState("llama3.1:8b");
+  const [openRating, setOpenRating] = useState(false);
+
 
   useEffect(() => {
     fetch((process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/test")
@@ -44,6 +47,7 @@ function GridApp(){
     setError("Please select some text first.");
     return;
   }
+
 
   setIsLoading(true);
   try {
@@ -94,11 +98,13 @@ function GridApp(){
 
 
 
+
+
     return(<>
 
 
 <div class="parent">
-
+  {openRating && <RatingModal setOpenRating={setOpenRating}/>}
  <div class="div4">
       <Top></Top>
          <hr/>
@@ -199,7 +205,11 @@ function GridApp(){
                   <strong>Question:</strong> {answer.question}
                 </div>
                 <div style={{marginBottom: 16}}>
-                  <strong>Answer:</strong> <Markdown>{answer.answer}</Markdown>
+                  <strong>Answer:</strong> 
+                  <div onClick={() => setOpenRating(true)}
+                       style={{ cursor: "pointer", display: "inline-block", marginLeft: 8 }}>
+                    <Markdown>{answer.answer}</Markdown>
+                  </div> 
                 </div>
                 {answer.context_chunks && answer.context_chunks.length > 0 && (
                   <details style={{marginBottom: 16}}>
