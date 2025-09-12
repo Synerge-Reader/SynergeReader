@@ -110,7 +110,8 @@ function GridApp(){
          <hr/>
            <TitleLogo></TitleLogo>
              <div className="alpha-subtitle">
-          Transforming research papers into interactive  AI analysis
+          Interactive Human-AI Reading for Any Document:
+          Transforming Complexity into Clarity and Insights
         </div>
     </div>
 
