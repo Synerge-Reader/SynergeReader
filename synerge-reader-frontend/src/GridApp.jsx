@@ -43,65 +43,64 @@ const GridApp = async () => {
   };
 
   const handleAsk = async (question) => {
-    if (!selectedText.trim()) {
-      setError("Please select some text first.");
-      return;
-    }
+  if (!selectedText.trim()) {
+    setError("Please select some text first.");
+    return;
   }
-
 
   setIsLoading(true);
   try {
     const res = await fetch((process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/ask", {
-     method: "POST",
+      method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-       selected_text: selectedText,
+        selected_text: selectedText,
         question,
-       model,
+        model,
       }),
     });
-  
+
     if (!res.ok) throw new Error("Backend error");
-  
+
     const reader = res.body.getReader();
     const decoder = new TextDecoder("utf-8");
     let fullText = "";
-  
-   while (true) {
+
+    while (true) {
       const { done, value } = await reader.read();
-     if (done) break;
+      if (done) break;
       fullText += decoder.decode(value, { stream: true });
-     // optionally: set partial streaming text here
+      // optionally: set partial streaming text here
     }
     
     // Extract entry ID from the end of the response
     let answer = fullText;
     let entryId = null;
-  
-   const entryIdMatch = fullText.match(/__ENTRY_ID__(\d+)__/);
-   if (entryIdMatch) {
+
+    const entryIdMatch = fullText.match(/__ENTRY_ID__(\d+)__/);
+    if (entryIdMatch) {
       entryId = parseInt(entryIdMatch[1]);
-     // Remove the entry ID marker from the answer
-     answer = fullText.replace(/__ENTRY_ID__\d+__/, '').trim();
+      // Remove the entry ID marker from the answer
+      answer = fullText.replace(/__ENTRY_ID__\d+__/, '').trim();
     }
-  
+
     console.log('Entry ID:', entryId); // You can use this ID as needed
-  
+
     setAnswer({
-     question,
-     answer: answer,
-     context_chunks: [],
-     relevant_history: [],
-     entryId: entryId // Add the entry ID to your state
-   });
-  
+      question,
+      answer: answer,
+      context_chunks: [],
+      relevant_history: [],
+      entryId: entryId // Add the entry ID to your state
+    });
+
   } catch (err) {
-   setError("Could not get answer from backend.");
+    setError("Could not get answer from backend.");
   } finally {
-   setIsLoading(false);
-   setAskOpen(false);
+    setIsLoading(false);
+    setAskOpen(false);
   }
+  };
 
   const handleTextSelection = (text) => {
     setSelectedText(text);
