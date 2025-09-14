@@ -33,6 +33,7 @@ class AskRequest(BaseModel):
     model: str
 
 class AskResponse(BaseModel):
+    id: int
     answer: str
     question: str
     context_chunks: List[str]
@@ -45,6 +46,12 @@ class HistoryItem(BaseModel):
     question: str
     answer: str
 
+class RatingRequest(BaseModel):
+    id: int
+    rating: int
+    comment: str = None
+
+
 def init_db():
     """Initialize SQLite database with proper schema"""
     conn = sqlite3.connect(DB_PATH)
@@ -56,7 +63,9 @@ def init_db():
         ts TEXT NOT NULL,
         selected_text TEXT NOT NULL,
         question TEXT NOT NULL,
-        answer TEXT NOT NULL
+        answer TEXT NOT NULL,
+        rating INTEGER,
+        comment TEXT
     )''')
     
     # New documents table
@@ -394,10 +403,10 @@ async def ask_question(request: AskRequest):
             context_chunks = [request.selected_text]
         elif not context_chunks:
             context_chunks = ["No relevant context found in uploaded documents."]
-
+        
         # Get relevant history
         relevant_history = get_relevant_history(request.question, request.selected_text)
-
+        
         # Build prompt
         prompt_parts = []
         if relevant_history:
@@ -406,18 +415,23 @@ async def ask_question(request: AskRequest):
                 for h in relevant_history
             )
             prompt_parts.append(f"Relevant History:\n{history_text}")
-
+        
         if context_chunks:
             prompt_parts.append(f"Document Context:\n" + "\n\n".join(context_chunks))
-
+        
         if request.selected_text:
             prompt_parts.append(f"Selected Text:\n{request.selected_text}")
-
+        
         prompt_parts.append(f"Question:\n{request.question}")
         prompt = "\n\n".join(prompt_parts) + "\n\nPlease provide a comprehensive answer based on the context provided."
-
+        
+        # Store answer chunks and entry ID for database insertion
+        answer_chunks = []
+        entry_id = None
+        
         # Generator to stream from Ollama
         def stream_generate():
+            nonlocal answer_chunks, entry_id
             api_url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/generate"
             payload = {
                 "model": request.model,
@@ -426,21 +440,50 @@ async def ask_question(request: AskRequest):
                 "temperature": 0.7,
                 "stream": True
             }
-
-            with requests.post(api_url, json=payload, stream=True) as r:
-                r.raise_for_status()
-                for line in r.iter_lines():
-                    if line:
-                        try:
-                            parsed = json.loads(line.decode("utf-8"))
-                            token = parsed.get("response", "")
-                            if token:
-                                yield token
-                        except Exception:
-                            continue
-
+            
+            try:
+                with requests.post(api_url, json=payload, stream=True) as r:
+                    r.raise_for_status()
+                    for line in r.iter_lines():
+                        if line:
+                            try:
+                                parsed = json.loads(line.decode("utf-8"))
+                                token = parsed.get("response", "")
+                                if token:
+                                    answer_chunks.append(token)
+                                    yield token
+                            except Exception:
+                                continue
+            finally:
+                # Save to database after streaming completes
+                full_answer = ''.join(answer_chunks)
+                if full_answer:  # Only save if we got a response
+                    try:
+                        conn = sqlite3.connect(DB_PATH)
+                        c = conn.cursor()
+                        c.execute('''
+                            INSERT INTO chat_history (ts, selected_text, question, answer)
+                            VALUES (?, ?, ?, ?)
+                        ''', (
+                            datetime.datetime.now().isoformat(),
+                            request.selected_text,
+                            request.question,
+                            full_answer
+                        ))
+                        entry_id = c.lastrowid  # Get the primary key of the inserted row
+                        conn.commit()
+                        conn.close()
+                        
+                        # Send the primary key as the final part of the stream
+                        yield f"\n\n__ENTRY_ID__{entry_id}__"
+                        
+                    except Exception as db_error:
+                        # Log the database error but don't interrupt streaming
+                        print(f"Database error: {db_error}")
+                        yield f"\n\n__ERROR__Database error occurred__"
+        
         return StreamingResponse(stream_generate(), media_type="text/plain")
-
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error streaming answer: {str(e)}")
 
@@ -500,6 +543,35 @@ async def get_documents():
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving documents: {str(e)}")
+
+@app.put("/put_ratings")  # Changed to PUT since you're updating
+async def put_ratings(request: RatingRequest):
+    """Update rating and comment for a chat history entry"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        # Update the rating and comment for the specified ID
+        c.execute('''
+            UPDATE chat_history 
+            SET rating = ?, comment = ?
+            WHERE id = ?
+        ''', (request.rating, request.comment, request.id))
+        
+        # Check if any row was actually updated
+        if c.rowcount == 0:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Chat history entry not found")
+        
+        conn.commit()
+        conn.close()
+        
+        return {"success": True, "message": "Rating updated successfully", "id": request.id}
+        
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating rating: {str(e)}")
 
 @app.get("/test")
 async def test_endpoint():
