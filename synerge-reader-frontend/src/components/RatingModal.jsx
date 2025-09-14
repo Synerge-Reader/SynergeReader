@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import './RatingModal.css'
 
-export default function RatingModal({ setOpenRating }) {
+export default function RatingModal({ setOpenRating, entryId }) {
   const [rating, setRating] = useState(0);
   const [hover, setHover] = useState(0);
   const [comment, setComment] = useState("");
@@ -9,14 +9,15 @@ export default function RatingModal({ setOpenRating }) {
 
 
   const handleSubmit = async () => {
-  //  const res = await fetch((process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/putRatings", {
-  //    method: "POST",
-  //    headers: { "Content-Type": "application/json" },
-  //    body: JSON.stringify({
-  //      rating: rating,
-  //     comment: comment,
-  //    }),
-  //  });
+    const res = await fetch((process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/put_ratings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        rating: rating,
+        comment: comment,
+        id: entryId
+      }),
+    });
     console.log(rating, comment);
     setOpenRating(false);
   }
