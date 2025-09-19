@@ -660,7 +660,7 @@ async def register(request: RegisterRequest):
     """,
         (request.username,),
     )
-    already_registered = c.fetchall()
+    already_registered = c.fetchone()
 
     if already_registered:
         conn.close()
@@ -675,6 +675,7 @@ async def register(request: RegisterRequest):
     """,
         (request.username, hashed_password),
     )
+    conn.commit()
     conn.close()
 
     return {"message": "Registered Successfully"}
