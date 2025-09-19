@@ -18,6 +18,7 @@ export default function UserAuth({ setOpenAuth }) {
         }),
       },
     );
+    console.log(res);
   };
 
   return (
@@ -44,7 +45,7 @@ export default function UserAuth({ setOpenAuth }) {
           onChange={(e) => setPassword(e.target.value)}
         />
         {/* Submit Button */}
-        <button className="submit-btn" onClick={handleSubmit()}>
+        <button className="submit-btn" onClick={() => handleSubmit()}>
           Submit
         </button>
       </div>
