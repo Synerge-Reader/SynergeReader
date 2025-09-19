@@ -2,39 +2,53 @@ import React, { useRef, useState } from "react";
 import * as pdfjsLib from "pdfjs-dist/build/pdf";
 import { GlobalWorkerOptions } from "pdfjs-dist/build/pdf";
 import mammoth from "mammoth";
-import Dropdown from "./Dropdown";
+import Dropdown from "./Dropdown/Dropdown.jsx";
 
 GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
-  import.meta.url
+  import.meta.url,
 ).toString();
 
-export default function FileUpload ({ onFileParsed, setIsLoading, setError, model, setModel }) {
+export default function FileUpload({
+  onFileParsed,
+  setIsLoading,
+  setError,
+  model,
+  setModel,
+}) {
   const fileInputRef = useRef();
   const [isDragging, setIsDragging] = useState(false);
-  const allowedTypes = ["application/pdf", "text/plain", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"];
+  const allowedTypes = [
+    "application/pdf",
+    "text/plain",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ];
   const setDefault = () => setIsDragging(false);
 
   const uploadToBackend = async (textContent, fileName) => {
     try {
       const formData = new FormData();
-      const blob = new Blob([textContent], { type: 'text/plain' });
-      formData.append('file', blob, fileName);
+      const blob = new Blob([textContent], { type: "text/plain" });
+      formData.append("file", blob, fileName);
 
-      const response = await fetch((process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + '/upload', {
-        method: 'POST',
-        body: formData
-      });
+      const response = await fetch(
+        (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") +
+          "/upload",
+        {
+          method: "POST",
+          body: formData,
+        },
+      );
 
       if (!response.ok) {
         throw new Error(`Upload failed: ${response.statusText}`);
       }
 
       const result = await response.json();
-      console.log('Document uploaded successfully:', result);
+      console.log("Document uploaded successfully:", result);
       return result;
     } catch (error) {
-      console.error('Upload error:', error);
+      console.error("Upload error:", error);
       setError(`Failed to upload document: ${error.message}`);
       throw error;
     }
@@ -58,7 +72,10 @@ export default function FileUpload ({ onFileParsed, setIsLoading, setError, mode
 
       if (file.type === "application/pdf") {
         textContent = await processPDF(file);
-      } else if (file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
+      } else if (
+        file.type ===
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      ) {
         textContent = await processDOCX(file);
       } else if (file.type === "text/plain") {
         textContent = await processTXT(file);
@@ -69,7 +86,6 @@ export default function FileUpload ({ onFileParsed, setIsLoading, setError, mode
 
       // Call the callback with parsed text
       onFileParsed(textContent, file.name);
-
     } catch (error) {
       setError(`Error processing file: ${error.message}`);
       setIsLoading(false);
@@ -103,7 +119,8 @@ export default function FileUpload ({ onFileParsed, setIsLoading, setError, mode
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = function (e) {
-        mammoth.extractRawText({ arrayBuffer: e.target.result })
+        mammoth
+          .extractRawText({ arrayBuffer: e.target.result })
           .then((result) => {
             resolve(result.value);
           })
@@ -165,9 +182,10 @@ export default function FileUpload ({ onFileParsed, setIsLoading, setError, mode
     >
       <img src="/uploadIcon.svg" />
       <div className="alpha-upload-hint">
-        <strong>Upload a document</strong><br /> <span className="pdf-accent">PDF</span>,{" "}
+        <strong>Upload a document</strong>
+        <br /> <span className="pdf-accent">PDF</span>,{" "}
         <span className="docx-accent">DOCX</span>, or{" "}
-        <span className="txt-accent">TXT</span> File{" "}<br />
+        <span className="txt-accent">TXT</span> File <br />
         <span className="dim">(max 20MB)</span>
         <br />
       </div>
@@ -195,7 +213,7 @@ export default function FileUpload ({ onFileParsed, setIsLoading, setError, mode
           console.log("Selected:", option);
         }}
       />
-
     </div>
   );
-};
+}
+

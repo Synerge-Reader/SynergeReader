@@ -49,7 +49,7 @@ class HistoryItem(BaseModel):
 class RatingRequest(BaseModel):
     id: int
     rating: int
-    comment: str = None
+    comment: str
 
 
 def init_db():
@@ -84,6 +84,13 @@ def init_db():
         chunk_index INTEGER,
         embedding_json TEXT,
         FOREIGN KEY (document_id) REFERENCES documents (id)
+    )''')
+    
+    # New users table
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT,
+        password TEXT
     )''')
     
     conn.commit()
@@ -573,6 +580,13 @@ async def put_ratings(request: RatingRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating rating: {str(e)}")
 
+
+
+@app.get("/register")
+async def register():
+    
+
+            
 @app.get("/test")
 async def test_endpoint():
     """Test endpoint to verify API is working"""
