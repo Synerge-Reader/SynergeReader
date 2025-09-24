@@ -17,7 +17,7 @@ services:
       - sqlite_data:/app/db                     # persistent SQLite DB
     environment:
       - PYTHONUNBUFFERED=1
-      - OLLAMA_HOST=172.18.0.1
+      - OLLAMA_HOST=${OLLAMA_HOST}
       - OLLAMA_PORT=11434
     restart: unless-stopped
 
