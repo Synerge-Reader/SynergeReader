@@ -25,22 +25,38 @@ const GridApp = () => {
   const [model, setModel] = useState("llama3.1:8b");
   const [openRating, setOpenRating] = useState(false);
   const [openAuth, setOpenAuth] = useState(false);
-
+  const [authToken, setAuthToken] = useState('')
   useEffect(() => {
-    fetch(
-      (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/test",
-    )
-      .then((res) => res.json())
-      .then((data) => setBackendMsg(data.message))
-      .catch(() => setBackendMsg("Could not connect to backend."));
-    fetch(
-      (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") +
-      "/history",
-    )
-      .then((res) => res.json())
-      .then((data) => setHistory(data))
-      .catch(() => setHistory([]));
+    const fetchData = async () => {
+      fetch(
+        (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/test",
+      )
+        .then((res) => res.json())
+        .then((data) => setBackendMsg(data.message))
+        .catch(() => setBackendMsg("Could not connect to backend."));
+      const token = localStorage.getItem("authToken"); // get token from localStorage
+      if (!token) {
+        setHistory([]);
+        return;
+      }
+      else {
+        const res = await fetch(
+          (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + `/history`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              token,
+            }),
+          }
+        );
+        const data = await res.json();
+        setHistory(data);
+      }
+    }
+    fetchData();
   }, []);
+
 
   const handleFileParsed = (text, name) => {
     setParsedText(text);
@@ -66,6 +82,7 @@ const GridApp = () => {
             selected_text: selectedText,
             question,
             model,
+            auth_token: authToken
           }),
         },
       );
@@ -124,7 +141,7 @@ const GridApp = () => {
         {openRating && (
           <RatingModal setOpenRating={setOpenRating} entryId={answer.entryId} />
         )}
-        {openAuth && <UserAuth setOpenAuth={setOpenAuth} />}
+        {openAuth && <UserAuth setOpenAuth={setOpenAuth} setAuthToken={setAuthToken} />}
         <div class="div4">
           <Top setOpenAuth={setOpenAuth} />
           <hr />
@@ -190,60 +207,58 @@ const GridApp = () => {
             <div className="main-action-box">
               {openHistory ? (
                 <>
-                  {fileName && (
-                    <div
-                      style={{
-                        margin: "32px auto",
-                        maxWidth: 800,
-                        padding: "10px",
-                        marginTop: "-10px",
-                      }}
-                    >
-                      {history.length === 0 ? (
-                        <div>No history yet.</div>
-                      ) : (
-                        <div style={{ maxHeight: 400, overflowY: "auto" }}>
-                          {history.map((h, idx) => (
-                            <div
-                              key={idx}
-                              style={{
-                                background: "#f8fafc",
-                                marginBottom: 12,
-                                padding: 16,
-                                borderRadius: 8,
-                                border: "1px solid #e2e8f0",
-                              }}
-                            >
-                              <div style={{ marginBottom: 8 }}>
-                                <strong>Selected Text:</strong>
-                                <div
-                                  style={{
-                                    background: "#fff",
-                                    padding: 8,
-                                    borderRadius: 4,
-                                    marginTop: 4,
-                                    fontSize: "0.9em",
-                                  }}
-                                >
-                                  {h.selected_text.substring(0, 200)}
-                                  {h.selected_text.length > 200 ? "..." : ""}
-                                </div>
-                              </div>
-                              <div style={{ marginBottom: 8 }}>
-                                <strong>Q:</strong> {h.question}
-                              </div>
-                              <div style={{ marginBottom: 8 }}>
-                                <strong>A:</strong> {h.answer}
-                              </div>
-                              <div style={{ fontSize: "0.8em", color: "#888" }}>
-                                {h.timestamp}
+                  <div
+                    style={{
+                      margin: "32px auto",
+                      maxWidth: 800,
+                      padding: "10px",
+                      marginTop: "-10px",
+                    }}
+                  >
+                    {history.length === 0 ? (
+                      <div>No history yet.</div>
+                    ) : (
+                      <div style={{ maxHeight: 400, overflowY: "auto" }}>
+                        {history.map((h, idx) => (
+                          <div
+                            key={idx}
+                            style={{
+                              background: "#f8fafc",
+                              marginBottom: 12,
+                              padding: 16,
+                              borderRadius: 8,
+                              border: "1px solid #e2e8f0",
+                            }}
+                          >
+                            <div style={{ marginBottom: 8 }}>
+                              <strong>Selected Text:</strong>
+                              <div
+                                style={{
+                                  background: "#fff",
+                                  padding: 8,
+                                  borderRadius: 4,
+                                  marginTop: 4,
+                                  fontSize: "0.9em",
+                                }}
+                              >
+                                {h.selected_text.substring(0, 200)}
+                                {h.selected_text.length > 200 ? "..." : ""}
                               </div>
                             </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  )}
+                            <div style={{ marginBottom: 8 }}>
+                              <strong>Q:</strong> {h.question}
+                            </div>
+                            <div style={{ marginBottom: 8 }}>
+                              <strong>A:</strong> {h.answer}
+                            </div>
+                            <div style={{ fontSize: "0.8em", color: "#888" }}>
+                              {h.timestamp}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </>
               ) : (
                 <>

@@ -9,6 +9,7 @@ import requests
 import json
 from pydantic import BaseModel
 import bcrypt
+import secrets
 
 app = FastAPI(title="SynergeReader API", version="1.0.0")
 
@@ -33,6 +34,7 @@ class AskRequest(BaseModel):
     selected_text: str
     question: str
     model: str
+    auth_token: str
 
 
 class AskResponse(BaseModel):
@@ -51,6 +53,10 @@ class HistoryItem(BaseModel):
     answer: str
 
 
+class HistoryRequest(BaseModel):
+    token: str
+
+
 class RatingRequest(BaseModel):
     id: int
     rating: int
@@ -58,6 +64,11 @@ class RatingRequest(BaseModel):
 
 
 class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginRequest(BaseModel):
     username: str
     password: str
 
@@ -70,12 +81,14 @@ def init_db():
     # Existing chat_history table
     c.execute("""CREATE TABLE IF NOT EXISTS chat_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
         ts TEXT NOT NULL,
         selected_text TEXT NOT NULL,
         question TEXT NOT NULL,
         answer TEXT NOT NULL,
         rating INTEGER,
-        comment TEXT
+        comment TEXT,
+        FOREIGN KEY (user_id) REFERENCES users (id)
     )""")
 
     # New documents table
@@ -100,7 +113,8 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT,
-        password TEXT
+        password TEXT,
+        token TEXT
     )""")
 
     conn.commit()
@@ -490,8 +504,9 @@ async def ask_question(request: AskRequest):
                 "stream": True,
             }
 
+            # Stream tokens from Ollama
             try:
-                with requests.post(api_url, json=payload, stream=True) as r:
+                with requests.post(api_url, json=payload, stream=True, timeout=60) as r:
                     r.raise_for_status()
                     for line in r.iter_lines():
                         if line:
@@ -503,38 +518,50 @@ async def ask_question(request: AskRequest):
                                     yield token
                             except Exception:
                                 continue
-            finally:
-                # Save to database after streaming completes
-                full_answer = "".join(answer_chunks)
-                if full_answer:  # Only save if we got a response
-                    try:
-                        conn = sqlite3.connect(DB_PATH)
-                        c = conn.cursor()
-                        c.execute(
-                            """
-                            INSERT INTO chat_history (ts, selected_text, question, answer)
-                            VALUES (?, ?, ?, ?)
+            except Exception as api_error:
+                yield f"\n\n__ERROR__LLM streaming error: {api_error}__"
+
+            # Save full answer to DB after streaming
+            full_answer = "".join(answer_chunks)
+            if full_answer:
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    c = conn.cursor()
+
+                    # Get user_id from token
+                    c.execute(
+                        "SELECT id FROM users WHERE token = ?", (request.auth_token,)
+                    )
+                    row = c.fetchone()
+                    if not row:
+                        yield f"\n\n__ERROR__Invalid auth token__"
+                        return
+                    user_id = row[0]
+
+                    # Insert into chat_history
+                    c.execute(
+                        """
+                        INSERT INTO chat_history (ts, selected_text, question, answer, user_id)
+                        VALUES (?, ?, ?, ?, ?)
                         """,
-                            (
-                                datetime.datetime.now().isoformat(),
-                                request.selected_text,
-                                request.question,
-                                full_answer,
-                            ),
-                        )
-                        entry_id = (
-                            c.lastrowid
-                        )  # Get the primary key of the inserted row
-                        conn.commit()
-                        conn.close()
+                        (
+                            datetime.datetime.now().isoformat(),
+                            request.selected_text,
+                            request.question,
+                            full_answer,
+                            user_id,
+                        ),
+                    )
+                    entry_id = c.lastrowid
+                    conn.commit()
+                    conn.close()
 
-                        # Send the primary key as the final part of the stream
-                        yield f"\n\n__ENTRY_ID__{entry_id}__"
+                    # Send the entry ID at the end
+                    yield f"\n\n__ENTRY_ID__{entry_id}__"
 
-                    except Exception as db_error:
-                        # Log the database error but don't interrupt streaming
-                        print(f"Database error: {db_error}")
-                        yield f"\n\n__ERROR__Database error occurred__"
+                except Exception as db_error:
+                    print(f"Database error: {db_error}")
+                    yield f"\n\n__ERROR__Database error occurred__"
 
         return StreamingResponse(stream_generate(), media_type="text/plain")
 
@@ -542,18 +569,26 @@ async def ask_question(request: AskRequest):
         raise HTTPException(status_code=500, detail=f"Error streaming answer: {str(e)}")
 
 
-@app.get("/history", response_model=List[HistoryItem])
-async def get_history():
+@app.post("/history", response_model=List[HistoryItem])
+async def get_history(request: HistoryRequest):
     """Get chat history"""
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("""
+        c.execute(
+            """
             SELECT id, ts, selected_text, question, answer 
-            FROM chat_history 
-            ORDER BY id DESC 
-            LIMIT 20
-        """)
+            FROM chat_history
+            WHERE user_id IN (
+                SELECT id
+                FROM users
+                WHERE token = ?
+            )
+            ORDER BY id 
+            DESC LIMIT 20
+        """,
+            (request.token,),
+        )
         rows = c.fetchall()
         conn.close()
 
@@ -654,9 +689,9 @@ async def register(request: RegisterRequest):
     c = conn.cursor()
     c.execute(
         """
-        SELECT id
-        FROM users
-        WHERE username = ?
+        select id
+        from users
+        where username = ?
     """,
         (request.username,),
     )
@@ -667,18 +702,37 @@ async def register(request: RegisterRequest):
         raise HTTPException(status_code=400, detail="Email already registered")
 
     hashed_password = await hash_password(request.password)
-
+    session_token = secrets.token_hex(32)
     c.execute(
         """
-        INSERT INTO users (username, password) 
-        VALUES (?, ?)
+        INSERT INTO users (username, password, token) 
+        VALUES (?, ?, ?)
     """,
-        (request.username, hashed_password),
+        (request.username, hashed_password, session_token),
     )
     conn.commit()
     conn.close()
 
-    return {"message": "Registered Successfully"}
+    return {"message": "Registered Successfully", "token": session_token}
+
+
+@app.post("/login")
+async def login(request: LoginRequest):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    c.execute(
+        "SELECT password, token FROM users WHERE username = ?", (request.username,)
+    )
+    row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=400, detail="Invalid username or password")
+
+    stored_hashed_password, token = row
+    if not bcrypt.checkpw(request.password.encode(), stored_hashed_password.encode()):
+        raise HTTPException(status_code=400, detail="Invalid username or password")
+
+    return {"message": "Login Successful", "token": token}
 
 
 @app.get("/test")
