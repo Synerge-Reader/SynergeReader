@@ -1,7 +1,7 @@
 import { useState } from "react";
 import "./UserAuth.css";
 
-export default function UserAuth({ setOpenAuth, setAuthToken }) {
+export default function UserAuth({ setOpenAuth, setAuthToken, setNotification }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
 
@@ -23,9 +23,11 @@ export default function UserAuth({ setOpenAuth, setAuthToken }) {
       const data = await res.json();
       console.log(endpoint.toUpperCase(), data);
       setAuthToken(data.token);
+      setNotification(`Successful ${endpoint}!`);
       localStorage.setItem("authToken", data.token);
     } catch (err) {
       console.error("Auth error:", err);
+      setNotification("User Auth Error")
     }
   };
 

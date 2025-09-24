@@ -4,12 +4,12 @@ import TextPreview from "./components/TextPreview";
 import AskModal from "./components/AskModal";
 import TitleLogo from "./components/TitleLogo";
 import Top from "./components/Top";
-import ReactMarkdown from "react-markdown";
 import Markdown from "react-markdown";
 import RatingModal from "./components/RatingModal/RatingModal.jsx";
 import UserAuth from "./components/UserAuth/UserAuth.jsx";
 import "./GridApp.css";
-
+import Spinner from './components/Spinner/Spinner'
+import Notifier from './components/Notifier/Notifier'
 const GridApp = () => {
   // Removed 'async' keyword
   const [parsedText, setParsedText] = useState("");
@@ -26,6 +26,9 @@ const GridApp = () => {
   const [openRating, setOpenRating] = useState(false);
   const [openAuth, setOpenAuth] = useState(false);
   const [authToken, setAuthToken] = useState('')
+  const [notification, setNotification] = useState('')
+
+
   useEffect(() => {
     const fetchData = async () => {
       fetch(
@@ -137,11 +140,14 @@ const GridApp = () => {
 
   return (
     <>
+
       <div class="parent">
+        {notification && <Notifier message={notification} setNotification={setNotification} />}
+        {isLoading && <Spinner />}
         {openRating && (
           <RatingModal setOpenRating={setOpenRating} entryId={answer.entryId} />
         )}
-        {openAuth && <UserAuth setOpenAuth={setOpenAuth} setAuthToken={setAuthToken} />}
+        {openAuth && <UserAuth setOpenAuth={setOpenAuth} setAuthToken={setAuthToken} setNotification={setNotification} />}
         <div class="div4">
           <Top setOpenAuth={setOpenAuth} />
           <hr />
