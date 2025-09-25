@@ -9,6 +9,83 @@ import requests
 import json
 from pydantic import BaseModel
 
+# System instruction and few-shot prompt for LLM
+SYSTEM_INSTRUCTION = """System Instruction: You are a precise document analysis assistant specialized in answering questions based exclusively on provided text snippets. Your core function is to analyze selected text from documents and provide accurate, factual answers derived solely from that text.
+CRITICAL CONSTRAINTS:
+1. You MUST answer questions using ONLY the information contained in the provided text snippet
+2. You MUST NOT use any external knowledge, even if you know additional information about the topic
+3. If the answer cannot be found in the provided text, you MUST explicitly state: "The provided text does not contain information to answer this question"
+4. You MUST NOT make inferences beyond what is explicitly stated in the text
+5. You MUST NOT add context or background information not present in the snippet
+RESPONSE GUIDELINES:
+- Provide direct, concise answers without conversational elements
+- Quote relevant portions of the text when appropriate to support your answer
+- If multiple interpretations are possible, acknowledge the ambiguity
+- Distinguish between explicit information and implied information
+- For yes/no questions, provide the answer followed by the supporting text evidence
+ACCURACY REQUIREMENTS:
+- Prioritize precision over helpfulness
+- If partially relevant information exists but doesn't fully answer the question, state what can be determined and what cannot
+- Never fabricate, assume, or extrapolate information
+- Maintain strict adherence to the text boundaries provided
+"""
+
+FEW_SHOT_PROMPT = """Few-Shot Prompt: INPUT FORMAT:
+<text_snippet>
+[Selected text from document]
+</text_snippet>
+<question>
+[User's question about the selected text]
+</question>
+---
+EXAMPLE 1 - Direct Answer Available:
+<text_snippet>
+The Amazon rainforest, often referred to as the "lungs of the Earth," produces approximately 20% of the world's oxygen. It spans across nine countries in South America, with Brazil containing 60% of the rainforest within its borders. The forest is home to an estimated 390 billion individual trees divided into 16,000 species.
+</text_snippet>
+<question>
+What percentage of the world's oxygen does the Amazon rainforest produce?
+</question>
+<answer>
+The Amazon rainforest produces approximately 20% of the world's oxygen.
+</answer>
+---
+EXAMPLE 2 - Information Not Found:
+<text_snippet>
+The Amazon rainforest, often referred to as the "lungs of the Earth," produces approximately 20% of the world's oxygen. It spans across nine countries in South America, with Brazil containing 60% of the rainforest within its borders. The forest is home to an estimated 390 billion individual trees divided into 16,000 species.
+</text_snippet>
+<question>
+What is the annual rainfall in the Amazon rainforest?
+</question>
+<answer>
+The provided text does not contain information about the annual rainfall in the Amazon rainforest.
+</answer>
+---
+EXAMPLE 3 - Partial Information Available:
+<text_snippet>
+Machine learning models require training data to learn patterns and make predictions. The quality and quantity of training data directly impact model performance. Data preprocessing steps include cleaning, normalization, and feature engineering. Models are evaluated using metrics such as accuracy, precision, and recall.
+</text_snippet>
+<question>
+How long does it typically take to train a machine learning model?
+</question>
+<answer>
+The provided text does not contain information about training duration for machine learning models. The text only discusses that models require training data and mentions evaluation metrics, but does not specify timeframes.
+</answer>
+---
+EXAMPLE 4 - Multiple Related Facts:
+<text_snippet>
+Solar panels convert sunlight into electricity through the photovoltaic effect. Modern residential solar panels typically have an efficiency rate between 15% and 20%. The average solar panel produces between 250 and 400 watts of power under optimal conditions. Installation costs have decreased by approximately 70% over the past decade.
+</text_snippet>
+<question>
+What are the key specifications of modern solar panels?
+</question>
+<answer>
+Based on the provided text, modern residential solar panels have:
+- Efficiency rate: between 15% and 20%
+- Power output: between 250 and 400 watts under optimal conditions
+- Cost trend: Installation costs have decreased by approximately 70% over the past decade
+</answer>
+"""
+
 app = FastAPI(title="SynergeReader API", version="1.0.0")
 
 # CORS middleware
@@ -330,68 +407,96 @@ def call_llm(
 # API Endpoints
 
 @app.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
-    """Upload and process a document for embedding storage"""
-    try:
-        # Read file content
-        content = await file.read()
-        
-        # Decode text (handle different file types as needed)
+async def upload_documents(file: UploadFile = File(None), files: List[UploadFile] = File(None)):
+    """Upload and process one or multiple documents for embedding storage"""
+    # Handle single file or multiple files
+    if file and files:
+        # If both provided, combine
+        all_files = [file] + files
+    elif files:
+        all_files = files
+    elif file:
+        all_files = [file]
+    else:
+        raise HTTPException(status_code=400, detail="No files provided")
+    
+    results = []
+    for f in all_files:
         try:
-            text = content.decode("utf-8")
-        except UnicodeDecodeError:
-            # Try other encodings if UTF-8 fails
+            # Read file content
+            content = await f.read()
+            
+            # Decode text (handle different file types as needed)
             try:
-                text = content.decode("latin-1")
+                text = content.decode("utf-8")
             except UnicodeDecodeError:
-                raise HTTPException(status_code=400, detail="Could not decode file content")
-        
-        if not text.strip():
-            raise HTTPException(status_code=400, detail="File appears to be empty")
-        
-        # Chunk the text
-        chunks = chunk_text(text, max_chunk_size=500)
-        
-        if not chunks:
-            raise HTTPException(status_code=400, detail="No valid chunks generated from document")
-        
-        # Generate embeddings
-        embeddings = embed_chunks(chunks)
-        
-        # Store in database
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        
-        # Insert document
-        c.execute('''
-            INSERT INTO documents (filename, upload_timestamp, content) 
-            VALUES (?, ?, ?)
-        ''', (file.filename, datetime.datetime.now().isoformat(), text))
-        
-        document_id = c.lastrowid
-        
-        # Insert chunks with embeddings
-        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+                # Try other encodings if UTF-8 fails
+                try:
+                    text = content.decode("latin-1")
+                except UnicodeDecodeError:
+                    results.append({
+                        "error": f"Could not decode file content for {f.filename}",
+                        "filename": f.filename
+                    })
+                    continue
+            
+            if not text.strip():
+                results.append({
+                    "error": f"File {f.filename} appears to be empty",
+                    "filename": f.filename
+                })
+                continue
+            
+            # Chunk the text
+            chunks = chunk_text(text, max_chunk_size=500)
+            
+            if not chunks:
+                results.append({
+                    "error": f"No valid chunks generated from document {f.filename}",
+                    "filename": f.filename
+                })
+                continue
+            
+            # Generate embeddings
+            embeddings = embed_chunks(chunks)
+            
+            # Store in database
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            
+            # Insert document
             c.execute('''
-                INSERT INTO document_chunks (document_id, chunk_text, chunk_index, embedding_json) 
-                VALUES (?, ?, ?, ?)
-            ''', (document_id, chunk, i, json.dumps(embedding)))
-        
-        conn.commit()
-        conn.close()
-        
-        return {
-            "message": "Document uploaded and processed successfully",
-            "filename": file.filename,
-            "document_id": document_id,
-            "chunks_count": len(chunks),
-            "embeddings_count": len(embeddings)
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
+                INSERT INTO documents (filename, upload_timestamp, content) 
+                VALUES (?, ?, ?)
+            ''', (f.filename, datetime.datetime.now().isoformat(), text))
+            
+            document_id = c.lastrowid
+            
+            # Insert chunks with embeddings
+            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+                c.execute('''
+                    INSERT INTO document_chunks (document_id, chunk_text, chunk_index, embedding_json) 
+                    VALUES (?, ?, ?, ?)
+                ''', (document_id, chunk, i, json.dumps(embedding)))
+            
+            conn.commit()
+            conn.close()
+            
+            results.append({
+                "message": f"Document {f.filename} uploaded and processed successfully",
+                "filename": f.filename,
+                "document_id": document_id,
+                "chunks_count": len(chunks),
+                "embeddings_count": len(embeddings)
+            })
+            
+        except Exception as e:
+            results.append({
+                "error": f"Error processing document {f.filename}: {str(e)}",
+                "filename": f.filename
+            })
+    
+    return results
 
 @app.post("/ask")
 async def ask_question(request: AskRequest):
@@ -408,22 +513,16 @@ async def ask_question(request: AskRequest):
         relevant_history = get_relevant_history(request.question, request.selected_text)
         
         # Build prompt
-        prompt_parts = []
-        if relevant_history:
-            history_text = "\n".join(
-                f"Previous Q: {h['question']}\nPrevious A: {h['answer']}"
-                for h in relevant_history
-            )
-            prompt_parts.append(f"Relevant History:\n{history_text}")
-        
+        combined_text = ""
         if context_chunks:
-            prompt_parts.append(f"Document Context:\n" + "\n\n".join(context_chunks))
-        
+            combined_text += "\n\n".join(context_chunks) + "\n\n"
         if request.selected_text:
-            prompt_parts.append(f"Selected Text:\n{request.selected_text}")
-        
-        prompt_parts.append(f"Question:\n{request.question}")
-        prompt = "\n\n".join(prompt_parts) + "\n\nPlease provide a comprehensive answer based on the context provided."
+            combined_text += request.selected_text
+        combined_text = combined_text.strip()
+        if not combined_text:
+            combined_text = "No context provided."
+
+        prompt = f"{SYSTEM_INSTRUCTION}\n\n{FEW_SHOT_PROMPT}\n\n<text_snippet>\n{combined_text}\n</text_snippet>\n<question>\n{request.question}\n</question>"
         
         # Store answer chunks and entry ID for database insertion
         answer_chunks = []
