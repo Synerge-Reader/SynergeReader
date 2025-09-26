@@ -6,7 +6,6 @@ import TitleLogo from "./components/TitleLogo";
 import Top from "./components/Top";
 import RatingModal from "./components/RatingModal/RatingModal.jsx";
 import UserAuth from "./components/UserAuth/UserAuth.jsx";
-import "./GridApp.css";
 import Spinner from './components/Spinner/Spinner'
 import Notifier from './components/Notifier/Notifier'
 import Markdown from "react-markdown";
@@ -18,6 +17,7 @@ const GridApp = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
   const [backendMsg, setBackendMsg] = useState("");
+  const [askOpen, setAskOpen] = useState(true);
   const [answer, setAnswer] = useState(null);
   const [history, setHistory] = useState([]);
   const [openHistory, setOpenHistory] = useState(false);
@@ -36,9 +36,9 @@ const GridApp = () => {
         .then((res) => res.json())
         .then((data) => setBackendMsg(data.message))
         .catch(() => setBackendMsg("Could not connect to backend."));
-      getHistory();
     }
     fetchData();
+    getHistory();
   }, []);
 
   const getHistory = async () => {
@@ -63,6 +63,7 @@ const GridApp = () => {
       );
       const data = await res.json();
       setHistory(data);
+      console.log(data)
     }
   }
 
@@ -134,7 +135,7 @@ const GridApp = () => {
       setError("Could not get answer from backend.");
     } finally {
       setIsLoading(false);
-      
+
     }
   };
 
@@ -142,73 +143,72 @@ const GridApp = () => {
     setSelectedText(text);
   };
 
+
   return (
     <>
-
-      <div class="parent">
+      <div className="parent">
         {notification && <Notifier message={notification} setNotification={setNotification} />}
         {isLoading && <Spinner />}
         {openRating && (
-          <RatingModal setOpenRating={setOpenRating} entryId={answer.entryId} />
+          <RatingModal setOpenRating={setOpenRating} entryId={answer?.entryId} />
         )}
-        {openAuth && <UserAuth setOpenAuth={setOpenAuth} setAuthToken={setAuthToken} setNotification={setNotification} getHistory={getHistory} />}
-        <div class="div4">
-          <Top setOpenAuth={setOpenAuth} authToken={authToken} setAuthToken={setAuthToken} setHistory={setHistory} />
+        {openAuth && (
+          <UserAuth
+            setOpenAuth={setOpenAuth}
+            setAuthToken={setAuthToken}
+            setNotification={setNotification}
+            getHistory={getHistory}
+          />
+        )}
+
+        {/* Header */}
+        <div className="div4">
+          <Top
+            setOpenAuth={setOpenAuth}
+            authToken={authToken}
+            setAuthToken={setAuthToken}
+            setHistory={setHistory}
+          />
           <hr />
-          <TitleLogo></TitleLogo>
+          <TitleLogo />
           <div className="alpha-subtitle">
             Interactive Human-AI Reading for Any Document: Transforming
             Complexity into Clarity and Insights
           </div>
         </div>
 
-    <div class="div1">
-      <div className="doc-section">
-        {parsedDocuments.length === 0 && (
-          <FileUpload
-            onFileParsed={handleFileParsed}
-            setIsLoading={setIsLoading}
-            setError={setError}
-            model={model}
-            setModel={setModel}
-          />
-        )}
-        {error && <div className="error-message">{error}</div>}
-        {isLoading && <div className="loading-spinner">Processing...</div>}
-       
-        {parsedDocuments.length > 0 &&(
-          <TextPreview documents={parsedDocuments} onSelect={handleTextSelection} />
-        )}
-        {parsedDocuments.length > 0 && (
-          <div className="file-info">
-            Uploaded: <span>{parsedDocuments.map(d => d.name).join(', ')}</span>
-          </div>
-        )}
-        
-      </div>
-    </div>
-    <div class="div2">
-      <div className="action-box">
-        <div className="box-contents">
-          <h2
-            onClick={() => setOpenHistory(false)}
-            style={{ cursor: 'pointer', fontWeight: openHistory ? 400 : 700, marginRight: 16 }}
-            
-          >
-            Chat Box
-          </h2>
-
-            {fileName && (
-              <TextPreview text={parsedText} onSelect={handleTextSelection} />
+        {/* Upload / Preview */}
+        <div className="div1">
+          <div className="doc-section">
+            {parsedDocuments.length === 0 && (
+              <FileUpload
+                onFileParsed={handleFileParsed}
+                setIsLoading={setIsLoading}
+                setError={setError}
+                model={model}
+                setModel={setModel}
+              />
             )}
-            {fileName && (
+            {error && <div className="error-message">{error}</div>}
+            {isLoading && <div className="loading-spinner">Processing...</div>}
+
+            {parsedDocuments.length > 0 && (
+              <TextPreview
+                documents={parsedDocuments}
+                onSelect={handleTextSelection}
+              />
+            )}
+            {parsedDocuments.length > 0 && (
               <div className="file-info">
-                Uploaded: <span>{fileName}</span>
+                Uploaded:{" "}
+                <span>{parsedDocuments.map((d) => d.name).join(", ")}</span>
               </div>
             )}
           </div>
         </div>
-        <div class="div2">
+
+        {/* Chat + History */}
+        <div className="div2">
           <div className="action-box">
             <div className="box-contents">
               <h2
@@ -234,19 +234,49 @@ const GridApp = () => {
               </h2>
             </div>
 
-        <div className="main-action-box">
-          {openHistory ? (
-            <>
-              {parsedDocuments.length > 0 && (
-                <div style={{margin: '32px auto', maxWidth: 800, padding: '10px', marginTop: '-10px'}}>
-                  {history.length === 0 ? <div>No history yet.</div> : (
-                    <div style={{maxHeight: 400, overflowY: 'auto'}}>
-                      {history.map((h, idx) => (
-                        <div key={idx} style={{background: '#f8fafc', marginBottom: 12, padding: 16, borderRadius: 8, border: '1px solid #e2e8f0'}}>
-                          <div style={{marginBottom: 8}}>
-                            <strong>Selected Text:</strong> 
-                            <div style={{background: '#fff', padding: 8, borderRadius: 4, marginTop: 4, fontSize: '0.9em'}}>
-                              {h.selected_text.substring(0, 200)}{h.selected_text.length > 200 ? '...' : ''}
+            <div className="main-action-box">
+              {openHistory ? (
+                <>
+                  <div
+                    style={{
+                      margin: "32px auto",
+                      maxWidth: 800,
+                      padding: "10px",
+                      marginTop: "-10px",
+                    }}
+                  >
+                    {history.length === 0 ? (
+                      <div>No history yet.</div>
+                    ) : (
+                      <div style={{ maxHeight: 400, overflowY: "auto" }}>
+                        {history.map((h, idx) => (
+                          <div
+                            key={idx}
+                            style={{
+                              background: "#f8fafc",
+                              marginBottom: 12,
+                              padding: 16,
+                              borderRadius: 8,
+                              border: "1px solid #e2e8f0",
+                            }}
+                          >
+                            <div style={{ marginBottom: 8 }}>
+                              <strong>Selected Text:</strong>
+                              <div
+                                style={{
+                                  background: "#fff",
+                                  padding: 8,
+                                  borderRadius: 4,
+                                  marginTop: 4,
+                                  fontSize: "0.9em",
+                                }}
+                              >
+                                {h.selected_text.substring(0, 200)}
+                                {h.selected_text.length > 200 ? "..." : ""}
+                              </div>
+                              <div style={{ marginBottom: 8 }}>
+                                <strong>A:</strong> {h.answer}
+                              </div>
                             </div>
                           </div>
                         ))}
@@ -320,7 +350,10 @@ const GridApp = () => {
                               {answer.context_chunks.map((chunk, idx) => (
                                 <div
                                   key={idx}
-                                  style={{ marginBottom: 8, fontSize: "0.9em" }}
+                                  style={{
+                                    marginBottom: 8,
+                                    fontSize: "0.9em",
+                                  }}
                                 >
                                   {chunk.substring(0, 150)}...
                                 </div>
@@ -347,7 +380,10 @@ const GridApp = () => {
                               {answer.relevant_history.map((hist, idx) => (
                                 <div
                                   key={idx}
-                                  style={{ marginBottom: 8, fontSize: "0.9em" }}
+                                  style={{
+                                    marginBottom: 8,
+                                    fontSize: "0.9em",
+                                  }}
                                 >
                                   <strong>Q:</strong> {hist.question}
                                   <br />
@@ -375,22 +411,22 @@ const GridApp = () => {
           </div>
         </div>
 
-        <div class="div3">
+        {/* Footer */}
+        <div className="div3">
           <footer>
             <hr />
             <div className="footContents">
               <div style={{ color: "#2b926e", fontWeight: 500 }}>
-                <p>Status: {backendMsg} </p>
+                <p>Status: {backendMsg}</p>
               </div>
               <div>
                 <p>
                   © {new Date().getFullYear()} Synergy Reader. All rights
-                  reserved.{" "}
-                </p>{" "}
+                  reserved.
+                </p>
               </div>
               <div>
-                {" "}
-                <p>Report An Issue</p>{" "}
+                <p>Report An Issue</p>
               </div>
             </div>
           </footer>
@@ -398,6 +434,5 @@ const GridApp = () => {
       </div>
     </>
   );
-};
-
+}
 export default GridApp;
