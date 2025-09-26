@@ -454,7 +454,9 @@ def call_llm(
 
 
 @app.post("/upload")
-async def upload_documents(file: UploadFile = File(None), files: List[UploadFile] = File(None)):
+async def upload_documents(
+    file: UploadFile = File(None), files: List[UploadFile] = File(None)
+):
     """Upload and process one or multiple documents for embedding storage"""
     # Handle single file or multiple files
     if file and files:
@@ -466,13 +468,13 @@ async def upload_documents(file: UploadFile = File(None), files: List[UploadFile
         all_files = [file]
     else:
         raise HTTPException(status_code=400, detail="No files provided")
-    
+
     results = []
     for f in all_files:
         try:
             # Read file content
             content = await f.read()
-            
+
             # Decode text (handle different file types as needed)
             try:
                 text = content.decode("utf-8")
@@ -481,69 +483,86 @@ async def upload_documents(file: UploadFile = File(None), files: List[UploadFile
                 try:
                     text = content.decode("latin-1")
                 except UnicodeDecodeError:
-                    results.append({
-                        "error": f"Could not decode file content for {f.filename}",
-                        "filename": f.filename
-                    })
+                    results.append(
+                        {
+                            "error": f"Could not decode file content for {f.filename}",
+                            "filename": f.filename,
+                        }
+                    )
                     continue
-            
+
             if not text.strip():
-                results.append({
-                    "error": f"File {f.filename} appears to be empty",
-                    "filename": f.filename
-                })
+                results.append(
+                    {
+                        "error": f"File {f.filename} appears to be empty",
+                        "filename": f.filename,
+                    }
+                )
                 continue
-            
+
             # Chunk the text
             chunks = chunk_text(text, max_chunk_size=500)
-            
+
             if not chunks:
-                results.append({
-                    "error": f"No valid chunks generated from document {f.filename}",
-                    "filename": f.filename
-                })
+                results.append(
+                    {
+                        "error": f"No valid chunks generated from document {f.filename}",
+                        "filename": f.filename,
+                    }
+                )
                 continue
-            
+
             # Generate embeddings
             embeddings = embed_chunks(chunks)
-            
+
             # Store in database
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
-            
+
             # Insert document
-            c.execute('''
+            c.execute(
+                """
                 INSERT INTO documents (filename, upload_timestamp, content) 
                 VALUES (?, ?, ?)
-            ''', (f.filename, datetime.datetime.now().isoformat(), text))
-            
+            """,
+                (f.filename, datetime.datetime.now().isoformat(), text),
+            )
+
             document_id = c.lastrowid
-            
+
             # Insert chunks with embeddings
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-                c.execute('''
+                c.execute(
+                    """
                     INSERT INTO document_chunks (document_id, chunk_text, chunk_index, embedding_json) 
                     VALUES (?, ?, ?, ?)
-                ''', (document_id, chunk, i, json.dumps(embedding)))
-            
+                """,
+                    (document_id, chunk, i, json.dumps(embedding)),
+                )
+
             conn.commit()
             conn.close()
-            
-            results.append({
-                "message": f"Document {f.filename} uploaded and processed successfully",
-                "filename": f.filename,
-                "document_id": document_id,
-                "chunks_count": len(chunks),
-                "embeddings_count": len(embeddings)
-            })
-            
+
+            results.append(
+                {
+                    "message": f"Document {f.filename} uploaded and processed successfully",
+                    "filename": f.filename,
+                    "document_id": document_id,
+                    "chunks_count": len(chunks),
+                    "embeddings_count": len(embeddings),
+                }
+            )
+
         except Exception as e:
-            results.append({
-                "error": f"Error processing document {f.filename}: {str(e)}",
-                "filename": f.filename
-            })
-    
+            results.append(
+                {
+                    "error": f"Error processing document {f.filename}: {str(e)}",
+                    "filename": f.filename,
+                }
+            )
+
     return results
+
 
 @app.post("/ask")
 async def ask_question(request: AskRequest):
@@ -570,7 +589,7 @@ async def ask_question(request: AskRequest):
             combined_text = "No context provided."
 
         prompt = f"{SYSTEM_INSTRUCTION}\n\n{FEW_SHOT_PROMPT}\n\n<text_snippet>\n{combined_text}\n</text_snippet>\n<question>\n{request.question}\n</question>"
-        
+
         # Store answer chunks and entry ID for database insertion
         answer_chunks = []
         entry_id = None
@@ -617,7 +636,6 @@ async def ask_question(request: AskRequest):
                     )
                     row = c.fetchone()
                     if not row:
-                        yield f"\n\n__ERROR__Invalid auth token__"
                         return
                     user_id = row[0]
 
