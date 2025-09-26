@@ -1,7 +1,7 @@
 import { useState } from "react";
 import "./UserAuth.css";
 
-export default function UserAuth({ setOpenAuth, setAuthToken, setNotification }) {
+export default function UserAuth({ setOpenAuth, setAuthToken, setNotification, getHistory }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
 
@@ -18,13 +18,19 @@ export default function UserAuth({ setOpenAuth, setAuthToken, setNotification })
             password,
           }),
         }
+
       );
 
-      const data = await res.json();
-      console.log(endpoint.toUpperCase(), data);
-      setAuthToken(data.token);
-      setNotification(`Successful ${endpoint}!`);
-      localStorage.setItem("authToken", data.token);
+      if (res.status == 200) {
+        const data = await res.json();
+        setAuthToken(data.token);
+        localStorage.setItem("authToken", data.token);
+        setOpenAuth(false);
+        getHistory();
+        setNotification(`Successful ${endpoint}!`);
+      } else {
+        setNotification("User Auth Error")
+      }
     } catch (err) {
       console.error("Auth error:", err);
       setNotification("User Auth Error")
@@ -41,14 +47,15 @@ export default function UserAuth({ setOpenAuth, setAuthToken, setNotification })
         <h2 className="modal-title">Authentication</h2>
 
         {/* Username and password */}
-        <textarea
+        <input
           className="comment-box"
           rows="1"
           placeholder="Username"
+          type="text"
           value={username}
           onChange={(e) => setUsername(e.target.value)}
         />
-        <textarea
+        <input
           className="comment-box"
           rows="1"
           placeholder="Password"

@@ -37,28 +37,37 @@ const GridApp = () => {
         .then((res) => res.json())
         .then((data) => setBackendMsg(data.message))
         .catch(() => setBackendMsg("Could not connect to backend."));
-      const token = localStorage.getItem("authToken"); // get token from localStorage
-      if (!token) {
-        setHistory([]);
-        return;
-      }
-      else {
-        const res = await fetch(
-          (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + `/history`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              token,
-            }),
-          }
-        );
-        const data = await res.json();
-        setHistory(data);
-      }
+      getHistory();
     }
     fetchData();
   }, []);
+
+  const getHistory = async () => {
+
+    const token = localStorage.getItem("authToken"); // get token from localStorage
+    if (!token) {
+      setHistory([]);
+      return;
+    }
+    else {
+      setAuthToken(token);
+
+      const res = await fetch(
+        (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + `/history`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            token,
+          }),
+        }
+      );
+      const data = await res.json();
+      setHistory(data);
+    }
+  }
+
+
 
 
   const handleFileParsed = (text, name) => {
@@ -147,9 +156,9 @@ const GridApp = () => {
         {openRating && (
           <RatingModal setOpenRating={setOpenRating} entryId={answer.entryId} />
         )}
-        {openAuth && <UserAuth setOpenAuth={setOpenAuth} setAuthToken={setAuthToken} setNotification={setNotification} />}
+        {openAuth && <UserAuth setOpenAuth={setOpenAuth} setAuthToken={setAuthToken} setNotification={setNotification} getHistory={getHistory} />}
         <div class="div4">
-          <Top setOpenAuth={setOpenAuth} />
+          <Top setOpenAuth={setOpenAuth} authToken={authToken} setAuthToken={setAuthToken} setHistory={setHistory} />
           <hr />
           <TitleLogo></TitleLogo>
           <div className="alpha-subtitle">

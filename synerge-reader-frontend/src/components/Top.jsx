@@ -1,4 +1,6 @@
-function Top({ setOpenAuth }) {
+import "./Top.css";
+
+function Top({ setOpenAuth, authToken, setAuthToken, setHistory }) {
   return (
     <>
       <div className="head">
@@ -6,9 +8,15 @@ function Top({ setOpenAuth }) {
           <img src="/menuBar.svg"></img>
           <h3>Community Papers</h3>
           <h3>Browse</h3>
-          <div onClick={() => setOpenAuth(true)}>
-            <img className="accLogo" src="/accountIcon.svg"></img>
-          </div>
+          {!authToken ? (
+            <div onClick={() => setOpenAuth(true)} className='auth'>
+              <img className="accLogo" src="/accountIcon.svg"></img>
+            </div>
+          ) : (
+            <div className='auth' onClick={() => { setAuthToken(''); localStorage.setItem("authToken", ""); setHistory([]); }}>
+              Sign out
+            </div>
+          )}
         </div>
       </div>
     </>
