@@ -9,9 +9,8 @@ import "./App.css";
 
 export default function App() {
   const [model, setModel] = useState("llama3.1:8b");
-  const [parsedText, setParsedText] = useState("");
+  const [documents, setDocuments] = useState([]);
   const [selectedText, setSelectedText] = useState("");
-  const [fileName, setFileName] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
   const [askOpen, setAskOpen] = useState(false);
@@ -31,9 +30,12 @@ export default function App() {
   }, []);
 
   const handleFileParsed = (text, name) => {
-    setParsedText(text);
-    setFileName(name);
-    setIsLoading(false);
+    setDocuments((prevDocs) => {
+      const filtered = prevDocs.filter((doc) => doc.name !== name);
+      const updated = [...filtered, { name, text }];
+      updated.sort((a, b) => a.name.localeCompare(b.name));
+      return updated;
+    });
     setError("");
   };
 
@@ -109,13 +111,20 @@ export default function App() {
         />
         {error && <div className="error-message">{error}</div>}
         {isLoading && <div className="loading-spinner">Processing...</div>}
-        {fileName && (
+        {documents.length > 0 && (
           <div className="file-info">
-            Uploaded: <span>{fileName}</span>
+            Uploaded:
+            <ul>
+              {documents.map((doc) => (
+                <li key={doc.name}>{doc.name}</li>
+              ))}
+            </ul>
           </div>
         )}
 
-        {fileName && <TextPreview text={parsedText} onSelect={handleTextSelection} />}
+        {documents.length > 0 && (
+          <TextPreview documents={documents} onSelect={handleTextSelection} />
+        )}
         {selectedText && (
           <div
             style={{
@@ -204,7 +213,7 @@ export default function App() {
             )}
           </div>
         )}
-        {fileName && (
+        {documents.length > 0 && (
           <div style={{ margin: "32px auto", maxWidth: 800 }}>
             <h3>Chat History</h3>
             {history.length === 0 ? (

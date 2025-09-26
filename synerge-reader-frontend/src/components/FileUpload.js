@@ -15,11 +15,13 @@ export default function FileUpload ({ onFileParsed, setIsLoading, setError, mode
   const allowedTypes = ["application/pdf", "text/plain", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"];
   const setDefault = () => setIsDragging(false);
 
-  const uploadToBackend = async (textContent, fileName) => {
+  const uploadBatchToBackend = async (parsedDocs) => {
     try {
       const formData = new FormData();
-      const blob = new Blob([textContent], { type: 'text/plain' });
-      formData.append('file', blob, fileName);
+      parsedDocs.forEach(({ text, name }) => {
+        const blob = new Blob([text], { type: 'text/plain' });
+        formData.append('files', blob, name);
+      });
 
       const response = await fetch((process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + '/upload', {
         method: 'POST',
@@ -31,48 +33,12 @@ export default function FileUpload ({ onFileParsed, setIsLoading, setError, mode
       }
 
       const result = await response.json();
-      console.log('Document uploaded successfully:', result);
+      console.log('Documents uploaded successfully:', result);
       return result;
     } catch (error) {
       console.error('Upload error:', error);
-      setError(`Failed to upload document: ${error.message}`);
+      setError(`Failed to upload documents: ${error.message}`);
       throw error;
-    }
-  };
-
-  const processFile = async (file) => {
-    if (file.size > 20 * 1024 * 1024) {
-      setError("File too large (max 20MB).");
-      return;
-    }
-    if (!allowedTypes.includes(file.type)) {
-      setError("Unsupported file type. Please upload PDF, DOCX, or TXT only.");
-      return;
-    }
-
-    setIsLoading(true);
-    setError("");
-
-    try {
-      let textContent = "";
-
-      if (file.type === "application/pdf") {
-        textContent = await processPDF(file);
-      } else if (file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
-        textContent = await processDOCX(file);
-      } else if (file.type === "text/plain") {
-        textContent = await processTXT(file);
-      }
-
-      // Upload to backend for processing
-      await uploadToBackend(textContent, file.name);
-
-      // Call the callback with parsed text
-      onFileParsed(textContent, file.name);
-
-    } catch (error) {
-      setError(`Error processing file: ${error.message}`);
-      setIsLoading(false);
     }
   };
 
@@ -128,18 +94,85 @@ export default function FileUpload ({ onFileParsed, setIsLoading, setError, mode
     });
   };
 
-  const handleFileChange = (e) => {
-    if (e.target.files.length > 0) {
-      processFile(e.target.files[0]);
-      setDefault();
+  const processFiles = async (files) => {
+    const validFiles = [];
+    const errorMessages = [];
+
+    files.forEach((file) => {
+      if (file.size > 20 * 1024 * 1024) {
+        errorMessages.push(`${file.name} is too large (max 20MB).`);
+        return;
+      }
+      if (!allowedTypes.includes(file.type)) {
+        errorMessages.push(`${file.name} has an unsupported type. Please upload PDF, DOCX, or TXT only.`);
+        return;
+      }
+      validFiles.push(file);
+    });
+
+    if (errorMessages.length) {
+      setError(errorMessages.join(" "));
+    } else {
+      setError("");
+    }
+
+    if (validFiles.length === 0) {
+      return;
+    }
+
+    setIsLoading(true);
+
+    const parsedDocs = [];
+
+    try {
+      for (const file of validFiles) {
+        let textContent = "";
+
+        if (file.type === "application/pdf") {
+          textContent = await processPDF(file);
+        } else if (file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
+          textContent = await processDOCX(file);
+        } else if (file.type === "text/plain") {
+          textContent = await processTXT(file);
+        }
+
+        const parsedDoc = { name: file.name, text: textContent };
+        parsedDocs.push(parsedDoc);
+        onFileParsed(parsedDoc);
+      }
+
+      const backendResults = await uploadBatchToBackend(parsedDocs);
+
+      const uploadErrors = [];
+      backendResults.forEach((result, index) => {
+        if (result && result.error) {
+          uploadErrors.push(`${parsedDocs[index].name}: ${result.error}`);
+        }
+      });
+
+      if (uploadErrors.length) {
+        setError(uploadErrors.join(" "));
+      }
+    } catch (error) {
+      setError(`Error processing file(s): ${error.message}`);
+    } finally {
+      setIsLoading(false);
     }
   };
 
-  const handleDrop = (e) => {
+  const handleFileChange = async (e) => {
+    if (e.target.files.length > 0) {
+      await processFiles(Array.from(e.target.files));
+      setDefault();
+      e.target.value = "";
+    }
+  };
+
+  const handleDrop = async (e) => {
     e.preventDefault();
     setDefault();
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      processFile(e.dataTransfer.files[0]);
+      await processFiles(Array.from(e.dataTransfer.files));
     }
   };
 
@@ -163,17 +196,18 @@ export default function FileUpload ({ onFileParsed, setIsLoading, setError, mode
       role="region"
       aria-label="File upload area"
     >
-      <img src="/uploadIcon.svg" />
+      <img src="/uploadIcon.svg" alt="Upload icon" />
       <div className="alpha-upload-hint">
-        <strong>Upload a document</strong><br /> <span className="pdf-accent">PDF</span>,{" "}
+        <strong>Upload documents</strong><br /> <span className="pdf-accent">PDF</span>,{" "}
         <span className="docx-accent">DOCX</span>, or{" "}
-        <span className="txt-accent">TXT</span> File{" "}<br />
-        <span className="dim">(max 20MB)</span>
+        <span className="txt-accent">TXT</span> Files{" "}<br />
+        <span className="dim">(max 20MB each)</span>
         <br />
       </div>
       <input
         type="file"
         accept=".pdf,.docx,.txt"
+        multiple
         ref={fileInputRef}
         onChange={handleFileChange}
         style={{ display: "none" }}

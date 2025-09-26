@@ -4,19 +4,18 @@ import TextPreview from "./components/TextPreview";
 import AskModal from "./components/AskModal";
 import TitleLogo from "./components/TitleLogo";
 import Top from "./components/Top";
-import ReactMarkdown from "react-markdown";
+
 import Markdown from "react-markdown";
 import RatingModal from "./components/RatingModal.jsx";
 import './GridApp.css'
 
-const GridApp = () => {  // Removed 'async' keyword
-  const [parsedText, setParsedText] = useState("");
+const GridApp = () => {
+  const [parsedDocuments, setParsedDocuments] = useState([]);
   const [selectedText, setSelectedText] = useState("");
-  const [fileName, setFileName] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
   const [backendMsg, setBackendMsg] = useState("");
-  const [askOpen, setAskOpen] = useState(false);
+  
   const [answer, setAnswer] = useState(null);
   const [history, setHistory] = useState([]);
   const [openHistory, setOpenHistory] = useState(false);
@@ -34,9 +33,8 @@ const GridApp = () => {  // Removed 'async' keyword
       .catch(() => setHistory([]));
   }, []);
 
-  const handleFileParsed = (text, name) => {
-    setParsedText(text);
-    setFileName(name);
+  const handleFileParsed = (doc) => {
+    setParsedDocuments(prevDocs => [...prevDocs, doc]);
     setIsLoading(false);
     setError("");
   };
@@ -97,15 +95,12 @@ const GridApp = () => {  // Removed 'async' keyword
       setError("Could not get answer from backend.");
     } finally {
       setIsLoading(false);
-      setAskOpen(false);
+      
     }
   };
 
   const handleTextSelection = (text) => {
     setSelectedText(text);
-    if (text.trim()) {
-      setAskOpen(true);
-    }
   };
 
   return(<>
@@ -123,7 +118,7 @@ const GridApp = () => {  // Removed 'async' keyword
 
     <div class="div1">
       <div className="doc-section">
-        {!fileName && (
+        {parsedDocuments.length === 0 && (
           <FileUpload
             onFileParsed={handleFileParsed}
             setIsLoading={setIsLoading}
@@ -135,12 +130,12 @@ const GridApp = () => {  // Removed 'async' keyword
         {error && <div className="error-message">{error}</div>}
         {isLoading && <div className="loading-spinner">Processing...</div>}
        
-        {fileName &&(
-          <TextPreview text={parsedText} onSelect={handleTextSelection} />
+        {parsedDocuments.length > 0 &&(
+          <TextPreview documents={parsedDocuments} onSelect={handleTextSelection} />
         )}
-        {fileName && (
+        {parsedDocuments.length > 0 && (
           <div className="file-info">
-            Uploaded: <span>{fileName}</span>
+            Uploaded: <span>{parsedDocuments.map(d => d.name).join(', ')}</span>
           </div>
         )}
         
@@ -152,7 +147,7 @@ const GridApp = () => {  // Removed 'async' keyword
           <h2
             onClick={() => setOpenHistory(false)}
             style={{ cursor: 'pointer', fontWeight: openHistory ? 400 : 700, marginRight: 16 }}
-            aria-selected={!openHistory}
+            
           >
             Chat Box
           </h2>
@@ -170,7 +165,7 @@ const GridApp = () => {  // Removed 'async' keyword
         <div className="main-action-box">
           {openHistory ? (
             <>
-              {fileName && (
+              {parsedDocuments.length > 0 && (
                 <div style={{margin: '32px auto', maxWidth: 800, padding: '10px', marginTop: '-10px'}}>
                   {history.length === 0 ? <div>No history yet.</div> : (
                     <div style={{maxHeight: 400, overflowY: 'auto'}}>
