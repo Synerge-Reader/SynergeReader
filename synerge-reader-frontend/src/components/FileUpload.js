@@ -51,7 +51,7 @@ export default function FileUpload({
       throw error;
     }
   };
-  
+
   const processPDF = (file) => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -234,7 +234,7 @@ export default function FileUpload({
 
       <Dropdown
         title={`Selected Model: ${model}`}
-        options={["llama3.1:8b", "gpt-oss:20b"]}
+        options={["llama3.1:8b", "qwen3:latest"]}
         onSelect={(option) => {
           setModel(option);
           console.log("Selected:", option);
