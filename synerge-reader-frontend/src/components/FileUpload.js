@@ -2,17 +2,27 @@ import React, { useRef, useState } from "react";
 import * as pdfjsLib from "pdfjs-dist/build/pdf";
 import { GlobalWorkerOptions } from "pdfjs-dist/build/pdf";
 import mammoth from "mammoth";
-import Dropdown from "./Dropdown";
+import Dropdown from "./Dropdown/Dropdown.jsx";
 
 GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
-  import.meta.url
+  import.meta.url,
 ).toString();
 
-export default function FileUpload ({ onFileParsed, setIsLoading, setError, model, setModel }) {
+export default function FileUpload({
+  onFileParsed,
+  setIsLoading,
+  setError,
+  model,
+  setModel,
+}) {
   const fileInputRef = useRef();
   const [isDragging, setIsDragging] = useState(false);
-  const allowedTypes = ["application/pdf", "text/plain", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"];
+  const allowedTypes = [
+    "application/pdf",
+    "text/plain",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ];
   const setDefault = () => setIsDragging(false);
 
   const uploadBatchToBackend = async (parsedDocs) => {
@@ -41,7 +51,7 @@ export default function FileUpload ({ onFileParsed, setIsLoading, setError, mode
       throw error;
     }
   };
-
+  
   const processPDF = (file) => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -69,7 +79,8 @@ export default function FileUpload ({ onFileParsed, setIsLoading, setError, mode
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = function (e) {
-        mammoth.extractRawText({ arrayBuffer: e.target.result })
+        mammoth
+          .extractRawText({ arrayBuffer: e.target.result })
           .then((result) => {
             resolve(result.value);
           })
@@ -229,7 +240,7 @@ export default function FileUpload ({ onFileParsed, setIsLoading, setError, mode
           console.log("Selected:", option);
         }}
       />
-
     </div>
   );
-};
+}
+

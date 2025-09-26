@@ -58,6 +58,7 @@ export default function App() {
             selected_text: selectedText,
             question,
             model: model,
+            auth_token: authToken
           }),
         }
       );
