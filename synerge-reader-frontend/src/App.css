@@ -365,8 +365,6 @@ width: 200px;
 /* Modal Styles */
 .modal-overlay {
   /* for responsive text box make sure to change width here */
- margin-top: -339px;
-  position: absolute;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -514,8 +512,6 @@ button:focus {
       border-radius: 8px;
       padding: 30px;
       min-width: 265px;
-      height: 176px;
-      overflow-y: hidden;
       box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
       animation: modalSlideIn 0.3s ease-out;
   
@@ -537,8 +533,6 @@ button:focus {
     border-radius: 8px;
     padding: 30px;
     min-width: 332px;
-    height: 190px;
-    overflow-y: hidden;
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
     animation: modalSlideIn 0.3s ease-out;
 
@@ -557,8 +551,6 @@ button:focus {
     border-radius: 8px;
     padding: 30px;
     min-width: 498px;
-    height: 190px;
-    overflow-y: hidden;
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
     animation: modalSlideIn 0.3s ease-out;
 
@@ -577,8 +569,6 @@ button:focus {
     border-radius: 8px;
     padding: 30px;
     min-width: 946px;
-    height: 190px;
-    overflow-y: hidden;
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
     animation: modalSlideIn 0.3s ease-out;
 

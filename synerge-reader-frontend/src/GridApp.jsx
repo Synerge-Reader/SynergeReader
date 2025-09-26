@@ -4,21 +4,20 @@ import TextPreview from "./components/TextPreview";
 import AskModal from "./components/AskModal";
 import TitleLogo from "./components/TitleLogo";
 import Top from "./components/Top";
-import Markdown from "react-markdown";
 import RatingModal from "./components/RatingModal/RatingModal.jsx";
 import UserAuth from "./components/UserAuth/UserAuth.jsx";
 import "./GridApp.css";
 import Spinner from './components/Spinner/Spinner'
 import Notifier from './components/Notifier/Notifier'
+import Markdown from "react-markdown";
+import './GridApp.css'
+
 const GridApp = () => {
-  // Removed 'async' keyword
-  const [parsedText, setParsedText] = useState("");
+  const [parsedDocuments, setParsedDocuments] = useState([]);
   const [selectedText, setSelectedText] = useState("");
-  const [fileName, setFileName] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
   const [backendMsg, setBackendMsg] = useState("");
-  const [askOpen, setAskOpen] = useState(false);
   const [answer, setAnswer] = useState(null);
   const [history, setHistory] = useState([]);
   const [openHistory, setOpenHistory] = useState(false);
@@ -70,9 +69,8 @@ const GridApp = () => {
 
 
 
-  const handleFileParsed = (text, name) => {
-    setParsedText(text);
-    setFileName(name);
+  const handleFileParsed = (doc) => {
+    setParsedDocuments(prevDocs => [...prevDocs, doc]);
     setIsLoading(false);
     setError("");
   };
@@ -136,15 +134,12 @@ const GridApp = () => {
       setError("Could not get answer from backend.");
     } finally {
       setIsLoading(false);
-      setAskOpen(false);
+      
     }
   };
 
   const handleTextSelection = (text) => {
     setSelectedText(text);
-    if (text.trim()) {
-      setAskOpen(true);
-    }
   };
 
   return (
@@ -167,19 +162,41 @@ const GridApp = () => {
           </div>
         </div>
 
-        <div class="div1">
-          <div className="doc-section">
-            {!fileName && (
-              <FileUpload
-                onFileParsed={handleFileParsed}
-                setIsLoading={setIsLoading}
-                setError={setError}
-                model={model}
-                setModel={setModel}
-              />
-            )}
-            {error && <div className="error-message">{error}</div>}
-            {isLoading && <div className="loading-spinner">Processing...</div>}
+    <div class="div1">
+      <div className="doc-section">
+        {parsedDocuments.length === 0 && (
+          <FileUpload
+            onFileParsed={handleFileParsed}
+            setIsLoading={setIsLoading}
+            setError={setError}
+            model={model}
+            setModel={setModel}
+          />
+        )}
+        {error && <div className="error-message">{error}</div>}
+        {isLoading && <div className="loading-spinner">Processing...</div>}
+       
+        {parsedDocuments.length > 0 &&(
+          <TextPreview documents={parsedDocuments} onSelect={handleTextSelection} />
+        )}
+        {parsedDocuments.length > 0 && (
+          <div className="file-info">
+            Uploaded: <span>{parsedDocuments.map(d => d.name).join(', ')}</span>
+          </div>
+        )}
+        
+      </div>
+    </div>
+    <div class="div2">
+      <div className="action-box">
+        <div className="box-contents">
+          <h2
+            onClick={() => setOpenHistory(false)}
+            style={{ cursor: 'pointer', fontWeight: openHistory ? 400 : 700, marginRight: 16 }}
+            
+          >
+            Chat Box
+          </h2>
 
             {fileName && (
               <TextPreview text={parsedText} onSelect={handleTextSelection} />
@@ -217,57 +234,19 @@ const GridApp = () => {
               </h2>
             </div>
 
-            <hr />
-
-            <div className="main-action-box">
-              {openHistory ? (
-                <>
-                  <div
-                    style={{
-                      margin: "32px auto",
-                      maxWidth: 800,
-                      padding: "10px",
-                      marginTop: "-10px",
-                    }}
-                  >
-                    {history.length === 0 ? (
-                      <div>No history yet.</div>
-                    ) : (
-                      <div style={{ maxHeight: 400, overflowY: "auto" }}>
-                        {history.map((h, idx) => (
-                          <div
-                            key={idx}
-                            style={{
-                              background: "#f8fafc",
-                              marginBottom: 12,
-                              padding: 16,
-                              borderRadius: 8,
-                              border: "1px solid #e2e8f0",
-                            }}
-                          >
-                            <div style={{ marginBottom: 8 }}>
-                              <strong>Selected Text:</strong>
-                              <div
-                                style={{
-                                  background: "#fff",
-                                  padding: 8,
-                                  borderRadius: 4,
-                                  marginTop: 4,
-                                  fontSize: "0.9em",
-                                }}
-                              >
-                                {h.selected_text.substring(0, 200)}
-                                {h.selected_text.length > 200 ? "..." : ""}
-                              </div>
-                            </div>
-                            <div style={{ marginBottom: 8 }}>
-                              <strong>Q:</strong> {h.question}
-                            </div>
-                            <div style={{ marginBottom: 8 }}>
-                              <strong>A:</strong> {h.answer}
-                            </div>
-                            <div style={{ fontSize: "0.8em", color: "#888" }}>
-                              {h.timestamp}
+        <div className="main-action-box">
+          {openHistory ? (
+            <>
+              {parsedDocuments.length > 0 && (
+                <div style={{margin: '32px auto', maxWidth: 800, padding: '10px', marginTop: '-10px'}}>
+                  {history.length === 0 ? <div>No history yet.</div> : (
+                    <div style={{maxHeight: 400, overflowY: 'auto'}}>
+                      {history.map((h, idx) => (
+                        <div key={idx} style={{background: '#f8fafc', marginBottom: 12, padding: 16, borderRadius: 8, border: '1px solid #e2e8f0'}}>
+                          <div style={{marginBottom: 8}}>
+                            <strong>Selected Text:</strong> 
+                            <div style={{background: '#fff', padding: 8, borderRadius: 4, marginTop: 4, fontSize: '0.9em'}}>
+                              {h.selected_text.substring(0, 200)}{h.selected_text.length > 200 ? '...' : ''}
                             </div>
                           </div>
                         ))}
