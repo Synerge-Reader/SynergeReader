@@ -29,10 +29,10 @@ const AskModal = ({ open, onClose, onAsk, selectedText }) => {
                 padding: 12,
                 border: '1px solid #ddd',
                 borderRadius: 4,
-                fontSize: '14px',
+                fontSize: '17px',
                 fontFamily: 'inherit'
               }}
-              placeholder="Enter your question about the highlighted text, or any question you have"
+              placeholder="Highlight text to ask about it, or type your own question."
             />
           </div>
 
