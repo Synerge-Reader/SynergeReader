@@ -263,13 +263,19 @@ export default function FileUpload({
       >
         Browse Files
       </button>
-      <Dropdown
+      <Dropdown className="alpha-upload-btn"
+        style={{
+          backgroundColor: "lightskyblue",
+          fontWeight: 600,
+          fontSize: "1rem",
+        }}
         title={`Selected Model: ${model}`}
         options={["llama3.1:8b", "qwen3:latest"]}
         onSelect={(option) => {
           setModel(option);
           console.log("Selected:", option);
         }}
+
       />
     </div >
   );
