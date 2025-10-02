@@ -24,10 +24,7 @@ function SurveyModal({ setOpenSurvey , setNotification }) {
 />
          <h1 className="guides">How do you plan to use our service?</h1>
           <input style={{height : '2em', fontSize : '1em', color: 'black',padding : "3px"}}
-  type="number" 
-  min="1" 
-  max="5" 
-  placeholder="1–5" 
+  placeholder="e.g., Research, Hobby, Education" 
   className="ai-familiarity-input"
 />
          <h1 className="guides">Do you face obstacles using AI?</h1>

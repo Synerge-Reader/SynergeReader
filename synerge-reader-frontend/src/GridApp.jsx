@@ -79,10 +79,12 @@ const GridApp = () => {
   };
 
   const handleAsk = async (question) => {
+    /* just in case we need this back on
     if (!selectedText.trim()) {
       setError("Please select some text first.");
       return;
     }
+    */
 
     setIsLoading(true);
     try {
@@ -191,6 +193,7 @@ const GridApp = () => {
         {/* Upload / Preview */}
         <div className="div1">
           <div className="doc-section">
+            
             {parsedDocuments.length === 0 && (
               <FileUpload
                 onFileParsed={handleFileParsed}
@@ -199,6 +202,7 @@ const GridApp = () => {
                 model={model}
                 setModel={setModel}
               />
+              
             )}
             {error && <div className="error-message">{error}</div>}
             {isLoading && <div className="loading-spinner">Processing...</div>}
@@ -244,7 +248,7 @@ const GridApp = () => {
                 History
               </h2>
             </div>
-
+            <hr></hr>
             <div className="main-action-box">
               {openHistory ? (
                 <>
@@ -339,7 +343,7 @@ const GridApp = () => {
                             marginLeft: 8,
                           }}
                         >
-                          <Markdown>{answer.answer}</Markdown>
+                         <Markdown>{answer.answer}</Markdown>
                         </div>
                       </div>
                       {answer.context_chunks &&

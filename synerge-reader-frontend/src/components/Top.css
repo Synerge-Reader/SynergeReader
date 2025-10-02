@@ -1,3 +1,13 @@
 .auth {
   cursor: pointer
 }
+
+.head{
+  display: flex;
+  flex-direction: column;
+}
+
+.headingInfo{
+  gap: 50px;
+}
+

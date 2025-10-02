@@ -6,7 +6,8 @@ function Top({ setOpenAuth, authToken, setAuthToken, setHistory }) {
       <div className="head">
         <div className="headingInfo">
           <img src="/menuBar.svg"></img>
-          <h3>Community Papers</h3>
+        
+          <h3 style={{marginLeft : 'auto'}}>Community Papers</h3>
           <h3>Browse</h3>
           {!authToken ? (
             <div onClick={() => setOpenAuth(true)} className='auth'>
@@ -19,6 +20,7 @@ function Top({ setOpenAuth, authToken, setAuthToken, setHistory }) {
           )}
         </div>
       </div>
+    
     </>
   );
 }
