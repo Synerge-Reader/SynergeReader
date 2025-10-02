@@ -3,6 +3,10 @@ import * as pdfjsLib from "pdfjs-dist/build/pdf";
 import { GlobalWorkerOptions } from "pdfjs-dist/build/pdf";
 import mammoth from "mammoth";
 import Dropdown from "./Dropdown/Dropdown.jsx";
+import txtLogo from '../assets/txt.png'
+import pdfLogo from '../assets/pdf.png'
+import docxLogo from '../assets/docx.png'
+
 
 GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -210,6 +214,31 @@ export default function FileUpload({
       <img src="/uploadIcon.svg" alt="Upload icon" />
       <div className="alpha-upload-hint">
         <strong>Upload documents</strong><br /> <span className="pdf-accent">PDF</span>,{" "}
+
+        <img src={docxLogo} className="txt-icon" style={{
+          width: "100px",
+          height: "100px",
+          verticalAlign: "middle",
+          filter: "none",
+          mixBlendMode: "normal",
+        }} />
+
+        <img src={pdfLogo} className="txt-icon" style={{
+          width: "100px",
+          height: "100px",
+          verticalAlign: "middle",
+          filter: "none",
+          mixBlendMode: "normal",
+        }} />
+
+        <img src={txtLogo} className="txt-icon" style={{
+          width: "100px",
+          height: "100px",
+          verticalAlign: "middle",
+          filter: "none",
+          mixBlendMode: "normal",
+        }} />
+
         <span className="docx-accent">DOCX</span>, or{" "}
         <span className="txt-accent">TXT</span> Files{" "}<br />
         <span className="dim">(max 20MB each)</span>
