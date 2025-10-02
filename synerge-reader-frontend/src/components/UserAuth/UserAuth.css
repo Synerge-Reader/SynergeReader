@@ -12,11 +12,15 @@
   z-index: 9999;
 }
 
+
 /* Modal box */
 .modal {
+  display: flex;
+  flex-direction: column;
+  padding: 35px;
+  gap: 20px;
   background: #fff;
-  padding: 20px;
-  width: 400px;
+  width: 450px;
   border-radius: 12px;
   position: relative;
   box-shadow: 0 5px 20px rgba(0, 0, 0, 0.2);
@@ -33,19 +37,39 @@
   font-size: 20px;
   cursor: pointer;
   color: #555;
+  border-radius: 5px;
+  background-color: black;
+  padding: 5px;
+  color: white;
 }
 
 /* Modal Title */
 .modal-title {
-  margin-bottom: 16px;
-  font-size: 20px;
+  font-family: sans-serif;
+  letter-spacing: 3px;
+  margin-bottom: -9px;
+  font-size: 2em;
   font-weight: bold;
+  font-weight: 300;
+}
+
+.button-group{
+  display: flex;
+  flex-direction: row;
+  gap: 20px;
+
+}
+
+.button-group button{
+    font-weight: 600;
 }
 
 /* Stars */
 .stars {
   margin-bottom: 16px;
 }
+
+
 
 .star {
   font-size: 28px;
@@ -63,10 +87,14 @@
   width: 100%;
   padding: 8px;
   border-radius: 8px;
-  border: 1px solid #ccc;
+  border: 1px solid#5a9bd5;
   margin-bottom: 8px;
   font-size: 20px;
   resize: none;
+}
+
+.comment-box:focus{
+
 }
 
 /* Submit Button */
@@ -80,6 +108,13 @@
   font-size: 16px;
   cursor: pointer;
   transition: background 0.2s;
+}
+
+.guides{
+  align-self: self-start;
+  font-size: 1.5em;
+  font-weight: 300;
+  margin-bottom: -10px;
 }
 
 .submit-btn:disabled {

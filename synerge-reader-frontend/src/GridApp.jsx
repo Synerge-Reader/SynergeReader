@@ -9,6 +9,7 @@ import UserAuth from "./components/UserAuth/UserAuth.jsx";
 import Spinner from './components/Spinner/Spinner'
 import Notifier from './components/Notifier/Notifier'
 import Markdown from "react-markdown";
+import SurveyModal from "./components/Survey/SurveyModal.jsx";
 import './GridApp.css'
 
 const GridApp = () => {
@@ -24,6 +25,7 @@ const GridApp = () => {
   const [model, setModel] = useState("llama3.1:8b");
   const [openRating, setOpenRating] = useState(false);
   const [openAuth, setOpenAuth] = useState(false);
+  const [openSurvey, setOpenSurvey] = useState(false);
   const [authToken, setAuthToken] = useState('')
   const [notification, setNotification] = useState('')
 
@@ -158,6 +160,15 @@ const GridApp = () => {
             setAuthToken={setAuthToken}
             setNotification={setNotification}
             getHistory={getHistory}
+            setOpenSurvey={setOpenSurvey}
+          />
+        )}
+        {openSurvey && (
+          <SurveyModal
+            setNotification={setNotification}
+            setOpenSurvey={setOpenSurvey}
+            
+            
           />
         )}
 
