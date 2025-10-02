@@ -225,16 +225,18 @@ width: 200px;
 }
 
 .alpha-upload-btn {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  margin-top: -10px;
+  background-color: lightskyblue;
   color: white;
   border: none;
   padding: 12px 24px;
-  border-radius: 8px;
+  border-radius: 7px;
   font-size: 1rem;
   font-weight: 600;
   cursor: pointer;
   transition: all 0.3s ease;
   box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+  width: 250px
 }
 
 .alpha-upload-btn:hover {
@@ -387,6 +389,14 @@ width: 200px;
 
 
 }
+.alpha-upload-hint{
+margin-top: -20px;
+
+}
+ .alpha-upload-hint strong {
+   font-size: 1.5rem;
+ 
+ }
 
 
 
@@ -481,6 +491,10 @@ button:focus {
   outline: 2px solid #667eea;
   outline-offset: 2px;
 }
+
+
+
+
 
 /* Accessibility */
 @media (prefers-reduced-motion: reduce) {
