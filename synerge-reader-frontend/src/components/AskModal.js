@@ -16,7 +16,6 @@ const AskModal = ({ open, onClose, onAsk, selectedText }) => {
   return (
     <div className="modal-overlay">
       <div className="modal-content">
-        <h2>Ask a Question</h2>
         <form onSubmit={handleSubmit}>
           <div style={{ marginBottom: 5 }}>
             <textarea
@@ -30,10 +29,10 @@ const AskModal = ({ open, onClose, onAsk, selectedText }) => {
                 padding: 12,
                 border: '1px solid #ddd',
                 borderRadius: 4,
-                fontSize: '14px',
+                fontSize: '17px',
                 fontFamily: 'inherit'
               }}
-              placeholder="Type your question about the selected text..."
+              placeholder="Highlight text to ask about it, or type your own question."
             />
           </div>
 

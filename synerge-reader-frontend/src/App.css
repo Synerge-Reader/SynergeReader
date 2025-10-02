@@ -56,7 +56,7 @@ margin-bottom: 0px
 .headingInfo{
 display: flex;
 flex-direction: row ;
-gap: 40px;
+
 
 }
 
@@ -138,6 +138,7 @@ margin-left: auto;
 .headingInfo{
   display: flex;
   align-items: center;
+  width: 100%;
 }
 
 
@@ -166,6 +167,14 @@ margin-left: auto;
   justify-content: center;
 
 
+
+}
+
+.alpha-upload-card .models-drop {
+  background-color: lightskyblue;
+    font-weight: 600;
+    font-size: 1rem;
+    width: 250px;
 
 }
 
@@ -224,22 +233,34 @@ width: 200px;
 }
 
 .alpha-upload-btn {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  margin-top: -10px;
+  background-color: lightskyblue;
+  font-weight: 600;
+  font-size: 1rem;
+  width: 250px;
   color: white;
   border: none;
   padding: 12px 24px;
-  border-radius: 8px;
-  font-size: 1rem;
-  font-weight: 600;
+  border-radius: 7px;
+
+ 
   cursor: pointer;
   transition: all 0.3s ease;
   box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+  
 }
 
 .alpha-upload-btn:hover {
   transform: translateY(-1px);
   box-shadow: 0 6px 16px rgba(102, 126, 234, 0.4);
 }
+
+.models-drop{
+background-color: lightskyblue;
+  font-weight: 600;
+  font-size: 1rem;
+}
+
 
 /* Preview Card Styles */
 .alpha-preview-card {
@@ -270,7 +291,8 @@ width: 200px;
   font-size: 1rem;
   line-height: 1.6;
   color: black;
-  max-height: 650px;
+  min-height: 580px;
+  max-height: 580px;
   overflow-y: auto;
   white-space: pre-wrap;
   word-wrap: break-word;
@@ -362,6 +384,8 @@ width: 200px;
   }
 }
 
+
+
 /* Modal Styles */
 .modal-overlay {
   /* for responsive text box make sure to change width here */
@@ -373,18 +397,26 @@ width: 200px;
 }
 
 .modal-content {
- 
   background: white;
   border-radius: 8px;
-  padding: 30px;
-  min-width: 400px;
+ 
+  min-width: 900px;
+  height: 100%;
   width: 90%;
   overflow-y: auto;
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-  animation: modalSlideIn 0.3s ease-out;
+ 
 
 
 }
+.alpha-upload-hint{
+margin-top: -20px;
+
+}
+ .alpha-upload-hint strong {
+   font-size: 1.5rem;
+ 
+ }
 
 
 
@@ -411,6 +443,7 @@ button {
   font-family: inherit;
   transition: all 0.3s ease;
 }
+
 
 button:disabled {
   opacity: 0.6;
@@ -479,6 +512,10 @@ button:focus {
   outline: 2px solid #667eea;
   outline-offset: 2px;
 }
+
+
+
+
 
 /* Accessibility */
 @media (prefers-reduced-motion: reduce) {

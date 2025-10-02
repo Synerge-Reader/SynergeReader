@@ -1,7 +1,7 @@
 import { useState } from "react";
 import "./UserAuth.css";
 
-export default function UserAuth({ setOpenAuth, setAuthToken, setNotification, getHistory }) {
+export default function UserAuth({ setOpenAuth, setAuthToken, setNotification, setOpenSurvey, getHistory }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
 
@@ -28,6 +28,7 @@ export default function UserAuth({ setOpenAuth, setAuthToken, setNotification, g
         setOpenAuth(false);
         getHistory();
         setNotification(`Successful ${endpoint}!`);
+        setOpenSurvey(true)
       } else {
         setNotification("User Auth Error")
       }
@@ -42,23 +43,28 @@ export default function UserAuth({ setOpenAuth, setAuthToken, setNotification, g
       <div className="modal">
         {/* Close button */}
         <button className="close-btn" onClick={() => setOpenAuth(false)}>
-          ×
+          X
         </button>
-        <h2 className="modal-title">Authentication</h2>
+        <h2 className="modal-title">User Portal
+        <hr></hr></h2>
+      
 
         {/* Username and password */}
+        <h1 className="guides">Username</h1>
         <input
           className="comment-box"
           rows="1"
-          placeholder="Username"
+          placeholder="John Doe"
           type="text"
           value={username}
           onChange={(e) => setUsername(e.target.value)}
         />
+         <h1 className="guides">Password</h1>
         <input
+        
           className="comment-box"
           rows="1"
-          placeholder="Password"
+          placeholder="*******"
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}

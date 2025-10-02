@@ -9,6 +9,7 @@ import UserAuth from "./components/UserAuth/UserAuth.jsx";
 import Spinner from './components/Spinner/Spinner'
 import Notifier from './components/Notifier/Notifier'
 import Markdown from "react-markdown";
+import SurveyModal from "./components/Survey/SurveyModal.jsx";
 import './GridApp.css'
 
 const GridApp = () => {
@@ -24,6 +25,7 @@ const GridApp = () => {
   const [model, setModel] = useState("llama3.1:8b");
   const [openRating, setOpenRating] = useState(false);
   const [openAuth, setOpenAuth] = useState(false);
+  const [openSurvey, setOpenSurvey] = useState(false);
   const [authToken, setAuthToken] = useState('')
   const [notification, setNotification] = useState('')
 
@@ -77,10 +79,12 @@ const GridApp = () => {
   };
 
   const handleAsk = async (question) => {
+    /* just in case we need this back on
     if (!selectedText.trim()) {
       setError("Please select some text first.");
       return;
     }
+    */
 
     setIsLoading(true);
     try {
@@ -158,6 +162,15 @@ const GridApp = () => {
             setAuthToken={setAuthToken}
             setNotification={setNotification}
             getHistory={getHistory}
+            setOpenSurvey={setOpenSurvey}
+          />
+        )}
+        {openSurvey && (
+          <SurveyModal
+            setNotification={setNotification}
+            setOpenSurvey={setOpenSurvey}
+            
+            
           />
         )}
 
@@ -180,6 +193,7 @@ const GridApp = () => {
         {/* Upload / Preview */}
         <div className="div1">
           <div className="doc-section">
+            
             {parsedDocuments.length === 0 && (
               <FileUpload
                 onFileParsed={handleFileParsed}
@@ -188,21 +202,16 @@ const GridApp = () => {
                 model={model}
                 setModel={setModel}
               />
+              
             )}
             {error && <div className="error-message">{error}</div>}
-            {isLoading && <div className="loading-spinner">Processing...</div>}
+          {/*  {isLoading && <div className="loading-spinner">Processing...</div>} */} 
 
             {parsedDocuments.length > 0 && (
               <TextPreview
                 documents={parsedDocuments}
                 onSelect={handleTextSelection}
               />
-            )}
-            {parsedDocuments.length > 0 && (
-              <div className="file-info">
-                Uploaded:{" "}
-                <span>{parsedDocuments.map((d) => d.name).join(", ")}</span>
-              </div>
             )}
           </div>
         </div>
@@ -233,7 +242,7 @@ const GridApp = () => {
                 History
               </h2>
             </div>
-
+            <hr></hr>
             <div className="main-action-box">
               {openHistory ? (
                 <>
@@ -328,7 +337,7 @@ const GridApp = () => {
                             marginLeft: 8,
                           }}
                         >
-                          <Markdown>{answer.answer}</Markdown>
+                         <Markdown>{answer.answer}</Markdown>
                         </div>
                       </div>
                       {answer.context_chunks &&

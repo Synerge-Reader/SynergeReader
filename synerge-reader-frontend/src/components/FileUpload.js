@@ -3,6 +3,10 @@ import * as pdfjsLib from "pdfjs-dist/build/pdf";
 import { GlobalWorkerOptions } from "pdfjs-dist/build/pdf";
 import mammoth from "mammoth";
 import Dropdown from "./Dropdown/Dropdown.jsx";
+import txtLogo from '../assets/txt.png'
+import pdfLogo from '../assets/pdf.png'
+import docxLogo from '../assets/docx.png'
+
 
 GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -209,10 +213,38 @@ export default function FileUpload({
     >
       <img src="/uploadIcon.svg" alt="Upload icon" />
       <div className="alpha-upload-hint">
-        <strong>Upload documents</strong><br /> <span className="pdf-accent">PDF</span>,{" "}
+        <strong style={{ marginTop: '100p' }}>Upload documents</strong><br />
+
+        <div style={{ display: "flex", gap: '20px', marginTop: "15px" }}>
+          <img src={docxLogo} className="txt-icon" style={{
+            width: "75px",
+            height: "75px",
+            verticalAlign: "middle",
+            filter: "none",
+            mixBlendMode: "normal",
+          }} />
+
+          <img src={pdfLogo} className="txt-icon" style={{
+            width: "75px",
+            height: "75px",
+            verticalAlign: "middle",
+            filter: "none",
+            mixBlendMode: "normal",
+          }} />
+
+          <img src={txtLogo} className="txt-icon" style={{
+            width: "75px",
+            height: "75px",
+            verticalAlign: "middle",
+            filter: "none",
+            mixBlendMode: "normal",
+          }} />
+        </div>
+
+        <span className="pdf-accent">PDF</span>,{" "}
         <span className="docx-accent">DOCX</span>, or{" "}
         <span className="txt-accent">TXT</span> Files{" "}<br />
-        <span className="dim">(max 20MB each)</span>
+        <span className="dim">(Max file size: 20MB each)</span>
         <br />
       </div>
       <input
@@ -231,16 +263,21 @@ export default function FileUpload({
       >
         Browse Files
       </button>
-
-      <Dropdown
+      <Dropdown className="alpha-upload-btn"
+        style={{
+          backgroundColor: "lightskyblue",
+          fontWeight: 600,
+          fontSize: "1rem",
+        }}
         title={`Selected Model: ${model}`}
         options={["llama3.1:8b", "qwen3:latest"]}
         onSelect={(option) => {
           setModel(option);
           console.log("Selected:", option);
         }}
+
       />
-    </div>
+    </div >
   );
 }
 
