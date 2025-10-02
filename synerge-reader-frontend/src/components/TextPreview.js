@@ -13,6 +13,12 @@ const TextPreview = ({ documents = [], onSelect }) => {
       <div className="alpha-preview-card" role="region" aria-label="Document preview">
         <div className="alpha-preview-title">
           Document Preview
+          {documents.length > 0 && (
+            <div className="file-info">
+              Uploaded:{" "}
+              <span>{documents.map((d) => d.name).join(", ")}</span>
+            </div>
+          )}
           <hr></hr>
         </div>
         <div className="alpha-preview-text" style={{ userSelect: 'text' }}>
@@ -26,6 +32,12 @@ const TextPreview = ({ documents = [], onSelect }) => {
     <div className="alpha-preview-card" role="region" aria-label="Document previews">
       <div className="alpha-preview-title">
         Document Previews
+        {documents.length > 0 && (
+          <div className="file-info">
+            Uploaded:{" "}
+            <span>{documents.map((d) => d.name).join(", ")}</span>
+          </div>
+        )}
         <hr></hr>
       </div>
       <div className="alpha-preview-text" style={{ userSelect: 'text' }}>

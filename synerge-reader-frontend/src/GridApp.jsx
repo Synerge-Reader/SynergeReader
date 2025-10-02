@@ -205,19 +205,13 @@ const GridApp = () => {
               
             )}
             {error && <div className="error-message">{error}</div>}
-            {isLoading && <div className="loading-spinner">Processing...</div>}
+          {/*  {isLoading && <div className="loading-spinner">Processing...</div>} */} 
 
             {parsedDocuments.length > 0 && (
               <TextPreview
                 documents={parsedDocuments}
                 onSelect={handleTextSelection}
               />
-            )}
-            {parsedDocuments.length > 0 && (
-              <div className="file-info">
-                Uploaded:{" "}
-                <span>{parsedDocuments.map((d) => d.name).join(", ")}</span>
-              </div>
             )}
           </div>
         </div>
