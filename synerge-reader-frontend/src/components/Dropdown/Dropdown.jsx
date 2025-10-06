@@ -24,7 +24,6 @@ const Dropdown = ({ title, options, onSelect }) => {
         >
           {title} <span className="arrow">▾</span>
         </button>
-
         {isOpen && (
           <div className="dropdown-menu">
             {options.map((opt, idx) => (
@@ -36,7 +35,7 @@ const Dropdown = ({ title, options, onSelect }) => {
                 }}
                 className="dropdown-item"
               >
-                {opt}
+                {opt.label}
               </button>
             ))}
           </div>
