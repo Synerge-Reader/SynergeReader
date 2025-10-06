@@ -79,29 +79,30 @@ const GridApp = () => {
   };
 
   const handleAsk = async (question) => {
-    /* just in case we need this back on
-    if (!selectedText.trim()) {
-      setError("Please select some text first.");
-      return;
-    }
-    */
-
     setIsLoading(true);
     try {
+      // If no text is selected, use all parsed documents' text
+      let textToSend = selectedText;
+
+      if (!selectedText || selectedText.trim() === "") {
+        // Concatenate all document texts
+        textToSend = parsedDocuments.map(doc => doc.text).join('\n\n---\n\n');
+      }
+
       const res = await fetch(
         (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/ask",
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            selected_text: selectedText,
+            selected_text: textToSend,
             question,
             model,
             auth_token: authToken
           }),
         },
       );
-
+      console.log(parsedDocuments);
       if (!res.ok) throw new Error("Backend error");
 
       const reader = res.body.getReader();
@@ -112,7 +113,6 @@ const GridApp = () => {
         const { done, value } = await reader.read();
         if (done) break;
         fullText += decoder.decode(value, { stream: true });
-        // optionally: set partial streaming text here
       }
 
       // Extract entry ID from the end of the response
@@ -127,7 +127,6 @@ const GridApp = () => {
       }
 
       console.log("Entry ID:", entryId); // You can use this ID as needed
-
       setAnswer({
         question,
         answer: answer,
@@ -139,7 +138,7 @@ const GridApp = () => {
       setError("Could not get answer from backend.");
     } finally {
       setIsLoading(false);
-
+      getHistory()
     }
   };
 
@@ -169,8 +168,8 @@ const GridApp = () => {
           <SurveyModal
             setNotification={setNotification}
             setOpenSurvey={setOpenSurvey}
-            
-            
+
+
           />
         )}
 
@@ -193,7 +192,7 @@ const GridApp = () => {
         {/* Upload / Preview */}
         <div className="div1">
           <div className="doc-section">
-            
+
             {parsedDocuments.length === 0 && (
               <FileUpload
                 onFileParsed={handleFileParsed}
@@ -202,10 +201,10 @@ const GridApp = () => {
                 model={model}
                 setModel={setModel}
               />
-              
+
             )}
             {error && <div className="error-message">{error}</div>}
-          {/*  {isLoading && <div className="loading-spinner">Processing...</div>} */} 
+            {/*  {isLoading && <div className="loading-spinner">Processing...</div>} */}
 
             {parsedDocuments.length > 0 && (
               <TextPreview
@@ -337,7 +336,7 @@ const GridApp = () => {
                             marginLeft: 8,
                           }}
                         >
-                         <Markdown>{answer.answer}</Markdown>
+                          <Markdown>{answer.answer}</Markdown>
                         </div>
                       </div>
                       {answer.context_chunks &&
