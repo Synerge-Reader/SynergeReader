@@ -322,7 +322,7 @@ const GridApp = () => {
                         padding: 20,
                       }}
                     >
-                      <h3>Response</h3>
+                      <h3>Response </h3>
                       <div style={{ marginBottom: 16 }}>
                         <strong>Question:</strong> {answer.question}
                       </div>
