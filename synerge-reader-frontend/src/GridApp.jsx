@@ -318,7 +318,7 @@ const GridApp = () => {
                         maxWidth: 800,
                         background: "#fff",
                         borderRadius: 8,
-                        boxShadow: "0 2px 8px rgba(0,0,0,0.07)",
+                        letterSpacing: "0.5px",
                         padding: 20,
                       }}
                     >

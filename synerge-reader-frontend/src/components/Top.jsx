@@ -1,4 +1,6 @@
 import "./Top.css";
+import { useState } from "react";
+
 
 function Top({ setOpenAuth, authToken, setAuthToken, setHistory }) {
   return (
@@ -7,7 +9,10 @@ function Top({ setOpenAuth, authToken, setAuthToken, setHistory }) {
         <div className="headingInfo">
           <img src="/menuBar.svg"></img>
         
-          <h3 style={{marginLeft : 'auto'}}>Community Papers</h3>
+          <h3 style={{marginLeft : 'auto'}}>
+            <select></select>
+            
+            Community Papers</h3>
           <h3>Browse</h3>
           {!authToken ? (
             <div onClick={() => setOpenAuth(true)} className='auth'>
