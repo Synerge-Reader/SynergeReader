@@ -192,6 +192,8 @@ const GridApp = () => {
             authToken={authToken}
             setAuthToken={setAuthToken}
             setHistory={setHistory}
+            model={model}
+  setModel={setModel}
           />
           <hr />
           <TitleLogo />
