@@ -22,6 +22,7 @@ export default function FileUpload({
     "application/pdf",
     "text/plain",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/json"
   ];
   const setDefault = () => setIsDragging(false);
 
@@ -105,6 +106,23 @@ export default function FileUpload({
     });
   };
 
+  const processJSON = (file) => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const json = JSON.parse(e.target.result);
+          resolve(JSON.stringify(json, null, 2));
+        } catch (error) {
+          reject(new Error(`Error reading JSON: ${error.message}`));
+        }
+      };
+      reader.readAsText(file, "utf-8");
+    });
+  };
+
+
+
   const processFiles = async (files) => {
     const validFiles = [];
     const errorMessages = [];
@@ -145,6 +163,9 @@ export default function FileUpload({
           textContent = await processDOCX(file);
         } else if (file.type === "text/plain") {
           textContent = await processTXT(file);
+        }
+        if (file.type === "application/json") {
+          textContent = await processJSON(file);
         }
 
         const parsedDoc = { name: file.name, text: textContent };
@@ -200,11 +221,11 @@ export default function FileUpload({
 
   const modelDisplayNames = {
     "llama3.1:8b": "LLaMA 3.1 8B",
-    "qwen3:latest": "Qwen 3",
-    "hf.co/TheBloke/law-LLM-GGUF:Q6_K": "Law LLM",
+    /* "qwen3:latest": "Qwen 3", */
+    /* "hf.co/TheBloke/law-LLM-GGUF:Q6_K": "Law LLM",  */
     "adrienbrault/saul-instruct-v1:Q8_0": "Saul Instruct",
     "OussamaELALLAM/MedExpert:latest": "MedExpert",
-    "meditron:latest": "Meditron"
+    /*  "meditron:latest": "Meditron" */
   };
 
   const displayName = modelDisplayNames[model] || model;
@@ -230,7 +251,7 @@ export default function FileUpload({
       </div>
       <input
         type="file"
-        accept=".pdf,.docx,.txt"
+        accept=".pdf,.docx,.txt,.json"
         multiple
         ref={fileInputRef}
         onChange={handleFileChange}
@@ -249,11 +270,11 @@ export default function FileUpload({
         title={`Selected Model: ${displayName}`}
         options={[
           { label: "LLaMA 3.1 8B", value: "llama3.1:8b" },
-          { label: "Qwen 3", value: "qwen3:latest" },
-          { label: "Law LLM", value: "hf.co/TheBloke/law-LLM-GGUF:Q6_K" },
+          /*   { label: "Qwen 3", value: "qwen3:latest" }, */
+          /* { label: "Law LLM", value: "hf.co/TheBloke/law-LLM-GGUF:Q6_K" },*/
           { label: "Saul Instruct", value: "adrienbrault/saul-instruct-v1:Q8_0" },
           { label: "MedExpert", value: "OussamaELALLAM/MedExpert:latest" },
-          { label: "Meditron", value: "meditron:latest" }
+          /*   { label: "Meditron", value: "meditron:latest" } */
         ]}
         onSelect={(option) => {
           setModel(option.value);

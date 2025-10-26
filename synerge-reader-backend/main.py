@@ -10,6 +10,7 @@ import json
 from pydantic import BaseModel
 import bcrypt
 import secrets
+import numpy as np
 
 # System instruction and few-shot prompt for LLM
 # Removed system instruction and few-shot prompt literals to avoid embedding model-level instructions in prompts
@@ -201,6 +202,24 @@ def embed_chunks(
     return embeddings
 
 
+def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+    """Calculate cosine similarity between two vectors"""
+    if not vec1 or not vec2:
+        return 0.0
+    
+    vec1_np = np.array(vec1)
+    vec2_np = np.array(vec2)
+    
+    dot_product = np.dot(vec1_np, vec2_np)
+    norm1 = np.linalg.norm(vec1_np)
+    norm2 = np.linalg.norm(vec2_np)
+    
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    
+    return dot_product / (norm1 * norm2)
+
+
 def analyze_question(question: str, selected_text: str) -> str:
     """Simple question analysis"""
     analysis_parts = []
@@ -283,15 +302,12 @@ def get_relevant_history(
 
 def get_relevant_chunks(question: str, top_k: int = 3) -> List[str]:
     """
-    Get relevant document chunks based on question similarity.
-    This is a simple implementation - you might want to use vector similarity later.
+    Get relevant document chunks based on semantic similarity using embeddings.
     """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
-    # Simple keyword matching for now
-    question_words = set(question.lower().split())
-
+    # Get all chunks with their embeddings
     c.execute("""
         SELECT chunk_text, embedding_json 
         FROM document_chunks
@@ -303,15 +319,25 @@ def get_relevant_chunks(question: str, top_k: int = 3) -> List[str]:
     if not chunks_data:
         return []
 
-    # Score chunks based on keyword overlap
+    # Generate embedding for the question
+    question_embedding = embed_chunks([question])
+    if not question_embedding or not question_embedding[0]:
+        return []
+    
+    question_vec = question_embedding[0]
+
+    # Calculate similarity scores for each chunk
     scored_chunks = []
     for chunk_text, embedding_json in chunks_data:
-        chunk_words = set(chunk_text.lower().split())
-        overlap_score = len(question_words.intersection(chunk_words))
-        if overlap_score > 0:
-            scored_chunks.append((chunk_text, overlap_score))
+        try:
+            chunk_embedding = json.loads(embedding_json)
+            similarity = cosine_similarity(question_vec, chunk_embedding)
+            scored_chunks.append((chunk_text, similarity))
+        except Exception as e:
+            print(f"Error calculating similarity: {str(e)}")
+            continue
 
-    # Sort by score and return top results
+    # Sort by similarity score (highest first) and return top results
     scored_chunks.sort(key=lambda x: x[1], reverse=True)
     return [chunk[0] for chunk in scored_chunks[:top_k]]
 
@@ -395,6 +421,19 @@ async def upload_documents(
     else:
         raise HTTPException(status_code=400, detail="No files provided")
 
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM document_chunks")
+        c.execute("DELETE FROM documents") ## remove function when we use start using proper semantic search 
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error clearing old documents: {str(e)}"
+        )
+    
     results = []
     for f in all_files:
         try:
@@ -408,6 +447,8 @@ async def upload_documents(
                 # Try other encodings if UTF-8 fails
                 try:
                     text = content.decode("latin-1")
+                   
+                    
                 except UnicodeDecodeError:
                     results.append(
                         {
@@ -494,8 +535,8 @@ async def upload_documents(
 async def ask_question(request: AskRequest):
     """Ask a question and stream LLM answer with context from uploaded documents"""
     try:
-        # Get relevant chunks from uploaded documents
-        context_chunks = get_relevant_chunks(request.question, top_k=3)
+        # semantic search now used
+        context_chunks = get_relevant_chunks(request.question, top_k=2)
         if not context_chunks and request.selected_text:
             context_chunks = [request.selected_text]
         elif not context_chunks:
@@ -526,6 +567,13 @@ async def ask_question(request: AskRequest):
         # Generator to stream from Ollama
         def stream_generate():
             nonlocal answer_chunks, entry_id
+            
+      
+            context_data = {
+                "context_chunks": context_chunks
+            }
+            yield f"__CONTEXT__{json.dumps(context_data)}__\n\n"
+            
             api_url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/generate"
             payload = {
                 "model": request.model,

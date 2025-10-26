@@ -115,6 +115,18 @@ const GridApp = () => {
         fullText += decoder.decode(value, { stream: true });
       }
 
+  let contextChunks = [];
+  const contextMatch = fullText.match(/__CONTEXT__({.+?})__/s);
+  if (contextMatch) {
+  try {
+  const contextData = JSON.parse(contextMatch[1]);
+  contextChunks = contextData.context_chunks || [];
+
+  fullText = fullText.replace(/__CONTEXT__{.+?}__\n*/s, "");
+  } catch (e) {
+  console.error("Error parsing context:", e);
+  }
+  }
       // Extract entry ID from the end of the response
       let answer = fullText;
       let entryId = null;
@@ -130,7 +142,7 @@ const GridApp = () => {
       setAnswer({
         question,
         answer: answer,
-        context_chunks: [],
+        context_chunks: contextChunks,
         relevant_history: [],
         entryId: entryId, // Add the entry ID to your state
       });
@@ -180,6 +192,8 @@ const GridApp = () => {
             authToken={authToken}
             setAuthToken={setAuthToken}
             setHistory={setHistory}
+            model={model}
+  setModel={setModel}
           />
           <hr />
           <TitleLogo />
@@ -318,11 +332,11 @@ const GridApp = () => {
                         maxWidth: 800,
                         background: "#fff",
                         borderRadius: 8,
-                        boxShadow: "0 2px 8px rgba(0,0,0,0.07)",
+                        letterSpacing: "0.5px",
                         padding: 20,
                       }}
                     >
-                      <h3>Response</h3>
+                      <h3>Response </h3>
                       <div style={{ marginBottom: 16 }}>
                         <strong>Question:</strong> {answer.question}
                       </div>
