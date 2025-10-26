@@ -10,7 +10,7 @@ function Top({ setOpenAuth, authToken, setAuthToken, setHistory }) {
           <img src="/menuBar.svg"></img>
         
           <h3 style={{marginLeft : 'auto'}}>
-            <select></select>
+            <select>Hello</select>
             
             Community Papers</h3>
           <h3>Browse</h3>
