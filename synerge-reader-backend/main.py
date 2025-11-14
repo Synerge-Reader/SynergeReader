@@ -4,7 +4,7 @@ from fastapi.responses import StreamingResponse
 import sqlite3
 import os
 import datetime
-from typing import List
+from typing import List, Optional
 import requests
 import json
 from pydantic import BaseModel
@@ -38,7 +38,7 @@ class AskRequest(BaseModel):
     selected_text: str
     question: str
     model: str
-    auth_token: str
+    auth_token: Optional[str] = None
 
 
 class AskResponse(BaseModel):
@@ -58,7 +58,7 @@ class HistoryItem(BaseModel):
 
 
 class HistoryRequest(BaseModel):
-    token: str
+    token: Optional[str] = None
 
 
 class RatingRequest(BaseModel):
@@ -115,11 +115,14 @@ def init_db():
 
     # New users table
     c.execute("""CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT,
+        id INTEGER PRIMARY KEY,
+        username TEXT UNIQUE,
         password TEXT,
         token TEXT
     )""")
+
+    # Insert anonymous user if not exists
+    c.execute("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (0, "anonymous"))
 
     conn.commit()
     conn.close()
@@ -249,97 +252,124 @@ def analyze_question(question: str, selected_text: str) -> str:
 
 
 def get_relevant_history(
-    question: str, selected_text: str, limit: int = 3
+    question: str, selected_text: str, token: Optional[str] = None, limit: int = 3
 ) -> List[dict]:
-    """Retrieve relevant chat history based on similarity"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        SELECT id, ts, selected_text, question, answer 
-        FROM chat_history 
-        ORDER BY id DESC 
-        LIMIT 20
-    """)
-    rows = c.fetchall()
-    conn.close()
+    """Retrieve relevant chat history for the authenticated or anonymous user based on similarity"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
 
-    if not rows:
+        user_id_to_fetch = None
+        if token:
+            c.execute("SELECT id FROM users WHERE token = ?", (token,))
+            row = c.fetchone()
+            if row:
+                user_id_to_fetch = row[0]
+        else:
+            # For anonymous users, use a default user_id (e.g., 0)
+            user_id_to_fetch = 0 
+
+        # Ensure the anonymous user exists
+        c.execute("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (0, "anonymous"))
+        conn.commit()
+
+        c.execute(
+            """
+            SELECT id, ts, selected_text, question, answer
+            FROM chat_history
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 20
+            """,
+            (user_id_to_fetch,),
+        )
+        rows = c.fetchall()
+        conn.close()
+
+        if not rows:
+            return []
+
+        # Simple keyword-based relevance scoring
+        question_lower = question.lower()
+        selected_lower = selected_text.lower()
+
+        relevant_history = []
+        for row in rows:
+            id, ts, sel_text, q, a = row
+            score = 0
+
+            # Score based on question similarity
+            if any(word in q.lower() for word in question_lower.split()):
+                score += 1
+
+            # Score based on selected text similarity
+            if any(word in sel_text.lower() for word in selected_lower.split()):
+                score += 2
+
+            if score > 0:
+                relevant_history.append(
+                    {
+                        "id": id,
+                        "timestamp": ts,
+                        "selected_text": sel_text,
+                        "question": q,
+                        "answer": a,
+                        "relevance_score": score,
+                    }
+                )
+
+        # Sort by relevance and return top results
+        relevant_history.sort(key=lambda x: x["relevance_score"], reverse=True)
+        return relevant_history[:limit]
+    except Exception as e:
+        print(f"Error in get_relevant_history: {str(e)}")
         return []
-
-    # Simple keyword-based relevance scoring
-    question_lower = question.lower()
-    selected_lower = selected_text.lower()
-
-    relevant_history = []
-    for row in rows:
-        id, ts, sel_text, q, a = row
-        score = 0
-
-        # Score based on question similarity
-        if any(word in q.lower() for word in question_lower.split()):
-            score += 1
-
-        # Score based on selected text similarity
-        if any(word in sel_text.lower() for word in selected_lower.split()):
-            score += 2
-
-        if score > 0:
-            relevant_history.append(
-                {
-                    "id": id,
-                    "timestamp": ts,
-                    "selected_text": sel_text,
-                    "question": q,
-                    "answer": a,
-                    "relevance_score": score,
-                }
-            )
-
-    # Sort by relevance and return top results
-    relevant_history.sort(key=lambda x: x["relevance_score"], reverse=True)
-    return relevant_history[:limit]
 
 
 def get_relevant_chunks(question: str, top_k: int = 3) -> List[str]:
     """
     Get relevant document chunks based on semantic similarity using embeddings.
     """
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
 
-    # Get all chunks with their embeddings
-    c.execute("""
-        SELECT chunk_text, embedding_json 
-        FROM document_chunks
-    """)
+        # Get all chunks with their embeddings
+        c.execute("""
+            SELECT chunk_text, embedding_json 
+            FROM document_chunks
+        """)
 
-    chunks_data = c.fetchall()
-    conn.close()
+        chunks_data = c.fetchall()
+        conn.close()
 
-    if not chunks_data:
-        return []
+        if not chunks_data:
+            return []
 
-    # Generate embedding for the question
-    question_embedding = embed_chunks([question])
-    if not question_embedding or not question_embedding[0]:
-        return []
-    
-    question_vec = question_embedding[0]
+        # Generate embedding for the question
+        question_embedding = embed_chunks([question])
+        if not question_embedding or not question_embedding[0]:
+            return []
+        
+        question_vec = question_embedding[0]
 
-    # Calculate similarity scores for each chunk
-    scored_chunks = []
-    for chunk_text, embedding_json in chunks_data:
-        try:
-            chunk_embedding = json.loads(embedding_json)
-            similarity = cosine_similarity(question_vec, chunk_embedding)
-            scored_chunks.append((chunk_text, similarity))
-        except Exception as e:
-            print(f"Error calculating similarity: {str(e)}")
-            continue
+        # Calculate similarity scores for each chunk
+        scored_chunks = []
+        for chunk_text, embedding_json in chunks_data:
+            try:
+                chunk_embedding = json.loads(embedding_json)
+                similarity = cosine_similarity(question_vec, chunk_embedding)
+                scored_chunks.append((chunk_text, similarity))
+            except Exception as e:
+                print(f"Error calculating similarity: {str(e)}")
+                continue
 
-    # Sort by similarity score (highest first) and return top results
-    scored_chunks.sort(key=lambda x: x[1], reverse=True)
-    return [chunk[0] for chunk in scored_chunks[:top_k]]
+        # Sort by similarity score (highest first) and return top results
+        scored_chunks.sort(key=lambda x: x[1], reverse=True)
+        return [chunk[0] for chunk in scored_chunks[:top_k]]
+    except Exception as e:
+        print(f"Error in get_relevant_chunks: {str(e)}")
+        return []  # Return empty list if embeddings fail
 
 
 def call_llm(
@@ -542,8 +572,12 @@ async def ask_question(request: AskRequest):
         elif not context_chunks:
             context_chunks = ["No relevant context found in uploaded documents."]
 
-        # Get relevant history
-        relevant_history = get_relevant_history(request.question, request.selected_text)
+        # Get relevant history (no auth required)
+        relevant_history = get_relevant_history(
+            request.question, 
+            request.selected_text,
+            token=request.auth_token
+        )
 
         # Build prompt
         combined_text = ""
@@ -607,14 +641,16 @@ async def ask_question(request: AskRequest):
                     conn = sqlite3.connect(DB_PATH)
                     c = conn.cursor()
 
-                    # Get user_id from token
-                    c.execute(
-                        "SELECT id FROM users WHERE token = ?", (request.auth_token,)
-                    )
-                    row = c.fetchone()
-                    if not row:
-                        return
-                    user_id = row[0]
+                    user_id_to_save = 0 # Default for anonymous users
+                    if request.auth_token:
+                        c.execute("SELECT id FROM users WHERE token = ?", (request.auth_token,))
+                        row = c.fetchone()
+                        if row:
+                            user_id_to_save = row[0]
+                    
+                    # Ensure the anonymous user exists
+                    c.execute("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (0, "anonymous"))
+                    conn.commit()
 
                     # Insert into chat_history
                     c.execute(
@@ -627,7 +663,7 @@ async def ask_question(request: AskRequest):
                             request.selected_text,
                             request.question,
                             full_answer,
-                            user_id,
+                            user_id_to_save,
                         ),
                     )
                     entry_id = c.lastrowid
@@ -653,19 +689,27 @@ async def get_history(request: HistoryRequest):
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
+
+        user_id_to_fetch = 0 # Default for anonymous users
+        if request.token:
+            c.execute("SELECT id FROM users WHERE token = ?", (request.token,))
+            row = c.fetchone()
+            if row:
+                user_id_to_fetch = row[0]
+        
+        # Ensure the anonymous user exists
+        c.execute("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (0, "anonymous"))
+        conn.commit()
+
         c.execute(
             """
             SELECT id, ts, selected_text, question, answer 
             FROM chat_history
-            WHERE user_id IN (
-                SELECT id
-                FROM users
-                WHERE token = ?
-            )
+            WHERE user_id = ?
             ORDER BY id 
             DESC LIMIT 20
         """,
-            (request.token,),
+            (user_id_to_fetch,),
         )
         rows = c.fetchall()
         conn.close()
@@ -680,7 +724,6 @@ async def get_history(request: HistoryRequest):
             )
             for row in rows
         ]
-
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Error retrieving history: {str(e)}"
@@ -816,6 +859,7 @@ async def login(request: LoginRequest):
 @app.get("/test")
 async def test_endpoint():
     """Test endpoint to verify API is working"""
+    print("--- /test endpoint called ---")
     return {"message": "SynergeReader API is working!"}
 
 

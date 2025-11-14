@@ -44,28 +44,29 @@ const GridApp = () => {
   }, []);
 
   const getHistory = async () => {
-
     const token = localStorage.getItem("authToken"); // get token from localStorage
-    if (!token) {
-      setHistory([]);
-      return;
-    }
-    else {
-      setAuthToken(token);
-
+    
+    try {
       const res = await fetch(
         (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + `/history`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            token,
+            token: token || undefined, // Pass token if available, otherwise undefined for anonymous
           }),
         }
       );
       const data = await res.json();
       setHistory(data);
-      console.log(data)
+      
+      // Set auth token if available
+      if (token) {
+        setAuthToken(token);
+      }
+    } catch (err) {
+      console.error("Error fetching history:", err);
+      setHistory([]);
     }
   }
 
@@ -296,9 +297,12 @@ const GridApp = () => {
                                 {h.selected_text.substring(0, 200)}
                                 {h.selected_text.length > 200 ? "..." : ""}
                               </div>
-                              <div style={{ marginBottom: 8 }}>
-                                <strong>A:</strong> {h.answer}
-                              </div>
+                            </div>
+                            <div style={{ marginBottom: 8 }}>
+                              <strong>Q:</strong> {h.question}
+                            </div>
+                            <div style={{ marginBottom: 8 }}>
+                              <strong>A:</strong> {h.answer}
                             </div>
                           </div>
                         ))}

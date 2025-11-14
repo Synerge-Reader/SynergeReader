@@ -7,6 +7,8 @@ import TitleLogo from "./components/TitleLogo";
 import Top from "./components/Top";
 import "./App.css";
 
+const API_BASE = "/";
+
 export default function App() {
   const [model, setModel] = useState("llama3.1:8b");
   const [documents, setDocuments] = useState([]);
@@ -19,11 +21,17 @@ export default function App() {
   const [history, setHistory] = useState([]);
 
   useEffect(() => {
-    fetch((process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/test")
+    fetch(`${API_BASE}test`)
       .then((res) => res.json())
       .then((data) => setBackendMsg(data.message))
       .catch(() => setBackendMsg("Could not connect to backend."));
-    fetch((process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/history")
+    
+    // Fetch anonymous user history on load
+    fetch(`${API_BASE}history`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}), // No token needed for anonymous history
+    })
       .then((res) => res.json())
       .then((data) => setHistory(data))
       .catch(() => setHistory([]));
@@ -47,35 +55,72 @@ export default function App() {
 
     setIsLoading(true);
     setError("");
+    setAnswer(null); // Clear previous answer
 
     try {
-      const response = await fetch(
-        (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/ask",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            selected_text: selectedText,
-            question,
-            model: model,
-          }),
-        }
-      );
+      const response = await fetch(`${API_BASE}ask`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          selected_text: selectedText,
+          question,
+          model: model,
+        }),
+      });
 
       if (!response.ok) {
         throw new Error("Backend error");
       }
 
-      const data = await response.json();
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let fullAnswer = "";
+      let contextChunks = [];
+      let entryId = null;
 
-      setAnswer(data);
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        const chunk = decoder.decode(value, { stream: true });
+        
+        if (chunk.includes("__ENTRY_ID__")) {
+          const idMatch = chunk.match(/__ENTRY_ID__(\d+)__/);
+          if (idMatch && idMatch[1]) {
+            entryId = parseInt(idMatch[1], 10);
+          }
+          continue;
+        }
+
+        if (chunk.includes("__ERROR__")) {
+          const errorMatch = chunk.match(/__ERROR__(.*)__/);
+          if (errorMatch && errorMatch[1]) {
+            setError(`Backend streaming error: ${errorMatch[1]}`);
+          } else {
+            setError("An unknown backend streaming error occurred.");
+          }
+          continue;
+        }
+
+        fullAnswer += chunk;
+        setAnswer({
+          question,
+          answer: fullAnswer,
+          context_chunks: contextChunks,
+        });
+      }
+
       setIsLoading(false);
       setAskOpen(false);
 
       // Refresh history
-      const historyRes = await fetch(
-        (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/history"
-      );
+      const historyRes = await fetch(`${API_BASE}history`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}), // No token needed for anonymous history
+      });
       const historyData = await historyRes.json();
       setHistory(historyData);
     } catch (err) {
