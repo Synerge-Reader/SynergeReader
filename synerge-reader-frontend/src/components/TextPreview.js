@@ -44,6 +44,23 @@ const TextPreview = ({ documents = [], onSelect }) => {
         {documents.map((doc) => (
           <div key={doc.name} style={{ marginBottom: '16px' }}>
             <h4>{doc.name}</h4>
+            {doc.citation && (doc.citation.title || doc.citation.author) && (
+              <div className="citation-info" style={{
+                fontSize: '0.85em',
+                color: '#555',
+                background: '#f5f5f5',
+                padding: '8px',
+                borderRadius: '4px',
+                marginBottom: '8px'
+              }}>
+                <strong>Citation: </strong>
+                {doc.citation.title && <span>"{doc.citation.title}" </span>}
+                {doc.citation.author && <span>by {doc.citation.author} </span>}
+                {doc.citation.publication_date && <span>({doc.citation.publication_date}) </span>}
+                {doc.citation.source && <span>- {doc.citation.source} </span>}
+                {doc.citation.doi_url && <span>[{doc.citation.doi_url}]</span>}
+              </div>
+            )}
             <div onMouseUp={handleMouseUp}>
               {doc.text ? doc.text.substring(0, 10000) : "No text parsed yet."}
             </div>
