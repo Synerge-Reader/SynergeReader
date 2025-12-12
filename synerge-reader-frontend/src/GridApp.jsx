@@ -10,6 +10,7 @@ import Spinner from './components/Spinner/Spinner'
 import Notifier from './components/Notifier/Notifier'
 import Markdown from "react-markdown";
 import SurveyModal from "./components/Survey/SurveyModal.jsx";
+import CorrectionModal from "./components/CorrectionModal/CorrectionModal.jsx";
 import './GridApp.css'
 
 const GridApp = () => {
@@ -28,6 +29,8 @@ const GridApp = () => {
   const [openSurvey, setOpenSurvey] = useState(false);
   const [authToken, setAuthToken] = useState('')
   const [notification, setNotification] = useState('')
+  const [openCorrection, setOpenCorrection] = useState(false);
+  const [correctionEntry, setCorrectionEntry] = useState(null);
 
 
   useEffect(() => {
@@ -45,7 +48,7 @@ const GridApp = () => {
 
   const getHistory = async () => {
     const token = localStorage.getItem("authToken"); // get token from localStorage
-    
+
     try {
       const res = await fetch(
         (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + `/history`,
@@ -59,7 +62,7 @@ const GridApp = () => {
       );
       const data = await res.json();
       setHistory(data);
-      
+
       // Set auth token if available
       if (token) {
         setAuthToken(token);
@@ -116,18 +119,41 @@ const GridApp = () => {
         fullText += decoder.decode(value, { stream: true });
       }
 
-  let contextChunks = [];
-  const contextMatch = fullText.match(/__CONTEXT__({.+?})__/s);
-  if (contextMatch) {
-  try {
-  const contextData = JSON.parse(contextMatch[1]);
-  contextChunks = contextData.context_chunks || [];
+      let contextChunks = [];
+      let citations = [];
+      let apaCitations = [];
+      let hasExternalSources = false;
+      let citationNote = "No external sources used";
+      let similarityScore = 0;
 
-  fullText = fullText.replace(/__CONTEXT__{.+?}__\n*/s, "");
-  } catch (e) {
-  console.error("Error parsing context:", e);
-  }
-  }
+      const contextMatch = fullText.match(/__CONTEXT__({.+?})__/s);
+      if (contextMatch) {
+        try {
+          const contextData = JSON.parse(contextMatch[1]);
+          contextChunks = contextData.context_chunks || [];
+          citations = contextData.citations || [];
+          apaCitations = contextData.apa_citations || [];
+          hasExternalSources = contextData.has_external_sources || false;
+          citationNote = contextData.citation_note || "No external sources used";
+          similarityScore = contextData.similarity_score || 0;
+
+          fullText = fullText.replace(/__CONTEXT__{.+?}__\n*/s, "");
+        } catch (e) {
+          console.error("Error parsing context:", e);
+        }
+      }
+
+      // Debug logging for citation data
+      console.log("DEBUG [Frontend]: Parsed citation data:", {
+        apaCitationsCount: apaCitations.length,
+        hasExternalSources: hasExternalSources,
+        citationNote: citationNote,
+        similarityScore: similarityScore
+      });
+      if (apaCitations.length > 0) {
+        console.log("DEBUG [Frontend]: First APA citation:", apaCitations[0]);
+      }
+
       // Extract entry ID from the end of the response
       let answer = fullText;
       let entryId = null;
@@ -144,6 +170,11 @@ const GridApp = () => {
         question,
         answer: answer,
         context_chunks: contextChunks,
+        citations: citations,
+        apa_citations: apaCitations,
+        has_external_sources: hasExternalSources,
+        citation_note: citationNote,
+        similarity_score: similarityScore,
         relevant_history: [],
         entryId: entryId, // Add the entry ID to your state
       });
@@ -185,6 +216,14 @@ const GridApp = () => {
 
           />
         )}
+        {openCorrection && correctionEntry && (
+          <CorrectionModal
+            setOpenCorrection={setOpenCorrection}
+            entryId={correctionEntry.entryId}
+            originalQuestion={correctionEntry.question}
+            originalAnswer={correctionEntry.answer}
+          />
+        )}
 
         {/* Header */}
         <div className="div4">
@@ -194,7 +233,7 @@ const GridApp = () => {
             setAuthToken={setAuthToken}
             setHistory={setHistory}
             model={model}
-  setModel={setModel}
+            setModel={setModel}
           />
           <hr />
           <TitleLogo />
@@ -356,6 +395,29 @@ const GridApp = () => {
                         >
                           <Markdown>{answer.answer}</Markdown>
                         </div>
+                        <div style={{ marginTop: '10px' }}>
+                          <button
+                            onClick={() => {
+                              setCorrectionEntry({
+                                entryId: answer.entryId,
+                                question: answer.question,
+                                answer: answer.answer
+                              });
+                              setOpenCorrection(true);
+                            }}
+                            style={{
+                              background: 'none',
+                              border: '1px solid #2b926e',
+                              color: '#2b926e',
+                              padding: '5px 10px',
+                              borderRadius: '4px',
+                              cursor: 'pointer',
+                              fontSize: '0.85em'
+                            }}
+                          >
+                            Provide Feedback / Correct Answer
+                          </button>
+                        </div>
                       </div>
                       {answer.context_chunks &&
                         answer.context_chunks.length > 0 && (
@@ -387,6 +449,91 @@ const GridApp = () => {
                             </div>
                           </details>
                         )}
+                      {/* Citations Section - Always show */}
+                      <details style={{ marginBottom: 16 }} open>
+                        <summary
+                          style={{ cursor: "pointer", fontWeight: "bold" }}
+                        >
+                          Citations (APA Format)
+                        </summary>
+                        <div
+                          style={{
+                            background: "#fff8e1",
+                            padding: 12,
+                            borderRadius: 4,
+                            marginTop: 8,
+                          }}
+                        >
+                          {/* Citation Note */}
+                          <div
+                            style={{
+                              marginBottom: 12,
+                              padding: "8px 12px",
+                              background: answer.has_external_sources ? "#e3f2fd" : "#e8f5e9",
+                              borderRadius: 4,
+                              fontSize: "0.85em",
+                              fontStyle: "italic",
+                              color: answer.has_external_sources ? "#1565c0" : "#2e7d32",
+                              borderLeft: `3px solid ${answer.has_external_sources ? "#1565c0" : "#2e7d32"}`
+                            }}
+                          >
+                            {answer.citation_note || "No external sources used"}
+                          </div>
+
+                          {/* APA Citations */}
+                          {answer.apa_citations && answer.apa_citations.length > 0 ? (
+                            answer.apa_citations.map((citation, idx) => (
+                              <div
+                                key={idx}
+                                style={{
+                                  marginBottom: 12,
+                                  fontSize: "0.85em",
+                                  color: "#333",
+                                  padding: "8px 12px",
+                                  background: citation.type === "external" ? "#e3f2fd" : "#fff",
+                                  borderRadius: 4,
+                                  borderLeft: `3px solid ${citation.type === "external" ? "#2196f3" : "#4caf50"}`
+                                }}
+                              >
+                                <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+                                  <span
+                                    style={{
+                                      fontWeight: "bold",
+                                      color: citation.type === "external" ? "#1976d2" : "#388e3c",
+                                      minWidth: "fit-content"
+                                    }}
+                                  >
+                                    [{citation.source_num}]
+                                  </span>
+                                  <span
+                                    style={{
+                                      fontFamily: "Georgia, serif",
+                                      lineHeight: 1.5
+                                    }}
+                                    dangerouslySetInnerHTML={{
+                                      __html: citation.apa
+                                        .replace(/\*(.*?)\*/g, '<em>$1</em>')
+                                    }}
+                                  />
+                                </div>
+                                <div
+                                  style={{
+                                    marginTop: 4,
+                                    fontSize: "0.8em",
+                                    color: "#666"
+                                  }}
+                                >
+                                  {citation.type === "external" ? "📌 External Source" : "📄 Document Source"}
+                                </div>
+                              </div>
+                            ))
+                          ) : (
+                            <div style={{ color: "#666", fontStyle: "italic" }}>
+                              No citations available for this response.
+                            </div>
+                          )}
+                        </div>
+                      </details>
                       {answer.relevant_history &&
                         answer.relevant_history.length > 0 && (
                           <details>

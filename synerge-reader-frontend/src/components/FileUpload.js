@@ -26,6 +26,8 @@ export default function FileUpload({
   ];
   const setDefault = () => setIsDragging(false);
 
+
+
   const uploadBatchToBackend = async (parsedDocs) => {
     try {
       const formData = new FormData();
@@ -33,6 +35,8 @@ export default function FileUpload({
         const blob = new Blob([text], { type: 'text/plain' });
         formData.append('files', blob, name);
       });
+
+
 
       const response = await fetch((process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + '/upload', {
         method: 'POST',
@@ -168,7 +172,10 @@ export default function FileUpload({
           textContent = await processJSON(file);
         }
 
-        const parsedDoc = { name: file.name, text: textContent };
+        const parsedDoc = {
+          name: file.name,
+          text: textContent
+        };
         parsedDocs.push(parsedDoc);
         onFileParsed(parsedDoc);
       }
@@ -249,6 +256,7 @@ export default function FileUpload({
         <span className="dim">(max 20MB each)</span>
         <br />
       </div>
+
       <input
         type="file"
         accept=".pdf,.docx,.txt,.json"

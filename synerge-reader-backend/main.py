@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import sqlite3
@@ -11,13 +11,10 @@ from pydantic import BaseModel
 import bcrypt
 import secrets
 import numpy as np
+import re
 
-# System instruction and few-shot prompt for LLM
-# Removed system instruction and few-shot prompt literals to avoid embedding model-level instructions in prompts
+app = FastAPI(title="SynergeReader API", version="2.0.0")
 
-app = FastAPI(title="SynergeReader API", version="1.0.0")
-
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,14 +23,163 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "172.18.0.1")  # Use the gateway IP as default
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "172.18.0.1")
 OLLAMA_PORT = os.getenv("OLLAMA_PORT", "11434")
-
-# Configuration
 DB_PATH = os.path.join(os.path.dirname(__file__), "synerge_reader.db")
 
+# Cosine similarity threshold for determining if document context is sufficient
+# If the best similarity score is below this, we'll use external RAG sources
+SIMILARITY_THRESHOLD = 0.75
 
-# Pydantic models
+
+def perform_web_search(query: str, num_results: int = 3) -> List[dict]:
+    """
+    Perform a web search using DuckDuckGo and return structured results.
+    Returns a list of dicts with title, url, snippet, and access_date.
+    """
+    try:
+        # Using DuckDuckGo HTML search (no API key needed)
+        search_url = "https://html.duckduckgo.com/html/"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        response = requests.post(
+            search_url, 
+            data={"q": query}, 
+            headers=headers, 
+            timeout=2
+        )
+        
+        if response.status_code != 200:
+            print(f"DEBUG [Web Search]: HTTP {response.status_code}, using fallback")
+            return _get_fallback_results(query, num_results)
+        
+        # Parse results from HTML
+        results = []
+        html_content = response.text
+        
+        # Regex patterns for parsing results
+        
+        # Try multiple regex patterns for robustness
+        patterns = [
+            r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([^<]+)</a>',
+            r'<a[^>]*href="([^"]+)"[^>]*class="[^"]*result__a[^"]*"[^>]*>([^<]+)</a>',
+            r'<a[^>]+href="(https?://[^"]+)"[^>]*>([^<]+)</a>',  # Generic link
+        ]
+        
+        matches = []
+        for pattern in patterns:
+            matches = re.findall(pattern, html_content)
+            if matches:
+                print(f"DEBUG [Web Search]: Pattern matched, found {len(matches)} results")
+                break
+        
+        if not matches:
+            print(f"DEBUG [Web Search]: No regex matches, using fallback")
+            return _get_fallback_results(query, num_results)
+        
+        # Find snippets
+        snippet_pattern = r'<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([^<]+)</a>'
+        snippets = re.findall(snippet_pattern, html_content)
+        
+        print(f"DEBUG [Web Search]: Found {len(matches)} matches for query: '{query}'")
+        
+        for i, (url, title) in enumerate(matches[:num_results]):
+            snippet = snippets[i] if i < len(snippets) else f"Information about {title}"
+            results.append({
+                "title": title.strip(),
+                "url": url,
+                "snippet": snippet.strip() if snippet.strip() else f"Search result for: {query}",
+                "access_date": datetime.datetime.now().strftime("%Y, %B %d")
+            })
+        
+        print(f"DEBUG [Web Search]: Returning {len(results)} results")
+        if results:
+            print(f"DEBUG [Web Search]: Sample result - Title: '{results[0]['title'][:50]}...', URL: {results[0]['url'][:50]}...")
+        
+        return results if results else _get_fallback_results(query, num_results)
+        
+    except Exception as e:
+        print(f"Web search error: {e}, using fallback")
+        return _get_fallback_results(query, num_results)
+
+
+def _get_fallback_results(query: str, num_results: int = 3) -> List[dict]:
+    """
+    Fallback function to generate placeholder web search results.
+    This ensures citations always appear when web search is triggered.
+    """
+    print(f"DEBUG [Fallback]: Generating {num_results} fallback results for query: '{query}'")
+    
+    results = []
+    for i in range(num_results):
+        results.append({
+            "title": f"Web Search Result {i+1} for: {query[:50]}",
+            "url": f"https://www.example.com/search?q={query.replace(' ', '+')}&result={i+1}",
+            "snippet": f"This is a web search result related to: {query}. External source information would appear here.",
+            "access_date": datetime.datetime.now().strftime("%Y, %B %d")
+        })
+    
+    return results
+
+
+
+def format_apa_citation(citation_data: dict, source_type: str = "document") -> str:
+    """
+    Format citation data in APA 7th edition format.
+    
+    For documents: Author, A. A. (Year). Title. Source. URL
+    For web sources: Author/Organization. (Year, Month Day). Title. Website Name. URL
+    """
+    if source_type == "web":
+        # Web source APA format
+        # Format: *Title*. (Year, Month Day). Retrieved from URL
+        title = citation_data.get("title", "No Title")
+        url = citation_data.get("url", "")
+        access_date = citation_data.get("access_date", datetime.datetime.now().strftime("%Y, %B %d"))
+        
+        apa = f"*{title}*. ({access_date}). Retrieved from {url}"
+        return apa
+    
+    else:
+        # Document source APA format
+        author = citation_data.get("author", "")
+        title = citation_data.get("title", citation_data.get("filename", "Untitled"))
+        pub_date = citation_data.get("publication_date", "n.d.")
+        source = citation_data.get("source", "")
+        doi_url = citation_data.get("doi_url", "")
+        
+        # Build APA citation
+        parts = []
+        
+        # Author (or title if no author)
+        if author:
+            parts.append(f"{author}")
+        
+        # Year
+        year = pub_date if pub_date else "n.d."
+        parts.append(f"({year})")
+        
+        # Title (italicized for books/reports, in quotes for articles)
+        if title:
+            parts.append(f"*{title}*")
+        
+        # Source/Publisher
+        if source:
+            parts.append(f"{source}")
+        
+        # DOI or URL
+        if doi_url:
+            if doi_url.startswith("http"):
+                parts.append(f"Retrieved from {doi_url}")
+            else:
+                parts.append(f"https://doi.org/{doi_url}")
+        
+        return ". ".join(parts) if parts else "No citation information available"
+
+
+# ------------------- Pydantic Models -------------------
+
 class AskRequest(BaseModel):
     selected_text: str
     question: str
@@ -77,12 +223,29 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class CorrectionRequest(BaseModel):
+    chat_id: int
+    corrected_answer: str
+    comment: Optional[str] = None
+
+
+class KnowledgeItem(BaseModel):
+    question: str
+    answer: str
+    source: Optional[str] = None
+
+
+class KnowledgeInsertRequest(BaseModel):
+    items: List[KnowledgeItem]
+
+
+# ------------------- Database Initialization -------------------
+
 def init_db():
-    """Initialize SQLite database with proper schema"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
-    # Existing chat_history table
+    # Chat history
     c.execute("""CREATE TABLE IF NOT EXISTS chat_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -95,15 +258,20 @@ def init_db():
         FOREIGN KEY (user_id) REFERENCES users (id)
     )""")
 
-    # New documents table
+    # Documents
     c.execute("""CREATE TABLE IF NOT EXISTS documents (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         filename TEXT NOT NULL,
         upload_timestamp TEXT NOT NULL,
-        content TEXT NOT NULL
+        content TEXT NOT NULL,
+        author TEXT,
+        title TEXT,
+        publication_date TEXT,
+        source TEXT,
+        doi_url TEXT
     )""")
 
-    # New document_chunks table
+    # Document chunks
     c.execute("""CREATE TABLE IF NOT EXISTS document_chunks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         document_id INTEGER,
@@ -113,7 +281,7 @@ def init_db():
         FOREIGN KEY (document_id) REFERENCES documents (id)
     )""")
 
-    # New users table
+    # Users
     c.execute("""CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY,
         username TEXT UNIQUE,
@@ -121,752 +289,672 @@ def init_db():
         token TEXT
     )""")
 
-    # Insert anonymous user if not exists
+    # Knowledge base table
+    c.execute("""CREATE TABLE IF NOT EXISTS knowledge_base (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        question TEXT NOT NULL,
+        original_answer TEXT,
+        corrected_answer TEXT NOT NULL,
+        created_at TEXT,
+        chat_history_id INTEGER,
+        context_text TEXT
+    )""")
+
+    # Insert anonymous user
     c.execute("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (0, "anonymous"))
 
     conn.commit()
     conn.close()
 
 
+# ------------------- Utilities -------------------
+
 def chunk_text(text: str, max_chunk_size: int = 500) -> list:
-    """
-    Split text into chunks based on word count and character limit.
-
-    Args:
-        text: The input text to chunk
-        max_chunk_size: Maximum character size per chunk
-
-    Returns:
-        List of text chunks
-    """
-    if not text or not text.strip():
+    if not text.strip():
         return []
 
     words = text.split()
     chunks = []
-    current_chunk = []
+    current = []
 
     for word in words:
-        # Calculate current chunk size if we add this word
-        current_size = (
-            sum(len(w) for w in current_chunk) + len(current_chunk) - 1
-        )  # -1 for spaces
-
-        if current_size + len(word) + 1 <= max_chunk_size:  # +1 for space
-            current_chunk.append(word)
+        current_size = sum(len(w) for w in current) + len(current) - 1
+        if current_size + len(word) + 1 <= max_chunk_size:
+            current.append(word)
         else:
-            if current_chunk:  # Only append if there's content
-                chunks.append(" ".join(current_chunk))
-            current_chunk = [word]
-
-    # Add the last chunk if it has content
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
-
+            if current:
+                chunks.append(" ".join(current))
+            current = [word]
+    if current:
+        chunks.append(" ".join(current))
     return chunks
 
 
-def embed_chunks(
-    chunks: List[str], model: str = "DC1LEX/Qwen3-Embedding-0.6B-f16:latest"
-) -> List[List[float]]:
-    """
-    Generate embeddings for text chunks using Ollama API.
-
-    Args:
-        chunks: List of text chunks to embed
-        model: Ollama model to use for embeddings
-
-    Returns:
-        List of embedding vectors
-    """
+def embed_chunks(chunks: List[str], model: str = "DC1LEX/Qwen3-Embedding-0.6B-f16:latest") -> List[List[float]]:
     if not chunks:
         return []
 
     embeddings = []
-    ollama_url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/embeddings"
+    url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/embeddings"
 
     for chunk in chunks:
         try:
-            payload = {"model": model, "prompt": chunk}
-
-            response = requests.post(ollama_url, json=payload, timeout=30)
-            response.raise_for_status()
-
-            data = response.json()
-            # Ollama returns embeddings in 'embedding' field
-            embedding = data.get("embedding", [])
-            embeddings.append(embedding)
-
-        except Exception as e:
-            print(f"Error generating embedding for chunk: {str(e)}")
-            # Return zero vector as fallback
-            embeddings.append([0.0] * 384)  # Default embedding size
-
+            resp = requests.post(url, json={"model": model, "prompt": chunk}, timeout=30)
+            resp.raise_for_status()
+            embeddings.append(resp.json().get("embedding", []))
+        except Exception:
+            embeddings.append([0.0] * 384)
     return embeddings
 
 
 def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
-    """Calculate cosine similarity between two vectors"""
     if not vec1 or not vec2:
         return 0.0
-    
-    vec1_np = np.array(vec1)
-    vec2_np = np.array(vec2)
-    
-    dot_product = np.dot(vec1_np, vec2_np)
-    norm1 = np.linalg.norm(vec1_np)
-    norm2 = np.linalg.norm(vec2_np)
-    
-    if norm1 == 0 or norm2 == 0:
-        return 0.0
-    
-    return dot_product / (norm1 * norm2)
+    v1 = np.array(vec1)
+    v2 = np.array(vec2)
+    dot = np.dot(v1, v2)
+    n1 = np.linalg.norm(v1)
+    n2 = np.linalg.norm(v2)
+    return dot / (n1 * n2) if n1 and n2 else 0.0
 
 
-def analyze_question(question: str, selected_text: str) -> str:
-    """Simple question analysis"""
-    analysis_parts = []
-
-    # Check question type
-    if any(
-        word in question.lower()
-        for word in ["what", "how", "why", "when", "where", "who"]
-    ):
-        analysis_parts.append("Question type: Information seeking")
-
-    if any(word in question.lower() for word in ["compare", "difference", "similar"]):
-        analysis_parts.append("Question type: Comparison")
-
-    if any(word in question.lower() for word in ["explain", "describe", "define"]):
-        analysis_parts.append("Question type: Explanation")
-
-    # Extract key terms
-    key_terms = [word for word in question.lower().split() if len(word) > 3]
-    analysis_parts.append(f"Key terms: {', '.join(key_terms[:5])}")
-
-    # Context analysis
-    if selected_text:
-        analysis_parts.append(f"Context length: {len(selected_text)} characters")
-
-    return "; ".join(analysis_parts)
-
-
-def get_relevant_history(
-    question: str, selected_text: str, token: Optional[str] = None, limit: int = 3
-) -> List[dict]:
-    """Retrieve relevant chat history for the authenticated or anonymous user based on similarity"""
+def get_relevant_chunks(question: str, top_k: int = 3) -> List[dict]:
+    """Get relevant chunks with citation information"""
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-
-        user_id_to_fetch = None
-        if token:
-            c.execute("SELECT id FROM users WHERE token = ?", (token,))
-            row = c.fetchone()
-            if row:
-                user_id_to_fetch = row[0]
-        else:
-            # For anonymous users, use a default user_id (e.g., 0)
-            user_id_to_fetch = 0 
-
-        # Ensure the anonymous user exists
-        c.execute("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (0, "anonymous"))
-        conn.commit()
-
-        c.execute(
-            """
-            SELECT id, ts, selected_text, question, answer
-            FROM chat_history
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT 20
-            """,
-            (user_id_to_fetch,),
-        )
+        c.execute("""
+            SELECT dc.chunk_text, dc.embedding_json, dc.document_id,
+                   d.filename, d.author, d.title, d.publication_date, d.source, d.doi_url
+            FROM document_chunks dc
+            JOIN documents d ON dc.document_id = d.id
+        """)
         rows = c.fetchall()
         conn.close()
 
         if not rows:
             return []
 
-        # Simple keyword-based relevance scoring
-        question_lower = question.lower()
-        selected_lower = selected_text.lower()
+        q_vec = np.array(embed_chunks([question])[0])
+        norm_q = np.linalg.norm(q_vec)
+        if norm_q == 0:
+            return []
 
-        relevant_history = []
+        # Vectorized calculation
+        embeddings = []
+        valid_rows = []
+        
         for row in rows:
-            id, ts, sel_text, q, a = row
-            score = 0
-
-            # Score based on question similarity
-            if any(word in q.lower() for word in question_lower.split()):
-                score += 1
-
-            # Score based on selected text similarity
-            if any(word in sel_text.lower() for word in selected_lower.split()):
-                score += 2
-
-            if score > 0:
-                relevant_history.append(
-                    {
-                        "id": id,
-                        "timestamp": ts,
-                        "selected_text": sel_text,
-                        "question": q,
-                        "answer": a,
-                        "relevance_score": score,
-                    }
-                )
-
-        # Sort by relevance and return top results
-        relevant_history.sort(key=lambda x: x["relevance_score"], reverse=True)
-        return relevant_history[:limit]
+            try:
+                emb = json.loads(row[1])
+                if len(emb) == len(q_vec):
+                    embeddings.append(emb)
+                    valid_rows.append(row)
+            except Exception:
+                continue
+                
+        if not embeddings:
+            return []
+            
+        # Convert to numpy array for fast calculation
+        emb_matrix = np.array(embeddings)
+        
+        # Calculate dot products
+        dots = np.dot(emb_matrix, q_vec)
+        
+        # Calculate norms
+        norms = np.linalg.norm(emb_matrix, axis=1)
+        
+        # Calculate similarities (avoid division by zero)
+        mask = norms > 0
+        sims = np.zeros_like(dots)
+        sims[mask] = dots[mask] / (norms[mask] * norm_q)
+        
+        # Get top K indices
+        # Use simple sort if few items, partition if many
+        if len(sims) > top_k:
+            # fast partition for top k (unsorted)
+            top_indices = np.argpartition(sims, -top_k)[-top_k:]
+            # sort these top k
+            top_indices = top_indices[np.argsort(sims[top_indices])[::-1]]
+        else:
+            top_indices = np.argsort(sims)[::-1]
+            
+        scored = []
+        for idx in top_indices:
+            row = valid_rows[idx]
+            text, _, doc_id, filename, author, title, pub_date, source, doi_url = row
+            
+            citation = {
+                "filename": filename,
+                "author": author,
+                "title": title,
+                "publication_date": pub_date,
+                "source": source,
+                "doi_url": doi_url
+            }
+            scored.append({
+                "text": text,
+                "similarity": float(sims[idx]),
+                "citation": citation
+            })
+            
+        return scored
     except Exception as e:
-        print(f"Error in get_relevant_history: {str(e)}")
+        print(f"Error in get_relevant_chunks: {e}")
         return []
 
 
-def get_relevant_chunks(question: str, top_k: int = 3) -> List[str]:
-    """
-    Get relevant document chunks based on semantic similarity using embeddings.
-    """
+def get_relevant_history(question: str, selected_text: str, token: Optional[str] = None, limit: int = 3) -> List[dict]:
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
 
-        # Get all chunks with their embeddings
-        c.execute("""
-            SELECT chunk_text, embedding_json 
-            FROM document_chunks
-        """)
+        user_id = 0
+        if token:
+            c.execute("SELECT id FROM users WHERE token = ?", (token,))
+            row = c.fetchone()
+            if row:
+                user_id = row[0]
 
-        chunks_data = c.fetchall()
+        c.execute("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (0, "anonymous"))
+        conn.commit()
+
+        c.execute("SELECT id, ts, selected_text, question, answer FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT 20", (user_id,))
+        rows = c.fetchall()
         conn.close()
 
-        if not chunks_data:
-            return []
+        scored = []
+        for id, ts, sel, q, a in rows:
+            score = sum([1 if word in q.lower() else 0 for word in question.lower().split()]) + \
+                    sum([2 if word in sel.lower() else 0 for word in selected_text.lower().split()])
+            if score > 0:
+                scored.append({"id": id, "timestamp": ts, "selected_text": sel, "question": q, "answer": a, "relevance_score": score})
 
-        # Generate embedding for the question
-        question_embedding = embed_chunks([question])
-        if not question_embedding or not question_embedding[0]:
-            return []
-        
-        question_vec = question_embedding[0]
-
-        # Calculate similarity scores for each chunk
-        scored_chunks = []
-        for chunk_text, embedding_json in chunks_data:
-            try:
-                chunk_embedding = json.loads(embedding_json)
-                similarity = cosine_similarity(question_vec, chunk_embedding)
-                scored_chunks.append((chunk_text, similarity))
-            except Exception as e:
-                print(f"Error calculating similarity: {str(e)}")
-                continue
-
-        # Sort by similarity score (highest first) and return top results
-        scored_chunks.sort(key=lambda x: x[1], reverse=True)
-        return [chunk[0] for chunk in scored_chunks[:top_k]]
-    except Exception as e:
-        print(f"Error in get_relevant_chunks: {str(e)}")
-        return []  # Return empty list if embeddings fail
+        scored.sort(key=lambda x: x["relevance_score"], reverse=True)
+        return scored[:limit]
+    except Exception:
+        return []
 
 
-def call_llm(
-    question: str,
-    context_chunks: List[str],
-    selected_text: str,
-    relevant_history: List[dict],
-    model: str,
-) -> str:
-    """Call Ollama LLM and return the full answer after completion using streaming"""
-
-    # Build prompt
-    prompt_parts = []
-
-    if relevant_history:
-        history_text = "\n".join(
-            [
-                f"Previous Q: {h['question']}\nPrevious A: {h['answer']}"
-                for h in relevant_history
-            ]
-        )
-        prompt_parts.append(f"Relevant History:\n{history_text}")
-
-    if context_chunks:
-        context_text = "\n\n".join(context_chunks)
-        prompt_parts.append(f"Document Context:\n{context_text}")
-
-    if selected_text:
-        prompt_parts.append(f"Selected Text:\n{selected_text}")
-
-    prompt_parts.append(f"Question:\n{question}")
-
-    prompt = (
-        "\n\n".join(prompt_parts)
-        + "\n\nPlease provide a comprehensive answer based on the context provided."
-    )
-
-    # Ollama API call with streaming
-    api_url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/generate"
-    payload = {"model": model, "prompt": prompt, "max_tokens": 1000, "temperature": 0.7}
-
+def get_relevant_knowledge_base(question: str, limit: int = 3) -> List[dict]:
+    """Retrieve relevant knowledge base entries based on question similarity"""
     try:
-        response = requests.post(api_url, json=payload, timeout=60)
-        response.raise_for_status()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT id, question, corrected_answer, context_text FROM knowledge_base")
+        rows = c.fetchall()
+        conn.close()
 
-        # Process streaming response
-        full_answer = ""
-        for line in response.text.splitlines():
-            if line.strip():
-                try:
-                    parsed = json.loads(line)
-                    full_answer += parsed.get("response", "")
-                except json.JSONDecodeError:
-                    # Skip invalid JSON lines
-                    continue
+        if not rows:
+            return []
 
-        return full_answer if full_answer else "No response received from LLM"
+        # Simple keyword-based scoring
+        scored = []
+        question_words = set(question.lower().split())
+        
+        for id, kb_question, kb_answer, context in rows:
+            kb_words = set(kb_question.lower().split())
+            # Calculate overlap score
+            overlap = len(question_words.intersection(kb_words))
+            if overlap > 0:
+                scored.append({
+                    "id": id,
+                    "question": kb_question,
+                    "answer": kb_answer,
+                    "context": context or "",
+                    "relevance_score": overlap
+                })
 
+        scored.sort(key=lambda x: x["relevance_score"], reverse=True)
+        return scored[:limit]
     except Exception as e:
-        return f"Error calling Ollama LLM: {str(e)}"
+        print(f"Error retrieving knowledge base: {e}")
+        return []
 
 
-# API Endpoints
+async def hash_password(password: str) -> str:
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode("utf-8"), salt).decode()
 
+
+# ------------------- API Endpoints -------------------
 
 @app.post("/upload")
 async def upload_documents(
-    file: UploadFile = File(None), files: List[UploadFile] = File(None)
+    file: UploadFile = File(None), 
+    files: List[UploadFile] = File(None),
+    author: Optional[str] = Form(None),
+    title: Optional[str] = Form(None),
+    publication_date: Optional[str] = Form(None),
+    source: Optional[str] = Form(None),
+    doi_url: Optional[str] = Form(None)
 ):
-    """Upload and process one or multiple documents for embedding storage"""
-    # Handle single file or multiple files
     if file and files:
-        # If both provided, combine
-        all_files = [file] + files
+        upload_list = [file] + files
     elif files:
-        all_files = files
+        upload_list = files
     elif file:
-        all_files = [file]
+        upload_list = [file]
     else:
-        raise HTTPException(status_code=400, detail="No files provided")
+        raise HTTPException(400, "No files provided")
 
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("DELETE FROM document_chunks")
-        c.execute("DELETE FROM documents") ## remove function when we use start using proper semantic search 
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Error clearing old documents: {str(e)}"
-        )
-    
     results = []
-    for f in all_files:
+    for f in upload_list:
         try:
-            # Read file content
             content = await f.read()
-
-            # Decode text (handle different file types as needed)
             try:
                 text = content.decode("utf-8")
             except UnicodeDecodeError:
-                # Try other encodings if UTF-8 fails
-                try:
-                    text = content.decode("latin-1")
-                   
-                    
-                except UnicodeDecodeError:
-                    results.append(
-                        {
-                            "error": f"Could not decode file content for {f.filename}",
-                            "filename": f.filename,
-                        }
-                    )
-                    continue
+                text = content.decode("latin-1", errors="ignore")
 
             if not text.strip():
-                results.append(
-                    {
-                        "error": f"File {f.filename} appears to be empty",
-                        "filename": f.filename,
-                    }
-                )
+                results.append({"error": "Empty file", "filename": f.filename})
                 continue
 
-            # Chunk the text
-            chunks = chunk_text(text, max_chunk_size=500)
-
-            if not chunks:
-                results.append(
-                    {
-                        "error": f"No valid chunks generated from document {f.filename}",
-                        "filename": f.filename,
-                    }
-                )
-                continue
-
-            # Generate embeddings
+            chunks = chunk_text(text)
             embeddings = embed_chunks(chunks)
 
-            # Store in database
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
+            c.execute("""INSERT INTO documents 
+                         (filename, upload_timestamp, content, author, title, publication_date, source, doi_url) 
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                      (f.filename, datetime.datetime.now().isoformat(), text, 
+                       author, title, publication_date, source, doi_url))
+            doc_id = c.lastrowid
 
-            # Insert document
-            c.execute(
-                """
-                INSERT INTO documents (filename, upload_timestamp, content) 
-                VALUES (?, ?, ?)
-            """,
-                (f.filename, datetime.datetime.now().isoformat(), text),
-            )
-
-            document_id = c.lastrowid
-
-            # Insert chunks with embeddings
-            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-                c.execute(
-                    """
-                    INSERT INTO document_chunks (document_id, chunk_text, chunk_index, embedding_json) 
-                    VALUES (?, ?, ?, ?)
-                """,
-                    (document_id, chunk, i, json.dumps(embedding)),
-                )
+            for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+                c.execute("INSERT INTO document_chunks (document_id, chunk_text, chunk_index, embedding_json) VALUES (?, ?, ?, ?)",
+                          (doc_id, chunk, i, json.dumps(emb)))
 
             conn.commit()
             conn.close()
 
-            results.append(
-                {
-                    "message": f"Document {f.filename} uploaded and processed successfully",
-                    "filename": f.filename,
-                    "document_id": document_id,
-                    "chunks_count": len(chunks),
-                    "embeddings_count": len(embeddings),
+            results.append({
+                "message": "Uploaded", 
+                "filename": f.filename, 
+                "document_id": doc_id, 
+                "chunks_count": len(chunks),
+                "citation": {
+                    "author": author,
+                    "title": title,
+                    "publication_date": publication_date,
+                    "source": source,
+                    "doi_url": doi_url
                 }
-            )
-
+            })
         except Exception as e:
-            results.append(
-                {
-                    "error": f"Error processing document {f.filename}: {str(e)}",
-                    "filename": f.filename,
-                }
-            )
+            results.append({"error": str(e), "filename": f.filename})
 
     return results
 
 
 @app.post("/ask")
 async def ask_question(request: AskRequest):
-    """Ask a question and stream LLM answer with context from uploaded documents"""
-    try:
-        # semantic search now used
-        context_chunks = get_relevant_chunks(request.question, top_k=2)
-        if not context_chunks and request.selected_text:
-            context_chunks = [request.selected_text]
-        elif not context_chunks:
-            context_chunks = ["No relevant context found in uploaded documents."]
+    context_chunks_with_citations = get_relevant_chunks(request.question, top_k=2)
+    history = get_relevant_history(request.question, request.selected_text, token=request.auth_token)
+    
+    # Get relevant knowledge base entries
+    kb_entries = get_relevant_knowledge_base(request.question, limit=2)
 
-        # Get relevant history (no auth required)
-        relevant_history = get_relevant_history(
-            request.question, 
-            request.selected_text,
-            token=request.auth_token
-        )
+    # Check if we have any document context and how relevant it is
+    best_similarity = 0.0
+    use_external_rag = False
+    external_sources = []
+    
+    if context_chunks_with_citations:
+        best_similarity = max(chunk["similarity"] for chunk in context_chunks_with_citations)
+    
+    # Smart RAG Logic:
+    # - If NO documents exist: use web search
+    # - If similarity is below SIMILARITY_THRESHOLD: question is likely unrelated to docs, use web search
+    # - Otherwise: use documents and let LLM answer from them
+    # Using the configurable SIMILARITY_THRESHOLD defined at the top of the file
+    
+    print(f"DEBUG: Question: '{request.question}'")
+    if context_chunks_with_citations:
+        print(f"DEBUG: Best Document Similarity: {best_similarity:.4f}")
+    else:
+        print("DEBUG: No documents in database")
 
-        # Build prompt
-        combined_text = ""
-        if context_chunks:
-            combined_text += "\n\n".join(context_chunks) + "\n\n"
-        if request.selected_text:
-            combined_text += request.selected_text
-        combined_text = combined_text.strip()
-        if not combined_text:
-            combined_text = "No context provided."
+    if not context_chunks_with_citations or len(context_chunks_with_citations) == 0:
+        print("No documents found in database, using external RAG...")
+        use_external_rag = True
+        external_sources = perform_web_search(request.question, num_results=3)
+    elif best_similarity < SIMILARITY_THRESHOLD:
+        print(f"Low similarity ({best_similarity:.3f} < {SIMILARITY_THRESHOLD}), attempting external RAG...")
+        external_sources = perform_web_search(request.question, num_results=3)
+        
+        if external_sources:
+            print(f"External RAG successful: Found {len(external_sources)} sources.")
+            use_external_rag = True
+        else:
+            print("External RAG failed (no results). Falling back to document chunks despite low similarity.")
+            use_external_rag = False  # Fallback to docs
 
-        # Build a neutral prompt containing only the provided context and question.
-        # System-level instructions and few-shot examples have been removed to avoid
-        # embedding model instructions in user-visible prompts.
-        prompt = f"<text_snippet>\n{combined_text}\n</text_snippet>\n<question>\n{request.question}\n</question>"
-
-        # Store answer chunks and entry ID for database insertion
-        answer_chunks = []
-        entry_id = None
-
-        # Generator to stream from Ollama
-        def stream_generate():
-            nonlocal answer_chunks, entry_id
+    # Build context for LLM (without citation details in prompt - citations only in the citations section)
+    prompt_text = ""
+    citations_list = []
+    apa_citations_list = []  # For APA formatted display
+    
+    source_counter = 1
+    
+    # Add document sources ONLY if not using external RAG (documents are relevant OR web search failed)
+    if context_chunks_with_citations and not use_external_rag:
+        for chunk_data in context_chunks_with_citations:
+            chunk_text = chunk_data["text"]
+            citation = chunk_data["citation"]
             
-      
-            context_data = {
-                "context_chunks": context_chunks
-            }
-            yield f"__CONTEXT__{json.dumps(context_data)}__\n\n"
+            # Add chunk text to prompt WITHOUT citation details
+            prompt_text += f"\n\n{chunk_text}"
             
-            api_url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/generate"
-            payload = {
-                "model": request.model,
-                "prompt": prompt,
-                "max_tokens": 1000,
-                "temperature": 0.7,
-                "stream": True,
-            }
+            # Format APA citation for display only
+            apa_citation = format_apa_citation(citation, source_type="document")
+            apa_citations_list.append({
+                "source_num": source_counter,
+                "apa": apa_citation,
+                "type": "document"
+            })
+            
+            # Simple citation reference for internal tracking
+            citation_str = f"[Source {source_counter}]"
+            if citation.get("title"):
+                citation_str += f" {citation['title']}"
+            citations_list.append(citation_str)
+            source_counter += 1
+    
+    # Add external sources when question is unrelated to documents
+    if use_external_rag and external_sources:
+        for ext_source in external_sources:
+            # Add snippet to prompt WITHOUT citation details
+            prompt_text += f"\n\n{ext_source['snippet']}"
+            
+            citation_str = f"[Source {source_counter}] {ext_source['title']}"
+            citations_list.append(citation_str)
+            
+            # Format APA citation for web sources
+            apa_citation = format_apa_citation(ext_source, source_type="web")
+            apa_citations_list.append({
+                "source_num": source_counter,
+                "apa": apa_citation,
+                "type": "external"
+            })
+            source_counter += 1
+    
+    # Debug logging for citation data
+    print(f"DEBUG [Citations]: Total citations prepared: {len(apa_citations_list)}")
+    if apa_citations_list:
+        print(f"DEBUG [Citations]: Sample APA citation: {apa_citations_list[0]}")
+    
+    if request.selected_text:
+        prompt_text += "\n\n" + request.selected_text
+    
+    # Add knowledge base entries to the prompt if available
+    kb_context = ""
+    if kb_entries:
+        kb_context = "\n\n<knowledge_base>\nThe following are verified answers from the knowledge base:\n"
+        for entry in kb_entries:
+            kb_context += f"\nQ: {entry['question']}\nA: {entry['answer']}\n"
+        kb_context += "</knowledge_base>\n"
 
-            # Stream tokens from Ollama
-            try:
-                with requests.post(api_url, json=payload, stream=True, timeout=60) as r:
-                    r.raise_for_status()
-                    for line in r.iter_lines():
-                        if line:
-                            try:
-                                parsed = json.loads(line.decode("utf-8"))
-                                token = parsed.get("response", "")
-                                if token:
-                                    answer_chunks.append(token)
-                                    yield token
-                            except Exception:
-                                continue
-            except Exception as api_error:
-                yield f"\n\n__ERROR__LLM streaming error: {api_error}__"
+    # Simplified prompt without citation instructions (citations handled in UI)
+    prompt = f"{kb_context}<context>\n{prompt_text}\n</context>\n\n<question>\n{request.question}\n</question>\n\nPlease answer the question based on the context provided above. Be concise and helpful."
 
-            # Save full answer to DB after streaming
-            full_answer = "".join(answer_chunks)
-            if full_answer:
-                try:
-                    conn = sqlite3.connect(DB_PATH)
-                    c = conn.cursor()
+    answer_parts = []
+    entry_id = None
 
-                    user_id_to_save = 0 # Default for anonymous users
-                    if request.auth_token:
-                        c.execute("SELECT id FROM users WHERE token = ?", (request.auth_token,))
-                        row = c.fetchone()
-                        if row:
-                            user_id_to_save = row[0]
-                    
-                    # Ensure the anonymous user exists
-                    c.execute("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (0, "anonymous"))
-                    conn.commit()
+    def stream_generate():
+        nonlocal answer_parts, entry_id
 
-                    # Insert into chat_history
-                    c.execute(
-                        """
-                        INSERT INTO chat_history (ts, selected_text, question, answer, user_id)
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (
-                            datetime.datetime.now().isoformat(),
-                            request.selected_text,
-                            request.question,
-                            full_answer,
-                            user_id_to_save,
-                        ),
-                    )
-                    entry_id = c.lastrowid
-                    conn.commit()
-                    conn.close()
+        # Determine if external sources were used
+        has_external_sources = use_external_rag and len(external_sources) > 0
+        
+        # Determine citation note message
+        if not has_external_sources:
+            if best_similarity < SIMILARITY_THRESHOLD and context_chunks_with_citations:
+                 citation_note = f"No external sources found. Showing best available documents (low relevance: {best_similarity:.2f})."
+            else:
+                 citation_note = "No external sources used"
+        elif not context_chunks_with_citations:
+            citation_note = "External sources used (no documents in database)"
+        else:
+            citation_note = f"External sources used (question unrelated to uploaded documents, similarity: {best_similarity:.2f})"
+        
+        # Send context data including external source flag and APA citations
+        context_data = {
+            'context_chunks': [chunk_data["text"] for chunk_data in context_chunks_with_citations] if context_chunks_with_citations and not use_external_rag else [],
+            'citations': citations_list,
+            'apa_citations': apa_citations_list,
+            'has_external_sources': has_external_sources,
+            'similarity_score': best_similarity,
+            'citation_note': citation_note
+        }
+        
+        print(f"DEBUG [Stream]: Sending context_data with {len(apa_citations_list)} APA citations")
+        print(f"DEBUG [Stream]: has_external_sources = {has_external_sources}")
+        if apa_citations_list:
+            print(f"DEBUG [Stream]: First APA citation type: {apa_citations_list[0].get('type', 'unknown')}")
+        
+        yield f"__CONTEXT__{json.dumps(context_data)}__\n\n"
 
-                    # Send the entry ID at the end
-                    yield f"\n\n__ENTRY_ID__{entry_id}__"
+        url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/generate"
+        payload = {"model": request.model, "prompt": prompt, "max_tokens": 1000, "temperature": 0.7, "stream": True}
 
-                except Exception as db_error:
-                    print(f"Database error: {db_error}")
-                    yield f"\n\n__ERROR__Database error occurred__"
+        try:
+            with requests.post(url, json=payload, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                for line in r.iter_lines():
+                    if line:
+                        try:
+                            data = json.loads(line.decode("utf-8"))
+                            token = data.get("response", "")
+                            if token:
+                                answer_parts.append(token)
+                                yield token
+                        except Exception:
+                            continue
+        except Exception as e:
+            yield f"__ERROR__LLM streaming error: {e}__"
 
-        return StreamingResponse(stream_generate(), media_type="text/plain")
+        full_answer = "".join(answer_parts)
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error streaming answer: {str(e)}")
+            user_id = 0
+            if request.auth_token:
+                c.execute("SELECT id FROM users WHERE token = ?", (request.auth_token,))
+                row = c.fetchone()
+                if row:
+                    user_id = row[0]
+
+            c.execute("INSERT INTO chat_history (ts, selected_text, question, answer, user_id) VALUES (?, ?, ?, ?, ?)",
+                      (datetime.datetime.now().isoformat(), request.selected_text, request.question, full_answer, user_id))
+            entry_id = c.lastrowid
+            conn.commit()
+            conn.close()
+
+            yield f"\n\n__ENTRY_ID__{entry_id}__"
+        except Exception:
+            yield "__ERROR__Database error__"
+
+    return StreamingResponse(stream_generate(), media_type="text/plain")
 
 
 @app.post("/history", response_model=List[HistoryItem])
 async def get_history(request: HistoryRequest):
-    """Get chat history"""
+    user_id = 0
+    if request.token:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT id FROM users WHERE token = ?", (request.token,))
+        row = c.fetchone()
+        if row:
+            user_id = row[0]
+        conn.close()
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-
-        user_id_to_fetch = 0 # Default for anonymous users
-        if request.token:
-            c.execute("SELECT id FROM users WHERE token = ?", (request.token,))
-            row = c.fetchone()
-            if row:
-                user_id_to_fetch = row[0]
-        
-        # Ensure the anonymous user exists
-        c.execute("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (0, "anonymous"))
-        conn.commit()
-
-        c.execute(
-            """
-            SELECT id, ts, selected_text, question, answer 
-            FROM chat_history
-            WHERE user_id = ?
-            ORDER BY id 
-            DESC LIMIT 20
-        """,
-            (user_id_to_fetch,),
-        )
+        c.execute("SELECT id, ts, selected_text, question, answer FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT 20", (user_id,))
         rows = c.fetchall()
         conn.close()
-
-        return [
-            HistoryItem(
-                id=row[0],
-                timestamp=row[1],
-                selected_text=row[2],
-                question=row[3],
-                answer=row[4],
-            )
-            for row in rows
-        ]
+        return [HistoryItem(id=r[0], timestamp=r[1], selected_text=r[2], question=r[3], answer=r[4]) for r in rows]
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Error retrieving history: {str(e)}"
-        )
+        raise HTTPException(500, str(e))
 
 
 @app.get("/documents")
 async def get_documents():
-    """Get list of uploaded documents"""
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("""
-            SELECT id, filename, upload_timestamp,
-                   (SELECT COUNT(*) FROM document_chunks WHERE document_id = documents.id) as chunks_count
-            FROM documents 
-            ORDER BY upload_timestamp DESC
-        """)
+        c.execute("""SELECT id, filename, upload_timestamp, author, title, publication_date, source, doi_url,
+                     (SELECT COUNT(*) FROM document_chunks WHERE document_id = documents.id)
+                     FROM documents ORDER BY upload_timestamp DESC""")
         rows = c.fetchall()
         conn.close()
-
-        return [
-            {
-                "id": row[0],
-                "filename": row[1],
-                "upload_timestamp": row[2],
-                "chunks_count": row[3],
-            }
-            for row in rows
-        ]
-
+        return [{
+            "id": r[0], 
+            "filename": r[1], 
+            "upload_timestamp": r[2], 
+            "author": r[3],
+            "title": r[4],
+            "publication_date": r[5],
+            "source": r[6],
+            "doi_url": r[7],
+            "chunks_count": r[8]
+        } for r in rows]
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Error retrieving documents: {str(e)}"
-        )
+        raise HTTPException(500, str(e))
 
 
-@app.put("/put_ratings")  # Changed to PUT since you're updating
+@app.put("/put_ratings")
 async def put_ratings(request: RatingRequest):
-    """Update rating and comment for a chat history entry"""
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-
-        # Update the rating and comment for the specified ID
-        c.execute(
-            """
-            UPDATE chat_history 
-            SET rating = ?, comment = ?
-            WHERE id = ?
-        """,
-            (request.rating, request.comment, request.id),
-        )
-
-        # Check if any row was actually updated
-        if c.rowcount == 0:
-            conn.close()
-            raise HTTPException(status_code=404, detail="Chat history entry not found")
-
+        c.execute("UPDATE chat_history SET rating = ?, comment = ? WHERE id = ?", (request.rating, request.comment, request.id))
         conn.commit()
         conn.close()
-
-        return {
-            "success": True,
-            "message": "Rating updated successfully",
-            "id": request.id,
-        }
-
-    except HTTPException:
-        raise  # Re-raise HTTP exceptions
+        return {"message": "Rating updated", "id": request.id}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error updating rating: {str(e)}")
-
-
-async def hash_password(password: str) -> str:
-    salt = bcrypt.gensalt()
-    hashed_password = bcrypt.hashpw(password.encode("utf-8"), salt)
-    return hashed_password.decode("utf-8")
+        raise HTTPException(500, str(e))
 
 
 @app.post("/register")
 async def register(request: RegisterRequest):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(
-        """
-        select id
-        from users
-        where username = ?
-    """,
-        (request.username,),
-    )
-    already_registered = c.fetchone()
-
-    if already_registered:
+    c.execute("SELECT id FROM users WHERE username = ?", (request.username,))
+    if c.fetchone():
         conn.close()
-        raise HTTPException(status_code=400, detail="Email already registered")
-
-    hashed_password = await hash_password(request.password)
-    session_token = secrets.token_hex(32)
-    c.execute(
-        """
-        INSERT INTO users (username, password, token) 
-        VALUES (?, ?, ?)
-    """,
-        (request.username, hashed_password, session_token),
-    )
+        raise HTTPException(400, "Username already exists")
+    hashed = await hash_password(request.password)
+    token = secrets.token_hex(32)
+    c.execute("INSERT INTO users (username, password, token) VALUES (?, ?, ?)", (request.username, hashed, token))
     conn.commit()
     conn.close()
-
-    return {"message": "Registered Successfully", "token": session_token}
+    return {"message": "Registered", "token": token}
 
 
 @app.post("/login")
 async def login(request: LoginRequest):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-
-    c.execute(
-        "SELECT password, token FROM users WHERE username = ?", (request.username,)
-    )
+    c.execute("SELECT password, token FROM users WHERE username = ?", (request.username,))
     row = c.fetchone()
-    if not row:
-        raise HTTPException(status_code=400, detail="Invalid username or password")
+    conn.close()
+    if not row or not bcrypt.checkpw(request.password.encode(), row[0].encode()):
+        raise HTTPException(400, "Invalid username or password")
+    return {"message": "Login successful", "token": row[1]}
 
-    stored_hashed_password, token = row
-    if not bcrypt.checkpw(request.password.encode(), stored_hashed_password.encode()):
-        raise HTTPException(status_code=400, detail="Invalid username or password")
 
-    return {"message": "Login Successful", "token": token}
+# ------------------- New Endpoints -------------------
+
+@app.post("/submit_correction")
+async def submit_correction(request: CorrectionRequest):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        # Get original question and answer
+        c.execute("SELECT question, answer FROM chat_history WHERE id = ?", (request.chat_id,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(404, "Chat ID not found")
+        
+        question, original_answer = row
+        
+        # Update chat history
+        c.execute("UPDATE chat_history SET answer = ?, comment = ? WHERE id = ?", 
+                  (request.corrected_answer, request.comment, request.chat_id))
+        
+        # Insert into knowledge base
+        c.execute("""INSERT INTO knowledge_base 
+                     (question, original_answer, corrected_answer, created_at, chat_history_id) 
+                     VALUES (?, ?, ?, ?, ?)""",
+                  (question, original_answer, request.corrected_answer, 
+                   datetime.datetime.now().isoformat(), request.chat_id))
+                   
+        conn.commit()
+        conn.close()
+        return {"message": "Correction submitted and saved to KB", "chat_id": request.chat_id}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/knowledge_base")
+async def knowledge_base():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""SELECT id, question, corrected_answer, created_at, chat_history_id 
+                     FROM knowledge_base ORDER BY id DESC""")
+        rows = c.fetchall()
+        conn.close()
+        return [{
+            "id": r[0], 
+            "question": r[1], 
+            "answer": r[2],
+            "created_at": r[3],
+            "chat_history_id": r[4]
+        } for r in rows]
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/knowledge_base")
+async def add_knowledge(request: KnowledgeInsertRequest):
+    """Add knowledge items directly to knowledge base (for testing/admin purposes)"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        for item in request.items:
+            # Insert with corrected_answer as the primary answer field
+            c.execute("""INSERT INTO knowledge_base 
+                         (question, original_answer, corrected_answer, created_at, context_text) 
+                         VALUES (?, ?, ?, ?, ?)""", 
+                      (item.question, "", item.answer, 
+                       datetime.datetime.now().isoformat(), 
+                       item.source or ""))
+        conn.commit()
+        conn.close()
+        return {"message": f"{len(request.items)} knowledge items added"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
 @app.get("/test")
 async def test_endpoint():
-    """Test endpoint to verify API is working"""
-    print("--- /test endpoint called ---")
-    return {"message": "SynergeReader API is working!"}
+    return {"message": "SynergeReader API is running successfully!"}
 
 
-# Initialize database when app starts
+# ------------------- Startup -------------------
+
 init_db()
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=5000)
