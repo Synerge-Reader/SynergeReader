@@ -14,6 +14,7 @@ export default function App() {
   const [documents, setDocuments] = useState([]);
   const [selectedText, setSelectedText] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState("");
   const [askOpen, setAskOpen] = useState(false);
   const [backendMsg, setBackendMsg] = useState("");
@@ -54,6 +55,7 @@ export default function App() {
     }
 
     setIsLoading(true);
+    setIsStreaming(false);
     setError("");
     setAnswer(null); // Clear previous answer
 
@@ -77,14 +79,42 @@ export default function App() {
       let fullAnswer = "";
       let contextChunks = [];
       let entryId = null;
+      let contextReceived = false;
+      let chunkCount = 0;
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) {
+          console.log(`DEBUG [Frontend]: Stream ended after ${chunkCount} chunks`);
           break;
         }
 
         const chunk = decoder.decode(value, { stream: true });
+        chunkCount++;
+        console.log(`DEBUG [Frontend]: Received chunk #${chunkCount}, length: ${chunk.length}, content: ${chunk.substring(0, 100)}`);
+        
+        // Handle ready signal
+        if (chunk.includes("__READY__")) {
+          console.log("DEBUG [Frontend]: LLM streaming started");
+          continue;
+        }
+        
+        // Handle context metadata
+        if (chunk.includes("__CONTEXT__")) {
+          const contextMatch = chunk.match(/__CONTEXT__(.*?)__/s);
+          if (contextMatch && contextMatch[1]) {
+            try {
+              const contextData = JSON.parse(contextMatch[1]);
+              contextChunks = contextData.context_chunks || [];
+              contextReceived = true;
+              setIsLoading(false);
+              setIsStreaming(true);
+            } catch (e) {
+              console.error("Failed to parse context:", e);
+            }
+          }
+          continue;
+        }
         
         if (chunk.includes("__ENTRY_ID__")) {
           const idMatch = chunk.match(/__ENTRY_ID__(\d+)__/);
@@ -101,18 +131,30 @@ export default function App() {
           } else {
             setError("An unknown backend streaming error occurred.");
           }
+          setIsStreaming(false);
           continue;
         }
 
-        fullAnswer += chunk;
-        setAnswer({
-          question,
-          answer: fullAnswer,
-          context_chunks: contextChunks,
-        });
+        // Remove newlines that are just delimiters (they shouldn't be part of the answer)
+        const cleanChunk = chunk.replace(/\n$/, "");
+        if (cleanChunk) {
+          fullAnswer += cleanChunk;
+          console.log(`DEBUG [Frontend]: Updated fullAnswer, length now: ${fullAnswer.length}, displaying: "${fullAnswer.substring(0, 100)}..."`);
+          setAnswer({
+            question,
+            answer: fullAnswer,
+            context_chunks: contextChunks,
+          });
+          
+          // Small delay to allow React to render updates
+          await new Promise(resolve => setTimeout(resolve, 5));
+        } else {
+          console.log(`DEBUG [Frontend]: Chunk was empty after cleaning (just a newline)`);
+        }
       }
 
       setIsLoading(false);
+      setIsStreaming(false);
       setAskOpen(false);
 
       // Refresh history
@@ -126,6 +168,7 @@ export default function App() {
     } catch (err) {
       setError("Could not get answer from backend.");
       setIsLoading(false);
+      setIsStreaming(false);
     }
   };
 
@@ -192,7 +235,7 @@ export default function App() {
           selectedText={selectedText}
           model={model}
         />
-        {answer && (
+        {(answer || isStreaming) && (
           <div
             style={{
               margin: "32px auto",
@@ -205,12 +248,26 @@ export default function App() {
           >
             <h3>Answer</h3>
             <div style={{ marginBottom: 16 }}>
-              <strong>Question:</strong> {answer.question}
+              <strong>Question:</strong> {answer?.question}
             </div>
             <div style={{ marginBottom: 16 }}>
-              <strong>Answer:</strong> <ReactMarkdown>{answer.answer}</ReactMarkdown>
+              <strong>Answer:</strong>
+              <div style={{ marginTop: 8 }}>
+                <ReactMarkdown>{answer?.answer || ""}</ReactMarkdown>
+                {isStreaming && (
+                  <span 
+                    style={{
+                      display: "inline-block",
+                      marginLeft: "4px",
+                      animation: "blink 1s infinite",
+                    }}
+                  >
+                    ▌
+                  </span>
+                )}
+              </div>
             </div>
-            {answer.context_chunks && answer.context_chunks.length > 0 && (
+            {answer?.context_chunks && answer.context_chunks.length > 0 && (
               <div style={{ marginBottom: 16 }}>
                 <strong>Relevant Context:</strong>
                 <div
@@ -232,7 +289,7 @@ export default function App() {
                 </div>
               </div>
             )}
-            {answer.relevant_history && answer.relevant_history.length > 0 && (
+            {answer?.relevant_history && answer.relevant_history.length > 0 && (
               <div>
                 <strong>Relevant History:</strong>
                 <div
