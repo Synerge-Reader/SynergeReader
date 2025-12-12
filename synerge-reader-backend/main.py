@@ -11,6 +11,7 @@ from pydantic import BaseModel
 import bcrypt
 import secrets
 import numpy as np
+import re
 
 app = FastAPI(title="SynergeReader API", version="2.0.0")
 
@@ -28,7 +29,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "synerge_reader.db")
 
 # Cosine similarity threshold for determining if document context is sufficient
 # If the best similarity score is below this, we'll use external RAG sources
-SIMILARITY_THRESHOLD = 0.45
+SIMILARITY_THRESHOLD = 0.75
 
 
 def perform_web_search(query: str, num_results: int = 3) -> List[dict]:
@@ -46,7 +47,7 @@ def perform_web_search(query: str, num_results: int = 3) -> List[dict]:
             search_url, 
             data={"q": query}, 
             headers=headers, 
-            timeout=3
+            timeout=2
         )
         
         if response.status_code != 200:
@@ -57,8 +58,7 @@ def perform_web_search(query: str, num_results: int = 3) -> List[dict]:
         results = []
         html_content = response.text
         
-        # Simple parsing for result links and snippets
-        import re
+        # Regex patterns for parsing results
         
         # Try multiple regex patterns for robustness
         patterns = [
@@ -608,9 +608,9 @@ async def ask_question(request: AskRequest):
     
     # Smart RAG Logic:
     # - If NO documents exist: use web search
-    # - If similarity is LOW (< 0.15): question is likely unrelated to docs, use web search
+    # - If similarity is below SIMILARITY_THRESHOLD: question is likely unrelated to docs, use web search
     # - Otherwise: use documents and let LLM answer from them
-    LOW_RELEVANCE_THRESHOLD = 0.15
+    # Using the configurable SIMILARITY_THRESHOLD defined at the top of the file
     
     print(f"DEBUG: Question: '{request.question}'")
     if context_chunks_with_citations:
@@ -622,8 +622,8 @@ async def ask_question(request: AskRequest):
         print("No documents found in database, using external RAG...")
         use_external_rag = True
         external_sources = perform_web_search(request.question, num_results=3)
-    elif best_similarity < LOW_RELEVANCE_THRESHOLD:
-        print(f"Low similarity ({best_similarity:.3f} < {LOW_RELEVANCE_THRESHOLD}), attempting external RAG...")
+    elif best_similarity < SIMILARITY_THRESHOLD:
+        print(f"Low similarity ({best_similarity:.3f} < {SIMILARITY_THRESHOLD}), attempting external RAG...")
         external_sources = perform_web_search(request.question, num_results=3)
         
         if external_sources:
@@ -712,7 +712,7 @@ async def ask_question(request: AskRequest):
         
         # Determine citation note message
         if not has_external_sources:
-            if best_similarity < LOW_RELEVANCE_THRESHOLD and context_chunks_with_citations:
+            if best_similarity < SIMILARITY_THRESHOLD and context_chunks_with_citations:
                  citation_note = f"No external sources found. Showing best available documents (low relevance: {best_similarity:.2f})."
             else:
                  citation_note = "No external sources used"
