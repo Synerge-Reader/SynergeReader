@@ -1,5 +1,6 @@
 import { useState } from "react";
 import "./UserAuth.css";
+import { GoogleLogin } from "@react-oauth/google";
 
 export default function UserAuth({ setOpenAuth, setAuthToken, setNotification, setOpenSurvey, getHistory }) {
   const [username, setUsername] = useState("");
@@ -36,6 +37,44 @@ export default function UserAuth({ setOpenAuth, setAuthToken, setNotification, s
       console.error("Auth error:", err);
       setNotification("User Auth Error")
     }
+  };
+
+  // Handle Google login response
+  const handleGoogleSuccess = async (credentialResponse) => {
+    try {
+      // credentialResponse.credential is the JWT token from Google
+      const googleToken = credentialResponse.credential;
+      
+      // Send token to backend for verification
+      const res = await fetch(
+        (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/google-login",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: googleToken }),
+        }
+      );
+
+      if (res.status === 200) {
+        const data = await res.json();
+        setAuthToken(data.token);
+        localStorage.setItem("authToken", data.token);
+        setOpenAuth(false);
+        getHistory();
+        setNotification("Google login successful!");
+        setOpenSurvey(true);
+      } else {
+        const errorData = await res.json();
+        setNotification(`Google login error: ${errorData.detail || "Unknown error"}`);
+      }
+    } catch (err) {
+      console.error("Google login error:", err);
+      setNotification("Google login error");
+    }
+  };
+
+  const handleGoogleError = () => {
+    setNotification("Google login failed");
   };
 
   return (
@@ -84,6 +123,22 @@ export default function UserAuth({ setOpenAuth, setAuthToken, setNotification, s
           >
             Register
           </button>
+        </div>
+
+        {/* Google Login Section */}
+        <div style={{ marginTop: "20px", textAlign: "center" }}>
+          <hr style={{ margin: "15px 0" }} />
+          <p style={{ color: "#666", marginBottom: "15px", fontSize: "14px" }}>
+            Or sign in with Google
+          </p>
+          <div style={{ display: "flex", justifyContent: "center" }}>
+            <GoogleLogin
+              onSuccess={handleGoogleSuccess}
+              onError={handleGoogleError}
+              text="signin_with"
+              size="large"
+            />
+          </div>
         </div>
       </div>
     </div>
