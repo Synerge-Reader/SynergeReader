@@ -26,8 +26,6 @@ export default function FileUpload({
   ];
   const setDefault = () => setIsDragging(false);
 
-
-
   const uploadBatchToBackend = async (parsedDocs) => {
     try {
       const formData = new FormData();
@@ -35,8 +33,6 @@ export default function FileUpload({
         const blob = new Blob([text], { type: 'text/plain' });
         formData.append('files', blob, name);
       });
-
-
 
       const response = await fetch((process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + '/upload', {
         method: 'POST',
@@ -125,8 +121,6 @@ export default function FileUpload({
     });
   };
 
-
-
   const processFiles = async (files) => {
     const validFiles = [];
     const errorMessages = [];
@@ -172,9 +166,13 @@ export default function FileUpload({
           textContent = await processJSON(file);
         }
 
+        const fileUrl = URL.createObjectURL(file);
+
         const parsedDoc = {
           name: file.name,
-          text: textContent
+          text: textContent,
+          url: fileUrl,
+          type: file.type
         };
         parsedDocs.push(parsedDoc);
         onFileParsed(parsedDoc);
@@ -225,18 +223,13 @@ export default function FileUpload({
     setDefault();
   };
 
-
   const modelDisplayNames = {
     "llama3.1:8b": "LLaMA 3.1 8B",
-    /* "qwen3:latest": "Qwen 3", */
-    /* "hf.co/TheBloke/law-LLM-GGUF:Q6_K": "Law LLM",  */
     "adrienbrault/saul-instruct-v1:Q8_0": "Saul Instruct",
     "OussamaELALLAM/MedExpert:latest": "MedExpert",
-    /*  "meditron:latest": "Meditron" */
   };
 
   const displayName = modelDisplayNames[model] || model;
-
 
   return (
     <div
@@ -278,19 +271,14 @@ export default function FileUpload({
         title={`Selected Model: ${displayName}`}
         options={[
           { label: "LLaMA 3.1 8B", value: "llama3.1:8b" },
-          /*   { label: "Qwen 3", value: "qwen3:latest" }, */
-          /* { label: "Law LLM", value: "hf.co/TheBloke/law-LLM-GGUF:Q6_K" },*/
           { label: "Saul Instruct", value: "adrienbrault/saul-instruct-v1:Q8_0" },
           { label: "MedExpert", value: "OussamaELALLAM/MedExpert:latest" },
-          /*   { label: "Meditron", value: "meditron:latest" } */
         ]}
         onSelect={(option) => {
           setModel(option.value);
           console.log("Selected:", option.value);
         }}
       />
-
     </div>
   );
 }
-

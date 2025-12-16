@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect } from "react";
 
 const TextPreview = ({ documents = [], onSelect }) => {
   const handleMouseUp = () => {
@@ -8,21 +8,26 @@ const TextPreview = ({ documents = [], onSelect }) => {
     }
   };
 
+  // Cleanup URLs when component unmounts or documents change
+  useEffect(() => {
+    return () => {
+      documents.forEach(doc => {
+        if (doc.url) {
+          URL.revokeObjectURL(doc.url);
+        }
+      });
+    };
+  }, [documents]);
+
   if (!documents || documents.length === 0) {
     return (
       <div className="alpha-preview-card" role="region" aria-label="Document preview">
         <div className="alpha-preview-title">
           Document Preview
-          {documents.length > 0 && (
-            <div className="file-info">
-              Uploaded:{" "}
-              <span>{documents.map((d) => d.name).join(", ")}</span>
-            </div>
-          )}
-          <hr></hr>
+          <hr />
         </div>
         <div className="alpha-preview-text" style={{ userSelect: 'text' }}>
-          No text parsed yet.
+          No documents uploaded yet.
         </div>
       </div>
     );
@@ -38,12 +43,27 @@ const TextPreview = ({ documents = [], onSelect }) => {
             <span>{documents.map((d) => d.name).join(", ")}</span>
           </div>
         )}
-        <hr></hr>
+        <hr />
       </div>
       <div className="alpha-preview-text" style={{ userSelect: 'text' }}>
         {documents.map((doc) => (
-          <div key={doc.name} style={{ marginBottom: '16px' }}>
+          <div key={doc.name} style={{ marginBottom: '24px' }}>
             <h4>{doc.name}</h4>
+
+            {/* Display document in iframe if URL is available */}
+            {doc.url && doc.type === 'application/pdf' && (
+              <iframe
+                title={`viewer-${doc.name}`}
+                src={doc.url}
+                style={{
+                  width: '100%',
+                  height: '600px',
+                  border: '1px solid #ccc',
+                  marginBottom: '16px'
+                }}
+              />
+            )}
+
             {doc.citation && (doc.citation.title || doc.citation.author) && (
               <div className="citation-info" style={{
                 fontSize: '0.85em',
