@@ -18,7 +18,8 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - OLLAMA_HOST=${OLLAMA_HOST}
-      - OLLAMA_PORT=11434
+      - OLLAMA_PORT=${OLLAMA_PORT}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
     restart: unless-stopped
 
   frontend:
@@ -31,7 +32,8 @@ services:
       - ./synerge-reader-frontend:/app
       - /app/node_modules
     environment:
-      - REACT_APP_API_URL=${REACT_APP_BACKEND_URL}
+      - REACT_APP_BACKEND_URL=${REACT_APP_BACKEND_URL}
+      - REACT_APP_GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
     depends_on:
       - backend
     restart: unless-stopped

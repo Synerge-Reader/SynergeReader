@@ -1,11 +1,30 @@
 import "./Top.css";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 
 
-function Top({ setOpenAuth, authToken, setAuthToken, setHistory, model, setModel }) {
+function Top({ setOpenAuth, authToken, setAuthToken, setHistory, model, setModel, onAdminClick }) {
 
    const [selectedDomain, setSelectedDomain] = useState("Domains");
   const [showDropdown, setShowDropdown] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
+
+  useEffect(() => {
+    if (authToken) {
+      checkAdminStatus();
+    }
+  }, [authToken]);
+
+  const checkAdminStatus = async () => {
+    try {
+      const backendUrl = process.env.REACT_APP_BACKEND_URL || "http://localhost:5000";
+      const res = await fetch(`${backendUrl}/admin/check?token=${authToken}`);
+      const data = await res.json();
+      setIsAdmin(data.is_admin);
+    } catch (err) {
+      console.error("Error checking admin status:", err);
+      setIsAdmin(false);
+    }
+  };
 
   const handleSelect = (domain) => {
     setSelectedDomain(domain);
@@ -69,6 +88,16 @@ function Top({ setOpenAuth, authToken, setAuthToken, setHistory, model, setModel
           </div>
 
           <h3>Community Papers</h3>
+
+          {isAdmin && authToken && (
+            <button
+              onClick={onAdminClick}
+              className="admin-btn"
+              title="Admin Dashboard"
+            >
+              📊 Admin
+            </button>
+          )}
 
           {!authToken ? (
             <div onClick={() => setOpenAuth(true)} className="auth">

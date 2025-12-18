@@ -11,6 +11,7 @@ import Notifier from './components/Notifier/Notifier'
 import Markdown from "react-markdown";
 import SurveyModal from "./components/Survey/SurveyModal.jsx";
 import CorrectionModal from "./components/CorrectionModal/CorrectionModal.jsx";
+import AdminDashboard from "./components/AdminDashboard/AdminDashboard.jsx";
 import './GridApp.css'
 
 const GridApp = () => {
@@ -31,6 +32,7 @@ const GridApp = () => {
   const [notification, setNotification] = useState('')
   const [openCorrection, setOpenCorrection] = useState(false);
   const [correctionEntry, setCorrectionEntry] = useState(null);
+  const [openAdminDashboard, setOpenAdminDashboard] = useState(false);
 
 
   useEffect(() => {
@@ -224,6 +226,12 @@ const GridApp = () => {
             originalAnswer={correctionEntry.answer}
           />
         )}
+        {openAdminDashboard && (
+          <AdminDashboard
+            authToken={authToken}
+            onClose={() => setOpenAdminDashboard(false)}
+          />
+        )}
 
         {/* Header */}
         <div className="div4">
@@ -234,6 +242,7 @@ const GridApp = () => {
             setHistory={setHistory}
             model={model}
             setModel={setModel}
+            onAdminClick={() => setOpenAdminDashboard(true)}
           />
           <hr />
           <TitleLogo />
