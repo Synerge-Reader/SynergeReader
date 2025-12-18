@@ -13,6 +13,12 @@ import secrets
 import numpy as np
 from dotenv import load_dotenv
 import re
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 load_dotenv()
 
@@ -29,6 +35,7 @@ app.add_middleware(
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "172.18.0.1")
 OLLAMA_PORT = os.getenv("OLLAMA_PORT", "11434")
 DB_PATH = os.path.join(os.path.dirname(__file__), "synerge_reader.db")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 
 # Cosine similarity threshold for determining if document context is sufficient
 # If the best similarity score is below this, we'll use external RAG sources
@@ -235,6 +242,10 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+
+class GoogleLoginRequest(BaseModel):
+    token: str
 
 
 class CorrectionRequest(BaseModel):
@@ -817,6 +828,9 @@ async def ask_question(request: AskRequest):
             )
 
         yield f"__CONTEXT__{json.dumps(context_data)}__\n\n"
+        
+        print("DEBUG: Context sent. Starting LLM streaming...")
+        yield "__READY__\n"
 
         url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/generate"
         payload = {
@@ -830,17 +844,43 @@ async def ask_question(request: AskRequest):
         try:
             with requests.post(url, json=payload, stream=True, timeout=60) as r:
                 r.raise_for_status()
-                for line in r.iter_lines():
-                    if line:
-                        try:
-                            data = json.loads(line.decode("utf-8"))
-                            token = data.get("response", "")
-                            if token:
-                                answer_parts.append(token)
-                                yield token
-                        except Exception:
-                            continue
+                buffer = ""
+                token_count = 0
+                for chunk in r.iter_content(decode_unicode=True, chunk_size=32):
+                    if chunk:
+                        if isinstance(chunk, bytes):
+                            chunk = chunk.decode("utf-8")
+                        buffer += chunk
+                        # Process complete JSON objects (lines ending with \n)
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            if line:
+                                try:
+                                    data = json.loads(line)
+                                    token = data.get("response", "")
+                                    if token:
+                                        token_count += 1
+                                        print(f"DEBUG: Yielding token #{token_count}: {repr(token[:50])}")
+                                        answer_parts.append(token)
+                                        yield token + "\n"
+                                except Exception as e:
+                                    print(f"DEBUG: JSON parse error: {e}")
+                                    continue
+                # Handle any remaining buffered data
+                if buffer:
+                    try:
+                        data = json.loads(buffer)
+                        token = data.get("response", "")
+                        if token:
+                            token_count += 1
+                            print(f"DEBUG: Yielding final token #{token_count}: {repr(token[:50])}")
+                            answer_parts.append(token)
+                            yield token
+                    except Exception:
+                        pass
+                print(f"DEBUG: Streaming complete. Total tokens: {token_count}")
         except Exception as e:
+            print(f"DEBUG: Exception during streaming: {e}")
             yield f"__ERROR__LLM streaming error: {e}__"
 
         full_answer = "".join(answer_parts)
@@ -873,7 +913,14 @@ async def ask_question(request: AskRequest):
         except Exception:
             yield "__ERROR__Database error__"
 
-    return StreamingResponse(stream_generate(), media_type="text/plain")
+    return StreamingResponse(
+        stream_generate(), 
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 
 @app.post("/history", response_model=List[HistoryItem])
@@ -981,6 +1028,80 @@ async def login(request: LoginRequest):
     if not row or not bcrypt.checkpw(request.password.encode(), row[0].encode()):
         raise HTTPException(400, "Invalid username or password")
     return {"message": "Login successful", "token": row[1]}
+
+
+@app.post("/google-login")
+async def google_login(request: GoogleLoginRequest):
+    """
+    Google OAuth 2.0 Login Endpoint
+
+    Flow:
+    1. Frontend sends Google ID token
+    2. Backend verifies token with Google
+    3. Backend extracts user email/name from token
+    4. Backend creates/updates user in database
+    5. Backend returns app token
+    """
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(500, "Google Client ID not configured")
+
+    try:
+        # Verify the token with Google
+        # This checks that the token is valid and hasn't been tampered with
+        idinfo = id_token.verify_oauth2_token(
+            request.token, google_requests.Request(), GOOGLE_CLIENT_ID
+        )
+
+        # Extract user information from the verified token
+        email = idinfo.get("email", "")
+        name = idinfo.get("name", "")
+        google_id = idinfo.get("sub", "")  # Unique Google user ID
+
+        if not email:
+            raise HTTPException(400, "Email not provided by Google")
+
+        # Connect to database
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+
+        # Check if user already exists
+        c.execute("SELECT id, token FROM users WHERE username = ?", (email,))
+        row = c.fetchone()
+
+        if row:
+            # User exists, return their token
+            conn.close()
+            return {
+                "message": "Login successful",
+                "token": row[1],
+                "email": email,
+                "name": name,
+            }
+        else:
+            # Create new user with Google email as username
+            # Password is not needed for Google users, we can use a placeholder
+            app_token = secrets.token_hex(32)
+            placeholder_password = secrets.token_hex(32)  # Random, unused password
+
+            c.execute(
+                "INSERT INTO users (username, password, token) VALUES (?, ?, ?)",
+                (email, placeholder_password, app_token),
+            )
+            conn.commit()
+            conn.close()
+
+            return {
+                "message": "Registration and login successful",
+                "token": app_token,
+                "email": email,
+                "name": name,
+            }
+
+    except ValueError as e:
+        # Token verification failed
+        raise HTTPException(401, f"Invalid token: {str(e)}")
+    except Exception as e:
+        raise HTTPException(500, f"Google login error: {str(e)}")
 
 
 # ------------------- New Endpoints -------------------

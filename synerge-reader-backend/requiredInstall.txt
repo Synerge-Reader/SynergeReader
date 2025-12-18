@@ -24,3 +24,7 @@ uvicorn==0.35.0
 uvloop==0.21.0
 watchfiles==1.1.0
 websockets==15.0.1
+google-auth==2.26.2
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.0
+PyJWT==2.10.1
