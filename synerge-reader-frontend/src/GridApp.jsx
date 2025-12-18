@@ -12,6 +12,7 @@ import Markdown from "react-markdown";
 import SurveyModal from "./components/Survey/SurveyModal.jsx";
 import CorrectionModal from "./components/CorrectionModal/CorrectionModal.jsx";
 import './GridApp.css'
+import './App.css'
 
 const GridApp = () => {
   const [parsedDocuments, setParsedDocuments] = useState([]);
