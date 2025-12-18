@@ -113,63 +113,93 @@ const GridApp = () => {
       const reader = res.body.getReader();
       const decoder = new TextDecoder("utf-8");
       let fullText = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        fullText += decoder.decode(value, { stream: true });
-      }
-
       let contextChunks = [];
       let citations = [];
       let apaCitations = [];
       let hasExternalSources = false;
       let citationNote = "No external sources used";
       let similarityScore = 0;
+      let contextProcessed = false;
 
-      const contextMatch = fullText.match(/__CONTEXT__({.+?})__/s);
-      if (contextMatch) {
-        try {
-          const contextData = JSON.parse(contextMatch[1]);
-          contextChunks = contextData.context_chunks || [];
-          citations = contextData.citations || [];
-          apaCitations = contextData.apa_citations || [];
-          hasExternalSources = contextData.has_external_sources || false;
-          citationNote = contextData.citation_note || "No external sources used";
-          similarityScore = contextData.similarity_score || 0;
-
-          fullText = fullText.replace(/__CONTEXT__{.+?}__\n*/s, "");
-        } catch (e) {
-          console.error("Error parsing context:", e);
+      // Stream and process in real-time
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        
+        const chunk = decoder.decode(value, { stream: true });
+        
+        // Handle context metadata
+        if (chunk.includes("__CONTEXT__") && !contextProcessed) {
+          const contextMatch = chunk.match(/__CONTEXT__({.+?})__/s);
+          if (contextMatch) {
+            try {
+              const contextData = JSON.parse(contextMatch[1]);
+              contextChunks = contextData.context_chunks || [];
+              citations = contextData.citations || [];
+              apaCitations = contextData.apa_citations || [];
+              hasExternalSources = contextData.has_external_sources || false;
+              citationNote = contextData.citation_note || "No external sources used";
+              similarityScore = contextData.similarity_score || 0;
+              contextProcessed = true;
+              
+              console.log("DEBUG [Frontend]: Context parsed, starting stream display");
+              setIsLoading(false);
+            } catch (e) {
+              console.error("Error parsing context:", e);
+            }
+          }
+          continue;
+        }
+        
+        // Skip control markers
+        if (chunk.includes("__READY__") || chunk.includes("__ENTRY_ID__")) {
+          const entryIdMatch = chunk.match(/__ENTRY_ID__(\d+)__/);
+          if (entryIdMatch) {
+            console.log("Entry ID:", entryIdMatch[1]);
+          }
+          continue;
+        }
+        
+        // Skip error markers
+        if (chunk.includes("__ERROR__")) {
+          continue;
+        }
+        
+        // Clean up the chunk (remove newlines used as delimiters)
+        const cleanChunk = chunk.replace(/\n$/, "");
+        if (cleanChunk) {
+          fullText += cleanChunk;
+          console.log(`DEBUG [Frontend]: Streaming token, fullText length: ${fullText.length}`);
+          
+          // Update UI in real-time as we receive tokens
+          setAnswer({
+            question,
+            answer: fullText,
+            context_chunks: contextChunks,
+            citations: citations,
+            apa_citations: apaCitations,
+            has_external_sources: hasExternalSources,
+            citation_note: citationNote,
+            similarity_score: similarityScore,
+            relevant_history: [],
+          });
+          
+          // Small delay to allow React to render
+          await new Promise(resolve => setTimeout(resolve, 5));
         }
       }
 
-      // Debug logging for citation data
-      console.log("DEBUG [Frontend]: Parsed citation data:", {
-        apaCitationsCount: apaCitations.length,
-        hasExternalSources: hasExternalSources,
-        citationNote: citationNote,
-        similarityScore: similarityScore
-      });
-      if (apaCitations.length > 0) {
-        console.log("DEBUG [Frontend]: First APA citation:", apaCitations[0]);
-      }
-
-      // Extract entry ID from the end of the response
-      let answer = fullText;
+      // Final update with any remaining data
       let entryId = null;
-
       const entryIdMatch = fullText.match(/__ENTRY_ID__(\d+)__/);
       if (entryIdMatch) {
         entryId = parseInt(entryIdMatch[1]);
-        // Remove the entry ID marker from the answer
-        answer = fullText.replace(/__ENTRY_ID__\d+__/, "").trim();
+        fullText = fullText.replace(/__ENTRY_ID__\d+__/, "").trim();
       }
 
-      console.log("Entry ID:", entryId); // You can use this ID as needed
       setAnswer({
         question,
-        answer: answer,
+        answer: fullText,
         context_chunks: contextChunks,
         citations: citations,
         apa_citations: apaCitations,
@@ -177,7 +207,7 @@ const GridApp = () => {
         citation_note: citationNote,
         similarity_score: similarityScore,
         relevant_history: [],
-        entryId: entryId, // Add the entry ID to your state
+        entryId: entryId,
       });
     } catch (err) {
       setError("Could not get answer from backend.");

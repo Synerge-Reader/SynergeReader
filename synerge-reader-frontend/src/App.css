@@ -431,6 +431,15 @@ margin-top: -20px;
   }
 }
 
+@keyframes blink {
+  0%, 49% {
+    opacity: 1;
+  }
+  50%, 100% {
+    opacity: 0;
+  }
+}
+
 .modal-content h2 {
   color: #334155;
   margin-bottom: 20px;

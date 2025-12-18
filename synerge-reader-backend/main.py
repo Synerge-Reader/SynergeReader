@@ -818,6 +818,9 @@ async def ask_question(request: AskRequest):
             )
 
         yield f"__CONTEXT__{json.dumps(context_data)}__\n\n"
+        
+        print("DEBUG: Context sent. Starting LLM streaming...")
+        yield "__READY__\n"
 
         url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/generate"
         payload = {
@@ -831,17 +834,43 @@ async def ask_question(request: AskRequest):
         try:
             with requests.post(url, json=payload, stream=True, timeout=60) as r:
                 r.raise_for_status()
-                for line in r.iter_lines():
-                    if line:
-                        try:
-                            data = json.loads(line.decode("utf-8"))
-                            token = data.get("response", "")
-                            if token:
-                                answer_parts.append(token)
-                                yield token
-                        except Exception:
-                            continue
+                buffer = ""
+                token_count = 0
+                for chunk in r.iter_content(decode_unicode=True, chunk_size=32):
+                    if chunk:
+                        if isinstance(chunk, bytes):
+                            chunk = chunk.decode("utf-8")
+                        buffer += chunk
+                        # Process complete JSON objects (lines ending with \n)
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            if line:
+                                try:
+                                    data = json.loads(line)
+                                    token = data.get("response", "")
+                                    if token:
+                                        token_count += 1
+                                        print(f"DEBUG: Yielding token #{token_count}: {repr(token[:50])}")
+                                        answer_parts.append(token)
+                                        yield token + "\n"
+                                except Exception as e:
+                                    print(f"DEBUG: JSON parse error: {e}")
+                                    continue
+                # Handle any remaining buffered data
+                if buffer:
+                    try:
+                        data = json.loads(buffer)
+                        token = data.get("response", "")
+                        if token:
+                            token_count += 1
+                            print(f"DEBUG: Yielding final token #{token_count}: {repr(token[:50])}")
+                            answer_parts.append(token)
+                            yield token
+                    except Exception:
+                        pass
+                print(f"DEBUG: Streaming complete. Total tokens: {token_count}")
         except Exception as e:
+            print(f"DEBUG: Exception during streaming: {e}")
             yield f"__ERROR__LLM streaming error: {e}__"
 
         full_answer = "".join(answer_parts)
@@ -874,7 +903,14 @@ async def ask_question(request: AskRequest):
         except Exception:
             yield "__ERROR__Database error__"
 
-    return StreamingResponse(stream_generate(), media_type="text/plain")
+    return StreamingResponse(
+        stream_generate(), 
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 
 @app.post("/history", response_model=List[HistoryItem])
