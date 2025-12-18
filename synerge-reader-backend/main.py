@@ -11,6 +11,7 @@ from pydantic import BaseModel
 import bcrypt
 import secrets
 import numpy as np
+from dotenv import load_dotenv
 import re
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
@@ -18,6 +19,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+load_dotenv()
 
 app = FastAPI(title="SynergeReader API", version="2.0.0")
 
@@ -309,7 +312,8 @@ def init_db():
         id INTEGER PRIMARY KEY,
         username TEXT UNIQUE,
         password TEXT,
-        token TEXT
+        token TEXT,
+        is_admin INTEGER DEFAULT 0
     )""")
 
     # Knowledge base table
@@ -327,6 +331,12 @@ def init_db():
     c.execute(
         "INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (0, "anonymous")
     )
+
+    # Add is_admin column if it doesn't exist (for migration)
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
 
     conn.commit()
     conn.close()
@@ -1190,6 +1200,148 @@ async def add_knowledge(request: KnowledgeInsertRequest):
         conn.commit()
         conn.close()
         return {"message": f"{len(request.items)} knowledge items added"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/admin/check")
+async def check_admin_status(token: Optional[str] = None):
+    """Check if user with given token is admin"""
+    if not token:
+        return {"is_admin": False}
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT is_admin FROM users WHERE token = ?", (token,))
+        row = c.fetchone()
+        conn.close()
+
+        if row:
+            return {"is_admin": bool(row[0])}
+        return {"is_admin": False}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/admin/ratings")
+async def get_all_ratings(token: Optional[str] = None):
+    """Get all ratings and feedback from responses"""
+    if not token:
+        raise HTTPException(401, "Unauthorized")
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+
+        # Check if user is admin
+        c.execute("SELECT is_admin FROM users WHERE token = ?", (token,))
+        row = c.fetchone()
+
+        if not row or not row[0]:
+            conn.close()
+            raise HTTPException(403, "Forbidden: Admin access required")
+
+        # Fetch all ratings from chat history
+        c.execute("""
+            SELECT 
+                ch.id,
+                ch.user_id,
+                u.username,
+                ch.ts,
+                ch.question,
+                ch.answer,
+                ch.rating,
+                ch.comment,
+                ch.selected_text
+            FROM chat_history ch
+            LEFT JOIN users u ON ch.user_id = u.id
+            WHERE ch.rating IS NOT NULL
+            ORDER BY ch.ts DESC
+        """)
+
+        rows = c.fetchall()
+        conn.close()
+
+        ratings = []
+        for row in rows:
+            ratings.append(
+                {
+                    "id": row[0],
+                    "user_id": row[1],
+                    "username": row[2] or "Anonymous",
+                    "timestamp": row[3],
+                    "question": row[4],
+                    "answer": row[5],
+                    "rating": row[6],
+                    "comment": row[7],
+                    "selected_text": row[8],
+                }
+            )
+
+        return {"ratings": ratings, "total_count": len(ratings)}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/admin/ratings/stats")
+async def get_rating_stats(token: Optional[str] = None):
+    """Get statistics about ratings"""
+    if not token:
+        raise HTTPException(401, "Unauthorized")
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+
+        # Check if user is admin
+        c.execute("SELECT is_admin FROM users WHERE token = ?", (token,))
+        row = c.fetchone()
+
+        if not row or not row[0]:
+            conn.close()
+            raise HTTPException(403, "Forbidden: Admin access required")
+
+        # Get rating statistics
+        c.execute("""
+            SELECT 
+                COUNT(*) as total_ratings,
+                AVG(rating) as average_rating,
+                MIN(rating) as min_rating,
+                MAX(rating) as max_rating
+            FROM chat_history
+            WHERE rating IS NOT NULL
+        """)
+
+        stats_row = c.fetchone()
+
+        # Get rating distribution
+        c.execute("""
+            SELECT rating, COUNT(*) as count
+            FROM chat_history
+            WHERE rating IS NOT NULL
+            GROUP BY rating
+            ORDER BY rating
+        """)
+
+        distribution_rows = c.fetchall()
+        conn.close()
+
+        distribution = {}
+        for rating, count in distribution_rows:
+            distribution[int(rating)] = count
+
+        return {
+            "total_ratings": stats_row[0] or 0,
+            "average_rating": round(stats_row[1], 2) if stats_row[1] else 0,
+            "min_rating": stats_row[2] or 0,
+            "max_rating": stats_row[3] or 0,
+            "distribution": distribution,
+        }
+    except HTTPException as e:
+        raise e
     except Exception as e:
         raise HTTPException(500, str(e))
 
