@@ -224,9 +224,9 @@ export default function FileUpload({
   };
 
   const modelDisplayNames = {
-    "llama3.1:8b": "LLaMA 3.1 8B",
-    "adrienbrault/saul-instruct-v1:Q8_0": "Saul Instruct",
-    "OussamaELALLAM/MedExpert:latest": "MedExpert",
+    "llama": "LLaMA",
+    "saul": "Saul Instruct",
+    "med": "MedExpert",
   };
 
   const displayName = modelDisplayNames[model] || model;
@@ -270,13 +270,13 @@ export default function FileUpload({
       <Dropdown
         title={`Selected Model: ${displayName}`}
         options={[
-          { label: "LLaMA 3.1 8B", value: "llama3.1:8b" },
-          { label: "Saul Instruct", value: "adrienbrault/saul-instruct-v1:Q8_0" },
-          { label: "MedExpert", value: "OussamaELALLAM/MedExpert:latest" },
+          { label: "LLaMA", value: "llama" },
+          { label: "Saul Instruct", value: "saul" },
+          { label: "MedExpert", value: "med" },
         ]}
         onSelect={(option) => {
           setModel(option.value);
-          console.log("Selected:", option.value);
+          console.log("Selected model family:", option.value);
         }}
       />
     </div>

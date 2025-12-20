@@ -25,7 +25,7 @@ const GridApp = () => {
   const [answer, setAnswer] = useState(null);
   const [history, setHistory] = useState([]);
   const [openHistory, setOpenHistory] = useState(false);
-  const [model, setModel] = useState("llama3.1:8b");
+  const [model, setModel] = useState("llama");
   const [openRating, setOpenRating] = useState(false);
   const [openAuth, setOpenAuth] = useState(false);
   const [openSurvey, setOpenSurvey] = useState(false);
@@ -127,9 +127,9 @@ const GridApp = () => {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        
+
         const chunk = decoder.decode(value, { stream: true });
-        
+
         // Handle context metadata
         if (chunk.includes("__CONTEXT__") && !contextProcessed) {
           const contextMatch = chunk.match(/__CONTEXT__({.+?})__/s);
@@ -143,7 +143,7 @@ const GridApp = () => {
               citationNote = contextData.citation_note || "No external sources used";
               similarityScore = contextData.similarity_score || 0;
               contextProcessed = true;
-              
+
               console.log("DEBUG [Frontend]: Context parsed, starting stream display");
               setIsLoading(false);
             } catch (e) {
@@ -152,7 +152,7 @@ const GridApp = () => {
           }
           continue;
         }
-        
+
         // Skip control markers
         if (chunk.includes("__READY__") || chunk.includes("__ENTRY_ID__")) {
           const entryIdMatch = chunk.match(/__ENTRY_ID__(\d+)__/);
@@ -161,18 +161,18 @@ const GridApp = () => {
           }
           continue;
         }
-        
+
         // Skip error markers
         if (chunk.includes("__ERROR__")) {
           continue;
         }
-        
+
         // Clean up the chunk (remove newlines used as delimiters)
         const cleanChunk = chunk.replace(/\n$/, "");
         if (cleanChunk) {
           fullText += cleanChunk;
           console.log(`DEBUG [Frontend]: Streaming token, fullText length: ${fullText.length}`);
-          
+
           // Update UI in real-time as we receive tokens
           setAnswer({
             question,
@@ -185,7 +185,7 @@ const GridApp = () => {
             similarity_score: similarityScore,
             relevant_history: [],
           });
-          
+
           // Small delay to allow React to render
           await new Promise(resolve => setTimeout(resolve, 5));
         }

@@ -327,6 +327,26 @@ def init_db():
         context_text TEXT
     )""")
 
+    # Model versions table - tracks all models and their relationships
+    c.execute("""CREATE TABLE IF NOT EXISTS model_versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        model_name TEXT UNIQUE NOT NULL,
+        base_family TEXT NOT NULL,
+        parent_model TEXT,
+        creation_timestamp TEXT NOT NULL,
+        training_file_name TEXT,
+        FOREIGN KEY (parent_model) REFERENCES model_versions(model_name)
+    )""")
+
+    # Active model selection table - one active model per base family
+    c.execute("""CREATE TABLE IF NOT EXISTS active_model_setting (
+        id INTEGER PRIMARY KEY,
+        base_family TEXT UNIQUE NOT NULL,
+        active_model_name TEXT NOT NULL,
+        updated_at TEXT,
+        FOREIGN KEY (active_model_name) REFERENCES model_versions(model_name)
+    )""")
+
     # Insert anonymous user
     c.execute(
         "INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (0, "anonymous")
@@ -338,11 +358,98 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # Column already exists
 
+    # Initialize default base models if not present
+    base_models = [
+        ("llama3.1:8b", "llama"),
+        ("adrienbrault/saul-instruct-v1:Q8_0", "saul"),
+        ("OussamaELALLAM/MedExpert:latest", "med"),
+    ]
+    for model_name, family in base_models:
+        c.execute(
+            "INSERT OR IGNORE INTO model_versions (model_name, base_family, creation_timestamp) VALUES (?, ?, ?)",
+            (model_name, family, datetime.datetime.now().isoformat())
+        )
+        # Initialize active model for each family
+        c.execute(
+            "INSERT OR IGNORE INTO active_model_setting (base_family, active_model_name, updated_at) VALUES (?, ?, ?)",
+            (family, model_name, datetime.datetime.now().isoformat())
+        )
+
     conn.commit()
     conn.close()
 
 
 # ------------------- Utilities -------------------
+
+
+def get_active_model(base_family: str) -> str:
+    """Get the currently active model for a specific base family"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT active_model_name FROM active_model_setting WHERE base_family = ?", (base_family,))
+        row = c.fetchone()
+        conn.close()
+        
+        if row:
+            return row[0]
+        # Fallback to base model name if no active model set
+        if base_family == "llama":
+            return "llama3.1:8b"
+        elif base_family == "saul":
+            return "adrienbrault/saul-instruct-v1:Q8_0"
+        elif base_family == "med":
+            return "OussamaELALLAM/MedExpert:latest"
+        return "llama3.1:8b"
+    except Exception as e:
+        print(f"Error getting active model for {base_family}: {e}")
+        return "llama3.1:8b"
+
+
+def get_model_family_info(base_family: str) -> dict:
+    """Get all models in a family (base + fine-tuned versions)"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        # Get all models in this family, ordered by creation time
+        c.execute("""
+            SELECT model_name, parent_model, creation_timestamp
+            FROM model_versions
+            WHERE base_family = ?
+            ORDER BY creation_timestamp
+        """, (base_family,))
+        
+        rows = c.fetchall()
+        
+        # Get active model for this family
+        c.execute("SELECT active_model_name FROM active_model_setting WHERE base_family = ?", (base_family,))
+        active_row = c.fetchone()
+        active_model = active_row[0] if active_row else None
+        
+        conn.close()
+        
+        if not rows:
+            return None
+        
+        versions = []
+        for model_name, parent, timestamp in rows:
+            versions.append({
+                "model_name": model_name,
+                "parent_model": parent,
+                "created_at": timestamp,
+                "is_active": model_name == active_model
+            })
+        
+        return {
+            "base_family": base_family,
+            "active_model": active_model,
+            "versions": versions
+        }
+    except Exception as e:
+        print(f"Error getting model family info: {e}")
+        return None
+
 
 
 def chunk_text(text: str, max_chunk_size: int = 500) -> list:
@@ -828,13 +935,17 @@ async def ask_question(request: AskRequest):
             )
 
         yield f"__CONTEXT__{json.dumps(context_data)}__\n\n"
-        
+
         print("DEBUG: Context sent. Starting LLM streaming...")
         yield "__READY__\n"
 
+        # Get the active model version for the selected family
+        active_model = get_active_model(request.model)
+        print(f"DEBUG: User selected family '{request.model}', using active model: {active_model}")
+
         url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/generate"
         payload = {
-            "model": request.model,
+            "model": active_model,
             "prompt": prompt,
             "max_tokens": 1000,
             "temperature": 0.7,
@@ -860,7 +971,9 @@ async def ask_question(request: AskRequest):
                                     token = data.get("response", "")
                                     if token:
                                         token_count += 1
-                                        print(f"DEBUG: Yielding token #{token_count}: {repr(token[:50])}")
+                                        print(
+                                            f"DEBUG: Yielding token #{token_count}: {repr(token[:50])}"
+                                        )
                                         answer_parts.append(token)
                                         yield token + "\n"
                                 except Exception as e:
@@ -873,7 +986,9 @@ async def ask_question(request: AskRequest):
                         token = data.get("response", "")
                         if token:
                             token_count += 1
-                            print(f"DEBUG: Yielding final token #{token_count}: {repr(token[:50])}")
+                            print(
+                                f"DEBUG: Yielding final token #{token_count}: {repr(token[:50])}"
+                            )
                             answer_parts.append(token)
                             yield token
                     except Exception:
@@ -914,12 +1029,9 @@ async def ask_question(request: AskRequest):
             yield "__ERROR__Database error__"
 
     return StreamingResponse(
-        stream_generate(), 
+        stream_generate(),
         media_type="text/plain",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no"
-        }
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -1349,6 +1461,270 @@ async def get_rating_stats(token: Optional[str] = None):
 @app.get("/test")
 async def test_endpoint():
     return {"message": "SynergeReader API is running successfully!"}
+
+
+@app.get("/admin/model_families")
+async def get_model_families(token: Optional[str] = None):
+    """Get all model families with their versions and active status"""
+    if not token:
+        raise HTTPException(401, "Unauthorized")
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT is_admin FROM users WHERE token = ?", (token,))
+        row = c.fetchone()
+        conn.close()
+
+        if not row or not row[0]:
+            raise HTTPException(403, "Forbidden: Admin access required")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+    try:
+        families = ["llama", "saul", "med"]
+        result = []
+        
+        for family in families:
+            family_info = get_model_family_info(family)
+            if family_info:
+                result.append(family_info)
+        
+        return {"model_families": result}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to fetch model families: {str(e)}")
+
+
+@app.post("/admin/set_active_model")
+async def set_active_model(token: Optional[str] = None, base_family: str = Form(...), model_name: str = Form(...)):
+    """Set the active model version for a base family"""
+    if not token:
+        raise HTTPException(401, "Unauthorized")
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT is_admin FROM users WHERE token = ?", (token,))
+        row = c.fetchone()
+        
+        if not row or not row[0]:
+            conn.close()
+            raise HTTPException(403, "Forbidden: Admin access required")
+        
+        # Verify the model belongs to this family
+        c.execute("SELECT base_family FROM model_versions WHERE model_name = ?", (model_name,))
+        model_row = c.fetchone()
+        
+        if not model_row or model_row[0] != base_family:
+            conn.close()
+            raise HTTPException(400, f"Model {model_name} does not belong to family {base_family}")
+        
+        # Update active model for this family
+        c.execute(
+            "UPDATE active_model_setting SET active_model_name = ?, updated_at = ? WHERE base_family = ?",
+            (model_name, datetime.datetime.now().isoformat(), base_family)
+        )
+        
+        conn.commit()
+        conn.close()
+        
+        return {
+            "message": f"Active model for {base_family} set to {model_name}",
+            "base_family": base_family,
+            "active_model": model_name
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Failed to set active model: {str(e)}")
+
+
+@app.get("/models")
+async def get_available_models(token: Optional[str] = None):
+    """Get list of available Ollama models for training"""
+    if not token:
+        raise HTTPException(401, "Unauthorized")
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT is_admin FROM users WHERE token = ?", (token,))
+        row = c.fetchone()
+        conn.close()
+
+        if not row or not row[0]:
+            raise HTTPException(403, "Forbidden: Admin access required")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+    try:
+        url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/tags"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        models = []
+        if "models" in data:
+            for model in data["models"]:
+                models.append(
+                    {
+                        "name": model.get("name", ""),
+                        "size": model.get("size", 0),
+                        "modified_at": model.get("modified_at", ""),
+                    }
+                )
+
+        return {"models": models}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to fetch models from Ollama: {str(e)}")
+
+
+class TrainModelRequest(BaseModel):
+    model_name: str
+    training_data: str
+
+
+@app.post("/train_model")
+async def train_model(
+    token: Optional[str] = None,
+    model_name: str = Form(...),
+    training_file: UploadFile = File(...),
+):
+    """Train an Ollama model with provided JSONL training data file
+    
+    Expected JSONL format (one JSON object per line):
+    {"role": "user", "content": "question"} 
+    {"role": "assistant", "content": "answer"}
+    
+    Or conversation format:
+    {"messages": [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]}
+    """
+    if not token:
+        raise HTTPException(401, "Unauthorized")
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT is_admin FROM users WHERE token = ?", (token,))
+        row = c.fetchone()
+        conn.close()
+
+        if not row or not row[0]:
+            raise HTTPException(403, "Forbidden: Admin access required")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+    try:
+        content = await training_file.read()
+        try:
+            training_text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            training_text = content.decode("latin-1", errors="ignore")
+
+        if not training_text.strip():
+            raise HTTPException(400, "Training file is empty")
+
+        # Validate JSONL format - each line should be valid JSON
+        lines = training_text.strip().split('\n')
+        training_pairs = []
+        
+        for i, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+                training_pairs.append(obj)
+            except json.JSONDecodeError:
+                raise HTTPException(400, f"Line {i+1} is not valid JSON: {line[:100]}")
+
+        if not training_pairs:
+            raise HTTPException(400, "No valid training data found in JSONL file")
+
+        # Create a Modelfile incorporating the training knowledge
+        # Build system prompt from training data
+        system_knowledge = "You have been trained with the following knowledge:\n\n"
+        for pair in training_pairs[:10]:  # Limit to first 10 for system prompt
+            if isinstance(pair, dict):
+                if "messages" in pair:
+                    for msg in pair["messages"]:
+                        if msg.get("role") == "user":
+                            system_knowledge += f"Q: {msg.get('content', '')}\n"
+                        elif msg.get("role") == "assistant":
+                            system_knowledge += f"A: {msg.get('content', '')}\n"
+                elif "role" in pair and "content" in pair:
+                    system_knowledge += f"{pair['role'].upper()}: {pair['content']}\n"
+
+        modelfile_content = f"""FROM {model_name}
+SYSTEM {system_knowledge}"""
+
+        # Save temporary modelfile
+        temp_dir = os.path.join(os.path.dirname(__file__), "temp_training")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        modelfile_path = os.path.join(temp_dir, f"Modelfile_{timestamp}")
+
+        with open(modelfile_path, "w") as f:
+            f.write(modelfile_content)
+
+        # Create the trained model via Ollama API
+        new_model_name = f"{model_name.split(':')[0]}_trained_{timestamp}:latest"
+
+        with open(modelfile_path, "rb") as f:
+            url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/create"
+            files = {"Modelfile": f}
+            params = {"name": new_model_name}
+
+            resp = requests.post(url, params=params, files=files, timeout=300)
+            resp.raise_for_status()
+
+        # Clean up temporary file
+        try:
+            os.remove(modelfile_path)
+        except:
+            pass
+
+        # Register the new model in database
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            
+            # Get the base family from the parent model
+            c.execute("SELECT base_family FROM model_versions WHERE model_name = ?", (model_name,))
+            family_row = c.fetchone()
+            base_family = family_row[0] if family_row else "llama"
+            
+            # Insert the new fine-tuned model
+            c.execute("""
+                INSERT INTO model_versions 
+                (model_name, base_family, parent_model, creation_timestamp, training_file_name)
+                VALUES (?, ?, ?, ?, ?)
+            """, (new_model_name, base_family, model_name, datetime.datetime.now().isoformat(), training_file.filename))
+            
+            conn.commit()
+            conn.close()
+            print(f"Registered new model {new_model_name} in family {base_family}")
+        except Exception as e:
+            print(f"Error registering model in database: {e}")
+
+        return {
+            "message": "Model training initiated successfully",
+            "original_model": model_name,
+            "new_model": new_model_name,
+            "training_file": training_file.filename,
+            "training_pairs_count": len(training_pairs),
+            "timestamp": timestamp,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Training failed: {str(e)}")
 
 
 # ------------------- Startup -------------------
