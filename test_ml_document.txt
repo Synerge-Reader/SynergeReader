@@ -1,0 +1,28 @@
+Machine Learning Fundamentals
+
+Chapter 1: Introduction to Neural Networks
+
+Neural networks are computing systems inspired by biological neural networks. They consist of interconnected nodes called neurons that process information through their connections. Each neuron receives input signals, processes them, and produces an output signal.
+
+The basic structure of a neural network includes:
+- Input layer: Receives the initial data
+- Hidden layers: Process the information
+- Output layer: Produces the final result
+
+Chapter 2: Deep Learning Concepts
+
+Deep learning is a subset of machine learning that uses neural networks with multiple layers. These deep neural networks can learn hierarchical representations of data, making them particularly effective for complex tasks like image recognition and natural language processing.
+
+Key advantages of deep learning:
+- Automatic feature extraction
+- Scalability with data
+- State-of-the-art performance on many tasks
+
+Chapter 3: Training Neural Networks
+
+Training a neural network involves adjusting the weights of connections between neurons to minimize the difference between predicted and actual outputs. This process uses optimization algorithms like gradient descent and backpropagation.
+
+Important training concepts:
+- Loss function: Measures prediction error
+- Learning rate: Controls the size of weight updates
+- Epochs: Number of complete passes through the training data

@@ -1,10 +1,22 @@
 import React, { useEffect } from "react";
 
-const TextPreview = ({ documents = [], onSelect }) => {
-  const handleMouseUp = () => {
+const TextPreview = ({ documents = [], onSelect, currentDocumentName = null }) => {
+  const handleMouseUp = (event, documentName) => {
     const selection = window.getSelection();
     if (selection && selection.toString().trim()) {
-      onSelect && onSelect(selection.toString());
+      const selectedText = selection.toString().trim();
+      
+      // Create selection object with metadata
+      const selectionObject = {
+        id: `sel_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        text: selectedText,
+        documentName: documentName,
+        timestamp: Date.now(),
+      };
+
+      // Always add to selections (multi-select by default)
+      // User can clear selections using the Clear All button
+      onSelect && onSelect(selectionObject, true);
     }
   };
 
@@ -81,7 +93,7 @@ const TextPreview = ({ documents = [], onSelect }) => {
                 {doc.citation.doi_url && <span>[{doc.citation.doi_url}]</span>}
               </div>
             )}
-            <div onMouseUp={handleMouseUp}>
+            <div onMouseUp={(e) => handleMouseUp(e, doc.name)}>
               {doc.text ? doc.text.substring(0, 10000) : "No text parsed yet."}
             </div>
           </div>

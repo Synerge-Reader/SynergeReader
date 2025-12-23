@@ -12,12 +12,13 @@ import Markdown from "react-markdown";
 import SurveyModal from "./components/Survey/SurveyModal.jsx";
 import CorrectionModal from "./components/CorrectionModal/CorrectionModal.jsx";
 import AdminDashboard from "./components/AdminDashboard/AdminDashboard.jsx";
+import MultiTextSelector from "./components/MultiTextSelector.js";
 import './GridApp.css'
 import './App.css'
 
 const GridApp = () => {
   const [parsedDocuments, setParsedDocuments] = useState([]);
-  const [selectedText, setSelectedText] = useState("");
+  const [selectedTexts, setSelectedTexts] = useState([]); // Changed from selectedText to selectedTexts array
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
   const [backendMsg, setBackendMsg] = useState("");
@@ -89,10 +90,15 @@ const GridApp = () => {
     setIsLoading(true);
     try {
       // If no text is selected, use all parsed documents' text
-      let textToSend = selectedText;
+      let textToSend = "";
 
-      if (!selectedText || selectedText.trim() === "") {
-        // Concatenate all document texts
+      if (selectedTexts && selectedTexts.length > 0) {
+        // Concatenate all selections with document context markers
+        textToSend = selectedTexts.map((sel, idx) =>
+          `[Selection ${idx + 1} from: ${sel.documentName}]\n${sel.text}`
+        ).join('\n\n---\n\n');
+      } else {
+        // Fallback: Concatenate all document texts
         textToSend = parsedDocuments.map(doc => doc.text).join('\n\n---\n\n');
       }
 
@@ -127,9 +133,9 @@ const GridApp = () => {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        
+
         const chunk = decoder.decode(value, { stream: true });
-        
+
         // Handle context metadata
         if (chunk.includes("__CONTEXT__") && !contextProcessed) {
           const contextMatch = chunk.match(/__CONTEXT__({.+?})__/s);
@@ -143,7 +149,7 @@ const GridApp = () => {
               citationNote = contextData.citation_note || "No external sources used";
               similarityScore = contextData.similarity_score || 0;
               contextProcessed = true;
-              
+
               console.log("DEBUG [Frontend]: Context parsed, starting stream display");
               setIsLoading(false);
             } catch (e) {
@@ -152,7 +158,7 @@ const GridApp = () => {
           }
           continue;
         }
-        
+
         // Skip control markers
         if (chunk.includes("__READY__") || chunk.includes("__ENTRY_ID__")) {
           const entryIdMatch = chunk.match(/__ENTRY_ID__(\d+)__/);
@@ -161,18 +167,18 @@ const GridApp = () => {
           }
           continue;
         }
-        
+
         // Skip error markers
         if (chunk.includes("__ERROR__")) {
           continue;
         }
-        
+
         // Clean up the chunk (remove newlines used as delimiters)
         const cleanChunk = chunk.replace(/\n$/, "");
         if (cleanChunk) {
           fullText += cleanChunk;
           console.log(`DEBUG [Frontend]: Streaming token, fullText length: ${fullText.length}`);
-          
+
           // Update UI in real-time as we receive tokens
           setAnswer({
             question,
@@ -185,7 +191,7 @@ const GridApp = () => {
             similarity_score: similarityScore,
             relevant_history: [],
           });
-          
+
           // Small delay to allow React to render
           await new Promise(resolve => setTimeout(resolve, 5));
         }
@@ -219,8 +225,22 @@ const GridApp = () => {
     }
   };
 
-  const handleTextSelection = (text) => {
-    setSelectedText(text);
+  const handleTextSelection = (selectionObject, isMultiSelect) => {
+    if (isMultiSelect) {
+      // Append to existing selections
+      setSelectedTexts(prev => [...prev, selectionObject]);
+    } else {
+      // Replace all selections with new one
+      setSelectedTexts([selectionObject]);
+    }
+  };
+
+  const handleRemoveSelection = (selectionId) => {
+    setSelectedTexts(prev => prev.filter(sel => sel.id !== selectionId));
+  };
+
+  const handleClearAllSelections = () => {
+    setSelectedTexts([]);
   };
 
 
@@ -391,21 +411,13 @@ const GridApp = () => {
                 </>
               ) : (
                 <>
-                  {selectedText && (
-                    <div
-                      style={{
-                        margin: "12px auto",
-                        maxWidth: 600,
-                        color: "#3b4ca0",
-                        background: "#f0f4ff",
-                        padding: 12,
-                        borderRadius: 6,
-                      }}
-                    >
-                      <strong>Selected Text:</strong>{" "}
-                      {selectedText.substring(0, 200)}
-                      {selectedText.length > 200 ? "..." : ""}
-                    </div>
+                  {/* Multi-Text Selector Component */}
+                  {selectedTexts && selectedTexts.length > 0 && (
+                    <MultiTextSelector
+                      selections={selectedTexts}
+                      onRemoveSelection={handleRemoveSelection}
+                      onClearAll={handleClearAllSelections}
+                    />
                   )}
 
                   {answer && (
@@ -618,7 +630,7 @@ const GridApp = () => {
                 open
                 onClose={() => setAskOpen(false)}
                 onAsk={handleAsk}
-                selectedText={selectedText}
+                selectedText={selectedTexts.length > 0 ? `${selectedTexts.length} selection(s)` : ""}
               />
             </div>
           </div>
