@@ -5,7 +5,7 @@ import mammoth from "mammoth";
 import Dropdown from "./Dropdown/Dropdown.jsx";
 
 GlobalWorkerOptions.workerSrc = new URL(
-  "pdfjs-dist/build/pdf.worker.min.mjs",
+  "pdfjs-dist/build/pdf.worker.min.js",
   import.meta.url,
 ).toString();
 

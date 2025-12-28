@@ -3,12 +3,14 @@ import "./Notifier.css";
 
 export default function Notifier({ message, duration = 3000, setNotification }) {
   useEffect(() => {
+    if (!message) return;
+    
     const timer = setTimeout(() => {
       setNotification('');
     }, duration);
 
     return () => clearTimeout(timer);
-  }, [duration]);
+  }, [duration, message, setNotification]);
 
   if (!message) return null;
 
