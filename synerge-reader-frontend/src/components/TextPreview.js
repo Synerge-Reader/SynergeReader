@@ -108,7 +108,7 @@ const TextPreview = ({ documents = [], onSelect, currentDocumentName = null }) =
                 <Viewer
                   fileUrl={documents[activeTabIndex].url}
                   plugins={[zoomPluginRef.current]}
-                  defaultScale={1.2}
+                  defaultScale={1}
                 />
               </div>
             )}
