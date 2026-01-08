@@ -1,11 +1,18 @@
-import React, { useEffect } from "react";
+import React, { useEffect, useState } from "react";
+import { Viewer } from '@react-pdf-viewer/core';
+import { zoomPlugin } from '@react-pdf-viewer/zoom';
+import '@react-pdf-viewer/core/lib/styles/index.css';
+import '@react-pdf-viewer/zoom/lib/styles/index.css';
 
 const TextPreview = ({ documents = [], onSelect, currentDocumentName = null }) => {
+  const zoomPluginRef = React.useRef(zoomPlugin());
+  const [activeTabIndex, setActiveTabIndex] = useState(0);
+
   const handleMouseUp = (event, documentName) => {
     const selection = window.getSelection();
     if (selection && selection.toString().trim()) {
       const selectedText = selection.toString().trim();
-      
+
       // Create selection object with metadata
       const selectionObject = {
         id: `sel_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -20,7 +27,7 @@ const TextPreview = ({ documents = [], onSelect, currentDocumentName = null }) =
     }
   };
 
-  // Cleanup URLs when component unmounts or documents change
+  // Cleanup URLs only when component unmounts
   useEffect(() => {
     return () => {
       documents.forEach(doc => {
@@ -29,7 +36,7 @@ const TextPreview = ({ documents = [], onSelect, currentDocumentName = null }) =
         }
       });
     };
-  }, [documents]);
+  }, []);
 
   if (!documents || documents.length === 0) {
     return (
@@ -49,34 +56,87 @@ const TextPreview = ({ documents = [], onSelect, currentDocumentName = null }) =
     <div className="alpha-preview-card" role="region" aria-label="Document previews">
       <div className="alpha-preview-title">
         Document Previews
-        {documents.length > 0 && (
-          <div className="file-info">
-            Uploaded:{" "}
-            <span>{documents.map((d) => d.name).join(", ")}</span>
-          </div>
-        )}
         <hr />
       </div>
-      <div className="alpha-preview-text" style={{ userSelect: 'text' }}>
-        {documents.map((doc) => (
-          <div key={doc.name} style={{ marginBottom: '24px' }}>
-            <h4>{doc.name}</h4>
+      
+      {/* Tab Navigation */}
+      <div style={{
+        display: 'flex',
+        borderBottom: '2px solid #ddd',
+        overflowX: 'auto',
+        backgroundColor: '#f9f9f9'
+      }}>
+        {documents.map((doc, index) => (
+          <button
+            key={doc.name}
+            onClick={() => setActiveTabIndex(index)}
+            style={{
+              padding: '12px 16px',
+              border: 'none',
+              backgroundColor: activeTabIndex === index ? '#fff' : '#f9f9f9',
+              borderBottom: activeTabIndex === index ? '3px solid #007bff' : 'none',
+              color: activeTabIndex === index ? '#007bff' : '#666',
+              cursor: 'pointer',
+              fontSize: '14px',
+              fontWeight: activeTabIndex === index ? '600' : '400',
+              whiteSpace: 'nowrap',
+              transition: 'all 0.2s ease'
+            }}
+          >
+            {doc.name}
+          </button>
+        ))}
+      </div>
 
-            {/* Display document in iframe if URL is available */}
-            {doc.url && doc.type === 'application/pdf' && (
-              <iframe
-                title={`viewer-${doc.name}`}
-                src={doc.url}
+      {/* Tab Content */}
+      <div className="alpha-preview-text" style={{ userSelect: 'text' }}>
+        {documents[activeTabIndex] && (
+          <div style={{ marginBottom: '24px' }}>
+            {/* Display PDF with React PDF Viewer if URL is available */}
+            {documents[activeTabIndex].url && documents[activeTabIndex].type === 'application/pdf' && (
+              <div
                 style={{
                   width: '100%',
-                  height: '600px',
+                  height: '800px',
                   border: '1px solid #ccc',
-                  marginBottom: '16px'
+                  marginBottom: '16px',
+                  display: 'flex',
+                  flexDirection: 'column'
                 }}
-              />
+                onMouseUp={(e) => handleMouseUp(e, documents[activeTabIndex].name)}
+              >
+                <Viewer
+                  fileUrl={documents[activeTabIndex].url}
+                  plugins={[zoomPluginRef.current]}
+                  defaultScale={1}
+                />
+              </div>
             )}
 
-            {doc.citation && (doc.citation.title || doc.citation.author) && (
+            {/* Display raw text for .txt files */}
+            {documents[activeTabIndex].type === 'text/plain' && (
+              <div
+                style={{
+                  width: '100%',
+                  height: '800px',
+                  border: '1px solid #ccc',
+                  marginBottom: '16px',
+                  padding: '16px',
+                  overflowY: 'auto',
+                  backgroundColor: '#f5f5f5',
+                  fontFamily: 'monospace',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  fontSize: '14px',
+                  lineHeight: '1.5'
+                }}
+                onMouseUp={(e) => handleMouseUp(e, documents[activeTabIndex].name)}
+              >
+                {documents[activeTabIndex].text || 'No text content available.'}
+              </div>
+            )}
+
+            {documents[activeTabIndex].citation && (documents[activeTabIndex].citation.title || documents[activeTabIndex].citation.author) && (
               <div className="citation-info" style={{
                 fontSize: '0.85em',
                 color: '#555',
@@ -86,18 +146,15 @@ const TextPreview = ({ documents = [], onSelect, currentDocumentName = null }) =
                 marginBottom: '8px'
               }}>
                 <strong>Citation: </strong>
-                {doc.citation.title && <span>"{doc.citation.title}" </span>}
-                {doc.citation.author && <span>by {doc.citation.author} </span>}
-                {doc.citation.publication_date && <span>({doc.citation.publication_date}) </span>}
-                {doc.citation.source && <span>- {doc.citation.source} </span>}
-                {doc.citation.doi_url && <span>[{doc.citation.doi_url}]</span>}
+                {documents[activeTabIndex].citation.title && <span>"{documents[activeTabIndex].citation.title}" </span>}
+                {documents[activeTabIndex].citation.author && <span>by {documents[activeTabIndex].citation.author} </span>}
+                {documents[activeTabIndex].citation.publication_date && <span>({documents[activeTabIndex].citation.publication_date}) </span>}
+                {documents[activeTabIndex].citation.source && <span>- {documents[activeTabIndex].citation.source} </span>}
+                {documents[activeTabIndex].citation.doi_url && <span>[{documents[activeTabIndex].citation.doi_url}]</span>}
               </div>
             )}
-            <div onMouseUp={(e) => handleMouseUp(e, doc.name)}>
-              {doc.text ? doc.text.substring(0, 10000) : "No text parsed yet."}
-            </div>
           </div>
-        ))}
+        )}
       </div>
     </div>
   );
