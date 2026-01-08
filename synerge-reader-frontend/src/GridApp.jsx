@@ -306,17 +306,16 @@ const GridApp = () => {
         {/* Upload / Preview */}
         <div className="div1">
           <div className="doc-section">
+            {/* Always show FileUpload - either as main view or as compact upload button */}
+            <FileUpload
+              onFileParsed={handleFileParsed}
+              setIsLoading={setIsLoading}
+              setError={setError}
+              model={model}
+              setModel={setModel}
+              isCompact={parsedDocuments.length > 0}
+            />
 
-            {parsedDocuments.length === 0 && (
-              <FileUpload
-                onFileParsed={handleFileParsed}
-                setIsLoading={setIsLoading}
-                setError={setError}
-                model={model}
-                setModel={setModel}
-              />
-
-            )}
             {error && <div className="error-message">{error}</div>}
             {/*  {isLoading && <div className="loading-spinner">Processing...</div>} */}
 
