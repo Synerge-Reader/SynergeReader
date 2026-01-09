@@ -15,6 +15,7 @@ export default function FileUpload({
   setError,
   model,
   setModel,
+  isCompact = false,
 }) {
   const fileInputRef = useRef();
   const [isDragging, setIsDragging] = useState(false);
@@ -231,6 +232,89 @@ export default function FileUpload({
 
   const displayName = modelDisplayNames[model] || model;
 
+  // Compact mode: show a small upload bar when documents are already uploaded
+  if (isCompact) {
+    return (
+      <div
+        className={`compact-upload-bar${isDragging ? " dragging" : ""}`}
+        onDragOver={handleDragEnter}
+        onDrop={handleDrop}
+        onDragEnter={handleDragEnter}
+        onDragLeave={handleDragLeave}
+        role="region"
+        aria-label="Add more documents"
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          padding: '12px 20px',
+          background: isDragging ? '#e8f4fd' : '#f8fafc',
+          borderRadius: '12px',
+          border: isDragging ? '2px dashed #3b82f6' : '2px dashed #cbd5e1',
+          marginBottom: '16px',
+          gap: '16px',
+          transition: 'all 0.3s ease',
+          flexWrap: 'wrap'
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <img
+            src="/uploadIcon.svg"
+            alt="Upload icon"
+            style={{ width: '28px', height: '28px', filter: 'grayscale(1) opacity(0.6)' }}
+          />
+          <span style={{ color: '#64748b', fontSize: '0.95rem' }}>
+            <strong>Add more documents</strong> - Drag & drop or click to browse
+          </span>
+        </div>
+
+        <input
+          type="file"
+          accept=".pdf,.docx,.txt,.json"
+          multiple
+          ref={fileInputRef}
+          onChange={handleFileChange}
+          style={{ display: "none" }}
+          id="file-upload-compact"
+        />
+
+        <button
+          onClick={() => fileInputRef.current.click()}
+          aria-label="Add more files"
+          style={{
+            background: 'linear-gradient(135deg, #3b82f6, #1d4ed8)',
+            color: 'white',
+            border: 'none',
+            padding: '10px 20px',
+            borderRadius: '8px',
+            cursor: 'pointer',
+            fontWeight: '600',
+            fontSize: '0.9rem',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+            boxShadow: '0 2px 8px rgba(59, 130, 246, 0.3)',
+            transition: 'all 0.2s ease'
+          }}
+          onMouseOver={(e) => {
+            e.currentTarget.style.transform = 'translateY(-1px)';
+            e.currentTarget.style.boxShadow = '0 4px 12px rgba(59, 130, 246, 0.4)';
+          }}
+          onMouseOut={(e) => {
+            e.currentTarget.style.transform = 'translateY(0)';
+            e.currentTarget.style.boxShadow = '0 2px 8px rgba(59, 130, 246, 0.3)';
+          }}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 5v14M5 12h14" />
+          </svg>
+          Add Files
+        </button>
+      </div>
+    );
+  }
+
+  // Full upload card view for initial upload
   return (
     <div
       className={`alpha-upload-card${isDragging ? " dragging" : ""}`}
