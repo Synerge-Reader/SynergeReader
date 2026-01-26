@@ -1,9 +1,9 @@
 version: "3.8"
-
 networks:
   default:
     external: true
     name: agent_network
+
 services:
   backend:
     build:
@@ -12,9 +12,9 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      - ./synerge-reader-backend:/app # host code
-      - chroma_data:/app/chroma_db # persistent Chroma DB
-      - sqlite_data:/app/db # persistent SQLite DB
+      - ./synerge-reader-backend:/app
+      - chroma_data:/app/chroma_db
+      - sqlite_data:/app/db
     environment:
       - PYTHONUNBUFFERED=1
       - OLLAMA_HOST=${OLLAMA_HOST}
@@ -35,6 +35,20 @@ services:
       - REACT_APP_BACKEND_URL=${REACT_APP_BACKEND_URL}
       - REACT_APP_GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
     depends_on:
+      - backend
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    container_name: nginx-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - frontend
       - backend
     restart: unless-stopped
 
