@@ -3,7 +3,6 @@ networks:
   default:
     external: true
     name: agent_network
-
 services:
   backend:
     build:
@@ -21,23 +20,21 @@ services:
       - OLLAMA_PORT=${OLLAMA_PORT}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
     restart: unless-stopped
-
   frontend:
     build:
       context: ./synerge-reader-frontend
       dockerfile: Dockerfile
+      args:
+        - REACT_APP_BACKEND_URL=${REACT_APP_BACKEND_URL}
+        - REACT_APP_GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
     ports:
       - "3000:3000"
     volumes:
       - ./synerge-reader-frontend:/app
       - /app/node_modules
-    environment:
-      - REACT_APP_BACKEND_URL=${REACT_APP_BACKEND_URL}
-      - REACT_APP_GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
     depends_on:
       - backend
     restart: unless-stopped
-
   nginx:
     image: nginx:alpine
     container_name: nginx-proxy
@@ -51,7 +48,6 @@ services:
       - frontend
       - backend
     restart: unless-stopped
-
 volumes:
   chroma_data:
   sqlite_data:
