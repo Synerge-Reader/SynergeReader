@@ -87,7 +87,7 @@ function Top({ setOpenAuth, authToken, setAuthToken, setHistory, model, setModel
             )}
           </div>
 
-          <h3>Community Papers</h3>
+          <h3>User guide</h3>
 
           {isAdmin && authToken && (
             <button
