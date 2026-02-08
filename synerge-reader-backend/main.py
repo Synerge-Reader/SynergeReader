@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from schemas import AskRequest, AskResponse, CorrectionRequest, RatingRequest
 import sqlite3
 import os
 import datetime
@@ -237,9 +238,11 @@ class RatingRequest(BaseModel):
 class RegisterRequest(BaseModel):
     username: str
     password: str
+    email: str
 
 
 class LoginRequest(BaseModel):
+    email: str
     username: str
     password: str
 
