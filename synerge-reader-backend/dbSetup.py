@@ -1,10 +1,7 @@
-import sqlite3
 import os
 import psycopg2
 import sys
 from dotenv import load_dotenv
-DB_PATH = os.path.join(os.path.dirname(__file__), "synerge_reader.db")
-
 
 
 def connect_to_postgres():
@@ -36,9 +33,12 @@ def test_postgres_connection():
 
 def init_db():
     conn = connect_to_postgres()
-    cursor = conn.cursor()
+    if conn is None:
+        print(" Failed to connect to PostgreSQL. Exiting")
+        sys.exit(1)
 
-   # Users (must be first)
+    cursor = conn.cursor()
+   # Users 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY,
@@ -106,14 +106,9 @@ def init_db():
     """)
 
     # Insert anonymous user
-    cursor.execute(
-        "INSERT INTO users (id, username) VALUES (0, 'anonymous') ON CONFLICT (id) DO NOTHING"
-    )
+   # cursor.execute("INSERT INTO users (id, username) VALUES (0, 'anonymous') ON CONFLICT (id) DO NOTHING")
 
-    cursor.execute(
-        "ALTER TABLE users ADD COLUMN email TEXT UNIQUE"
-    )
-    
+
     conn.commit()
     conn.close()
 
