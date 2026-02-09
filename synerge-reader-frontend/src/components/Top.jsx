@@ -87,7 +87,14 @@ function Top({ setOpenAuth, authToken, setAuthToken, setHistory, model, setModel
             )}
           </div>
 
-          <h3>User guide</h3>
+          <h3> <a
+            href="/SynergeReader User Guide.pdf"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ textDecoration: "none", color: "inherit" }}
+            g >  User guide</a>
+            </h3>
+          <h3>Community Papers</h3>
 
           {isAdmin && authToken && (
             <button
