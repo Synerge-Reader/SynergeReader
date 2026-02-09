@@ -1,25 +1,25 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from schemas import AskRequest, AskResponse, CorrectionRequest, RatingRequest
+from schemas import AskRequest, AskResponse, CorrectionRequest, RatingRequest,GoogleLoginRequest,LoginRequest,RegisterRequest
+from schemas import HistoryItem,HistoryRequest, KnowledgeItem,KnowledgeInsertRequest
 import sqlite3
 import os
 import datetime
 from typing import List, Optional
+from dbSetup import init_db,connect_to_postgres,test_postgres_connection
 import requests
 import json
 from pydantic import BaseModel
 import bcrypt
 import secrets
+import psycopg2
 import numpy as np
 from dotenv import load_dotenv
 import re
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 from dotenv import load_dotenv
-
-load_dotenv()
-
 
 load_dotenv()
 
@@ -199,150 +199,8 @@ def format_apa_citation(citation_data: dict, source_type: str = "document") -> s
         return ". ".join(parts) if parts else "No citation information available"
 
 
-# ------------------- Pydantic Models -------------------
 
 
-class AskRequest(BaseModel):
-    selected_text: str
-    question: str
-    model: str
-    auth_token: Optional[str] = None
-
-
-class AskResponse(BaseModel):
-    id: int
-    answer: str
-    question: str
-    context_chunks: List[str]
-    relevant_history: List[dict]
-
-
-class HistoryItem(BaseModel):
-    id: int
-    timestamp: str
-    selected_text: str
-    question: str
-    answer: str
-
-
-class HistoryRequest(BaseModel):
-    token: Optional[str] = None
-
-
-class RatingRequest(BaseModel):
-    id: int
-    rating: int
-    comment: str
-
-
-class RegisterRequest(BaseModel):
-    username: str
-    password: str
-    email: str
-
-
-class LoginRequest(BaseModel):
-    email: str
-    username: str
-    password: str
-
-
-class GoogleLoginRequest(BaseModel):
-    token: str
-
-
-class CorrectionRequest(BaseModel):
-    chat_id: int
-    corrected_answer: str
-    comment: Optional[str] = None
-
-
-class KnowledgeItem(BaseModel):
-    question: str
-    answer: str
-    source: Optional[str] = None
-
-
-class KnowledgeInsertRequest(BaseModel):
-    items: List[KnowledgeItem]
-
-
-# ------------------- Database Initialization -------------------
-
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-
-    # Chat history
-    c.execute("""CREATE TABLE IF NOT EXISTS chat_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        ts TEXT NOT NULL,
-        selected_text TEXT NOT NULL,
-        question TEXT NOT NULL,
-        answer TEXT NOT NULL,
-        rating INTEGER,
-        comment TEXT,
-        FOREIGN KEY (user_id) REFERENCES users (id)
-    )""")
-
-    # Documents
-    c.execute("""CREATE TABLE IF NOT EXISTS documents (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        filename TEXT NOT NULL,
-        upload_timestamp TEXT NOT NULL,
-        content TEXT NOT NULL,
-        author TEXT,
-        title TEXT,
-        publication_date TEXT,
-        source TEXT,
-        doi_url TEXT
-    )""")
-
-    # Document chunks
-    c.execute("""CREATE TABLE IF NOT EXISTS document_chunks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        document_id INTEGER,
-        chunk_text TEXT NOT NULL,
-        chunk_index INTEGER,
-        embedding_json TEXT,
-        FOREIGN KEY (document_id) REFERENCES documents (id)
-    )""")
-
-    # Users
-    c.execute("""CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY,
-        username TEXT UNIQUE,
-        password TEXT,
-        token TEXT,
-        is_admin INTEGER DEFAULT 0
-    )""")
-
-    # Knowledge base table
-    c.execute("""CREATE TABLE IF NOT EXISTS knowledge_base (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        question TEXT NOT NULL,
-        original_answer TEXT,
-        corrected_answer TEXT NOT NULL,
-        created_at TEXT,
-        chat_history_id INTEGER,
-        context_text TEXT
-    )""")
-
-    # Insert anonymous user
-    c.execute(
-        "INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (0, "anonymous")
-    )
-
-    # Add is_admin column if it doesn't exist (for migration)
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-
-    conn.commit()
-    conn.close()
 
 
 # ------------------- Utilities -------------------
@@ -584,8 +442,6 @@ async def hash_password(password: str) -> str:
     salt = bcrypt.gensalt()
     return bcrypt.hashpw(password.encode("utf-8"), salt).decode()
 
-
-# ------------------- API Endpoints -------------------
 
 
 @app.post("/upload")
@@ -1106,10 +962,6 @@ async def google_login(request: GoogleLoginRequest):
     except Exception as e:
         raise HTTPException(500, f"Google login error: {str(e)}")
 
-
-# ------------------- New Endpoints -------------------
-
-
 @app.post("/submit_correction")
 async def submit_correction(request: CorrectionRequest):
     try:
@@ -1357,7 +1209,6 @@ async def test_endpoint():
 # ------------------- Startup -------------------
 
 init_db()
-
 if __name__ == "__main__":
     import uvicorn
 
