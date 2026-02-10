@@ -24,8 +24,9 @@ const AskModal = ({ open, onClose, onAsk, selectedText }) => {
               onChange={e => setQuestion(e.target.value)}
               rows={4}
               style={{
-                width: '100%',
-                justifyContent: 'center',
+                width: '90%',
+                display: 'block',
+                margin: '0 auto',
                 padding: 12,
                 border: '1px solid #ddd',
                 borderRadius: 4,
