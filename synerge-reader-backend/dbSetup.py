@@ -55,7 +55,6 @@ def init_db():
     );
     """)
 
-    cursor.execute("ALTER TABLE users ADD COLUMN email TEXT UNIQUE")
 
 
 

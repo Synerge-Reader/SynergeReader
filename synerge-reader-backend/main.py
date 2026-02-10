@@ -481,7 +481,8 @@ async def upload_documents(
             c.execute(
              """INSERT INTO documents
             (filename, upload_timestamp, content, author, title, publication_date, source, doi_url)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id""",
             (
             f.filename,
             datetime.datetime.now().isoformat(),
@@ -494,7 +495,7 @@ async def upload_documents(
             ),
             )
 
-            doc_id = c.lastrowid
+            doc_id = c.fetchone()[0]
 
             for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
                c.execute("INSERT INTO document_chunks (document_id, chunk_text, chunk_index, embedding_json) VALUES (%s, %s, %s, %s)", (doc_id, chunk, i, json.dumps(emb)))
@@ -522,6 +523,7 @@ async def upload_documents(
             results.append({"error": str(e), "filename": f.filename})
 
     return results
+
 
 
 @app.post("/ask")
@@ -695,7 +697,6 @@ async def ask_question(request: AskRequest):
             "temperature": 0.7,
             "stream": True,
         }
-
         try:
             with requests.post(url, json=payload, stream=True, timeout=60) as r:
                 r.raise_for_status()
@@ -750,8 +751,22 @@ async def ask_question(request: AskRequest):
                 if row:
                     user_id = row[0]
 
-            c.execute("INSERT INTO chat_history (ts, selected_text, question, answer, user_id) VALUES (%s, %s, %s, %s, %s)", (datetime.datetime.now().isoformat(), request.selected_text, request.question, full_answer, user_id))
-            entry_id = c.lastrowid
+            c.execute(
+                """
+                INSERT INTO chat_history (ts, selected_text, question, answer, user_id)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    datetime.datetime.now().isoformat(),
+                    request.selected_text,
+                    request.question,
+                    full_answer,
+                    user_id,
+                )
+            )
+
+            entry_id = c.fetchone()[0]
             conn.commit()
             conn.close()
 
@@ -760,13 +775,14 @@ async def ask_question(request: AskRequest):
             yield "__ERROR__Database error__"
 
     return StreamingResponse(
-        stream_generate(), 
+        stream_generate(),
         media_type="text/plain",
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no"
         }
     )
+
 
 
 @app.post("/history", response_model=List[HistoryItem])
