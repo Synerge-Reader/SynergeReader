@@ -1,25 +1,26 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from schemas import AskRequest, AskResponse, CorrectionRequest, RatingRequest
-import sqlite3
+from schemas import AskRequest, AskResponse, CorrectionRequest, RatingRequest,GoogleLoginRequest,LoginRequest,RegisterRequest
+from schemas import HistoryItem,HistoryRequest, KnowledgeItem,KnowledgeInsertRequest,ForgotPasswordRequest
 import os
+import string
 import datetime
 from typing import List, Optional
+from dbSetup import init_db,connect_to_postgres,test_postgres_connection
 import requests
 import json
 from pydantic import BaseModel
 import bcrypt
 import secrets
+import psycopg2
 import numpy as np
 from dotenv import load_dotenv
 import re
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
+import resend 
 from dotenv import load_dotenv
-
-load_dotenv()
-
 
 load_dotenv()
 
@@ -37,10 +38,11 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "172.18.0.1")
 OLLAMA_PORT = os.getenv("OLLAMA_PORT", "11434")
 DB_PATH = os.path.join(os.path.dirname(__file__), "synerge_reader.db")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+resend.api_key = os.getenv("EMAIL_KEY")
 
 # Cosine similarity threshold for determining if document context is sufficient
 # If the best similarity score is below this, we'll use external RAG sources
-SIMILARITY_THRESHOLD = 0.75
+SIMILARITY_THRESHOLD = 0.85
 
 
 def perform_web_search(query: str, num_results: int = 3) -> List[dict]:
@@ -199,150 +201,8 @@ def format_apa_citation(citation_data: dict, source_type: str = "document") -> s
         return ". ".join(parts) if parts else "No citation information available"
 
 
-# ------------------- Pydantic Models -------------------
 
 
-class AskRequest(BaseModel):
-    selected_text: str
-    question: str
-    model: str
-    auth_token: Optional[str] = None
-
-
-class AskResponse(BaseModel):
-    id: int
-    answer: str
-    question: str
-    context_chunks: List[str]
-    relevant_history: List[dict]
-
-
-class HistoryItem(BaseModel):
-    id: int
-    timestamp: str
-    selected_text: str
-    question: str
-    answer: str
-
-
-class HistoryRequest(BaseModel):
-    token: Optional[str] = None
-
-
-class RatingRequest(BaseModel):
-    id: int
-    rating: int
-    comment: str
-
-
-class RegisterRequest(BaseModel):
-    username: str
-    password: str
-    email: str
-
-
-class LoginRequest(BaseModel):
-    email: str
-    username: str
-    password: str
-
-
-class GoogleLoginRequest(BaseModel):
-    token: str
-
-
-class CorrectionRequest(BaseModel):
-    chat_id: int
-    corrected_answer: str
-    comment: Optional[str] = None
-
-
-class KnowledgeItem(BaseModel):
-    question: str
-    answer: str
-    source: Optional[str] = None
-
-
-class KnowledgeInsertRequest(BaseModel):
-    items: List[KnowledgeItem]
-
-
-# ------------------- Database Initialization -------------------
-
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-
-    # Chat history
-    c.execute("""CREATE TABLE IF NOT EXISTS chat_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        ts TEXT NOT NULL,
-        selected_text TEXT NOT NULL,
-        question TEXT NOT NULL,
-        answer TEXT NOT NULL,
-        rating INTEGER,
-        comment TEXT,
-        FOREIGN KEY (user_id) REFERENCES users (id)
-    )""")
-
-    # Documents
-    c.execute("""CREATE TABLE IF NOT EXISTS documents (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        filename TEXT NOT NULL,
-        upload_timestamp TEXT NOT NULL,
-        content TEXT NOT NULL,
-        author TEXT,
-        title TEXT,
-        publication_date TEXT,
-        source TEXT,
-        doi_url TEXT
-    )""")
-
-    # Document chunks
-    c.execute("""CREATE TABLE IF NOT EXISTS document_chunks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        document_id INTEGER,
-        chunk_text TEXT NOT NULL,
-        chunk_index INTEGER,
-        embedding_json TEXT,
-        FOREIGN KEY (document_id) REFERENCES documents (id)
-    )""")
-
-    # Users
-    c.execute("""CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY,
-        username TEXT UNIQUE,
-        password TEXT,
-        token TEXT,
-        is_admin INTEGER DEFAULT 0
-    )""")
-
-    # Knowledge base table
-    c.execute("""CREATE TABLE IF NOT EXISTS knowledge_base (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        question TEXT NOT NULL,
-        original_answer TEXT,
-        corrected_answer TEXT NOT NULL,
-        created_at TEXT,
-        chat_history_id INTEGER,
-        context_text TEXT
-    )""")
-
-    # Insert anonymous user
-    c.execute(
-        "INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (0, "anonymous")
-    )
-
-    # Add is_admin column if it doesn't exist (for migration)
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-
-    conn.commit()
-    conn.close()
 
 
 # ------------------- Utilities -------------------
@@ -404,7 +264,7 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
 def get_relevant_chunks(question: str, top_k: int = 3) -> List[dict]:
     """Get relevant chunks with citation information"""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_to_postgres()
         c = conn.cursor()
         c.execute("""
             SELECT dc.chunk_text, dc.embedding_json, dc.document_id,
@@ -490,25 +350,20 @@ def get_relevant_history(
     question: str, selected_text: str, token: Optional[str] = None, limit: int = 3
 ) -> List[dict]:
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_to_postgres()
         c = conn.cursor()
 
         user_id = 0
         if token:
-            c.execute("SELECT id FROM users WHERE token = ?", (token,))
+            c.execute("SELECT id FROM users WHERE token = %s", (token,))
             row = c.fetchone()
             if row:
                 user_id = row[0]
 
-        c.execute(
-            "INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (0, "anonymous")
-        )
+        c.execute("INSERT INTO users (id, username) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING", (0, "anonymous"))
         conn.commit()
 
-        c.execute(
-            "SELECT id, ts, selected_text, question, answer FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT 20",
-            (user_id,),
-        )
+        c.execute("SELECT id, ts, selected_text, question, answer FROM chat_history WHERE user_id = %s ORDER BY id DESC LIMIT 20", (user_id,))
         rows = c.fetchall()
         conn.close()
 
@@ -543,7 +398,7 @@ def get_relevant_history(
 def get_relevant_knowledge_base(question: str, limit: int = 3) -> List[dict]:
     """Retrieve relevant knowledge base entries based on question similarity"""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_to_postgres()
         c = conn.cursor()
         c.execute(
             "SELECT id, question, corrected_answer, context_text FROM knowledge_base"
@@ -585,8 +440,6 @@ async def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), salt).decode()
 
 
-# ------------------- API Endpoints -------------------
-
 
 @app.post("/upload")
 async def upload_documents(
@@ -623,30 +476,30 @@ async def upload_documents(
             chunks = chunk_text(text)
             embeddings = embed_chunks(chunks)
 
-            conn = sqlite3.connect(DB_PATH)
+            conn = connect_to_postgres()
             c = conn.cursor()
             c.execute(
-                """INSERT INTO documents 
-                         (filename, upload_timestamp, content, author, title, publication_date, source, doi_url) 
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    f.filename,
-                    datetime.datetime.now().isoformat(),
-                    text,
-                    author,
-                    title,
-                    publication_date,
-                    source,
-                    doi_url,
-                ),
+             """INSERT INTO documents
+            (filename, upload_timestamp, content, author, title, publication_date, source, doi_url)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id""",
+            (
+            f.filename,
+            datetime.datetime.now().isoformat(),
+            text,
+            author,
+            title,
+            publication_date,
+            source,
+            doi_url,
+            ),
             )
-            doc_id = c.lastrowid
+
+            doc_id = c.fetchone()[0]
 
             for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
-                c.execute(
-                    "INSERT INTO document_chunks (document_id, chunk_text, chunk_index, embedding_json) VALUES (?, ?, ?, ?)",
-                    (doc_id, chunk, i, json.dumps(emb)),
-                )
+               c.execute("INSERT INTO document_chunks (document_id, chunk_text, chunk_index, embedding_json) VALUES (%s, %s, %s, %s)", (doc_id, chunk, i, json.dumps(emb)))
+
 
             conn.commit()
             conn.close()
@@ -670,6 +523,7 @@ async def upload_documents(
             results.append({"error": str(e), "filename": f.filename})
 
     return results
+
 
 
 @app.post("/ask")
@@ -843,7 +697,6 @@ async def ask_question(request: AskRequest):
             "temperature": 0.7,
             "stream": True,
         }
-
         try:
             with requests.post(url, json=payload, stream=True, timeout=60) as r:
                 r.raise_for_status()
@@ -888,27 +741,32 @@ async def ask_question(request: AskRequest):
 
         full_answer = "".join(answer_parts)
         try:
-            conn = sqlite3.connect(DB_PATH)
+            conn = connect_to_postgres()
             c = conn.cursor()
 
             user_id = 0
             if request.auth_token:
-                c.execute("SELECT id FROM users WHERE token = ?", (request.auth_token,))
+                c.execute("SELECT id FROM users WHERE token = %s", (request.auth_token,))
                 row = c.fetchone()
                 if row:
                     user_id = row[0]
 
             c.execute(
-                "INSERT INTO chat_history (ts, selected_text, question, answer, user_id) VALUES (?, ?, ?, ?, ?)",
+                """
+                INSERT INTO chat_history (ts, selected_text, question, answer, user_id)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id
+                """,
                 (
                     datetime.datetime.now().isoformat(),
                     request.selected_text,
                     request.question,
                     full_answer,
                     user_id,
-                ),
+                )
             )
-            entry_id = c.lastrowid
+
+            entry_id = c.fetchone()[0]
             conn.commit()
             conn.close()
 
@@ -917,7 +775,7 @@ async def ask_question(request: AskRequest):
             yield "__ERROR__Database error__"
 
     return StreamingResponse(
-        stream_generate(), 
+        stream_generate(),
         media_type="text/plain",
         headers={
             "Cache-Control": "no-cache",
@@ -926,24 +784,25 @@ async def ask_question(request: AskRequest):
     )
 
 
+
 @app.post("/history", response_model=List[HistoryItem])
 async def get_history(request: HistoryRequest):
     user_id = 0
     if request.token:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_to_postgres()
         c = conn.cursor()
-        c.execute("SELECT id FROM users WHERE token = ?", (request.token,))
+        c.execute(
+        "SELECT id FROM users WHERE token = %s",
+        (request.token,)
+        )
         row = c.fetchone()
         if row:
             user_id = row[0]
         conn.close()
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_to_postgres()
         c = conn.cursor()
-        c.execute(
-            "SELECT id, ts, selected_text, question, answer FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT 20",
-            (user_id,),
-        )
+        c.execute("SELECT id, ts, selected_text, question, answer FROM chat_history WHERE user_id = %s ORDER BY id DESC LIMIT 20", (user_id,))
         rows = c.fetchall()
         conn.close()
         return [
@@ -959,7 +818,7 @@ async def get_history(request: HistoryRequest):
 @app.get("/documents")
 async def get_documents():
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_to_postgres()
         c = conn.cursor()
         c.execute("""SELECT id, filename, upload_timestamp, author, title, publication_date, source, doi_url,
                      (SELECT COUNT(*) FROM document_chunks WHERE document_id = documents.id)
@@ -987,12 +846,9 @@ async def get_documents():
 @app.put("/put_ratings")
 async def put_ratings(request: RatingRequest):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_to_postgres()
         c = conn.cursor()
-        c.execute(
-            "UPDATE chat_history SET rating = ?, comment = ? WHERE id = ?",
-            (request.rating, request.comment, request.id),
-        )
+        c.execute("UPDATE chat_history SET rating = %s, comment = %s WHERE id = %s", (request.rating, request.comment, request.id))
         conn.commit()
         conn.close()
         return {"message": "Rating updated", "id": request.id}
@@ -1002,30 +858,98 @@ async def put_ratings(request: RatingRequest):
 
 @app.post("/register")
 async def register(request: RegisterRequest):
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_to_postgres()
     c = conn.cursor()
-    c.execute("SELECT id FROM users WHERE username = ?", (request.username,))
+    c.execute("SELECT id FROM users WHERE username = %s OR email = %s", (request.username,request.email))
     if c.fetchone():
         conn.close()
-        raise HTTPException(400, "Username already exists")
+        raise HTTPException(400, "Username or email already exists")
     hashed = await hash_password(request.password)
     token = secrets.token_hex(32)
+    c.execute("INSERT INTO users (username, password, token,email) VALUES (%s, %s, %s)", (request.username, hashed, token,request.email))
+    conn.commit()
+    conn.close()
+
+    params = { # improve on this message later
+    "from": "Synerge <no-reply@synergereader.ai>",
+    "to": [request.email],
+    "subject": "Welcome to SynergeReader!",
+    "html": """
+        <h2>Welcome to SynergeReader!</h2>
+
+        <p>Your account has been successfully created.</p>
+
+        <p>SynergeReader helps you read, analyze, and interact with documents more intelligently — all in one place.</p>
+
+        <p><b>What you can do next:</b></p>
+        <ul>
+            <li>Upload and read documents</li>
+            <li>Ask questions and get contextual answers</li>
+        </ul>
+
+        <p>A user guide will be available inside the app.</p>
+
+        <p>— The SynergeReader Team</p>
+    """
+    }
+
+    email = resend.Emails.send(params)
+
+    return {"message": "Registered", "token": token}
+
+
+@app.post("/forgot-password")
+async def forgot_password(request: ForgotPasswordRequest):
+    conn = connect_to_postgres()
+    c = conn.cursor()
+
     c.execute(
-        "INSERT INTO users (username, password, token) VALUES (?, ?, ?)",
-        (request.username, hashed, token),
+        "SELECT id, email FROM users WHERE email = %s",
+        (request.email,)
+    )
+    user = c.fetchone()
+
+    if not user:
+        conn.close()
+        raise HTTPException(400, "User not found")
+
+    user_id, email = user
+
+    new_password = ''.join(
+        secrets.choice(string.ascii_letters + string.digits)
+        for _ in range(12)
+    )
+
+    hashed = await hash_password(new_password)
+
+    c.execute(
+        "UPDATE users SET password = %s WHERE id = %s",
+        (hashed, user_id)
     )
     conn.commit()
     conn.close()
-    return {"message": "Registered", "token": token}
+
+    params = {
+    "from": "Synerge <no-reply@synergereader.ai>",
+    "to": [email],
+    "subject": "Your new password",
+    "html": f"""
+        <p>Your password has been reset.</p>
+        <p><b>New password:</b> {new_password}</p>
+        <p>Please log in and change it immediately.</p>
+    """
+}
+
+    email_response = resend.Emails.send(params)
+
+    return {"message": "New password sent to your email"}
 
 
 @app.post("/login")
 async def login(request: LoginRequest):
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_to_postgres()
     c = conn.cursor()
-    c.execute(
-        "SELECT password, token FROM users WHERE username = ?", (request.username,)
-    )
+    c.execute("SELECT password, token FROM users WHERE username = %s", (request.username,))
     row = c.fetchone()
     conn.close()
     if not row or not bcrypt.checkpw(request.password.encode(), row[0].encode()):
@@ -1064,11 +988,11 @@ async def google_login(request: GoogleLoginRequest):
             raise HTTPException(400, "Email not provided by Google")
 
         # Connect to database
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_to_postgres()
         c = conn.cursor()
 
         # Check if user already exists
-        c.execute("SELECT id, token FROM users WHERE username = ?", (email,))
+        c.execute("SELECT id, token FROM users WHERE username = %s", (email,))
         row = c.fetchone()
 
         if row:
@@ -1086,10 +1010,7 @@ async def google_login(request: GoogleLoginRequest):
             app_token = secrets.token_hex(32)
             placeholder_password = secrets.token_hex(32)  # Random, unused password
 
-            c.execute(
-                "INSERT INTO users (username, password, token) VALUES (?, ?, ?)",
-                (email, placeholder_password, app_token),
-            )
+            c.execute("INSERT INTO users (username, password, token) VALUES (%s, %s, %s)", (email, placeholder_password, app_token))
             conn.commit()
             conn.close()
 
@@ -1106,20 +1027,14 @@ async def google_login(request: GoogleLoginRequest):
     except Exception as e:
         raise HTTPException(500, f"Google login error: {str(e)}")
 
-
-# ------------------- New Endpoints -------------------
-
-
 @app.post("/submit_correction")
 async def submit_correction(request: CorrectionRequest):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_to_postgres()
         c = conn.cursor()
 
         # Get original question and answer
-        c.execute(
-            "SELECT question, answer FROM chat_history WHERE id = ?", (request.chat_id,)
-        )
+        c.execute("SELECT question, answer FROM chat_history WHERE id = %s", (request.chat_id,))
         row = c.fetchone()
         if not row:
             conn.close()
@@ -1128,24 +1043,10 @@ async def submit_correction(request: CorrectionRequest):
         question, original_answer = row
 
         # Update chat history
-        c.execute(
-            "UPDATE chat_history SET answer = ?, comment = ? WHERE id = ?",
-            (request.corrected_answer, request.comment, request.chat_id),
-        )
+        c.execute("UPDATE chat_history SET answer = %s, comment = %s WHERE id = %s", (request.corrected_answer, request.comment, request.chat_id))
 
         # Insert into knowledge base
-        c.execute(
-            """INSERT INTO knowledge_base 
-                     (question, original_answer, corrected_answer, created_at, chat_history_id) 
-                     VALUES (?, ?, ?, ?, ?)""",
-            (
-                question,
-                original_answer,
-                request.corrected_answer,
-                datetime.datetime.now().isoformat(),
-                request.chat_id,
-            ),
-        )
+        c.execute("INSERT INTO knowledge_base (question, original_answer, corrected_answer, created_at, chat_history_id) VALUES (%s, %s, %s, %s, %s)", (question, original_answer, request.corrected_answer, datetime.datetime.now().isoformat(), request.chat_id))
 
         conn.commit()
         conn.close()
@@ -1160,7 +1061,7 @@ async def submit_correction(request: CorrectionRequest):
 @app.get("/knowledge_base")
 async def knowledge_base():
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_to_postgres()
         c = conn.cursor()
         c.execute("""SELECT id, question, corrected_answer, created_at, chat_history_id 
                      FROM knowledge_base ORDER BY id DESC""")
@@ -1184,22 +1085,11 @@ async def knowledge_base():
 async def add_knowledge(request: KnowledgeInsertRequest):
     """Add knowledge items directly to knowledge base (for testing/admin purposes)"""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_to_postgres()
         c = conn.cursor()
         for item in request.items:
             # Insert with corrected_answer as the primary answer field
-            c.execute(
-                """INSERT INTO knowledge_base 
-                         (question, original_answer, corrected_answer, created_at, context_text) 
-                         VALUES (?, ?, ?, ?, ?)""",
-                (
-                    item.question,
-                    "",
-                    item.answer,
-                    datetime.datetime.now().isoformat(),
-                    item.source or "",
-                ),
-            )
+            c.execute("INSERT INTO knowledge_base (question, original_answer, corrected_answer, created_at, context_text) VALUES (%s, %s, %s, %s, %s)", (item.question, "", item.answer, datetime.datetime.now().isoformat(), item.source or ""))
         conn.commit()
         conn.close()
         return {"message": f"{len(request.items)} knowledge items added"}
@@ -1214,9 +1104,9 @@ async def check_admin_status(token: Optional[str] = None):
         return {"is_admin": False}
 
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_to_postgres()
         c = conn.cursor()
-        c.execute("SELECT is_admin FROM users WHERE token = ?", (token,))
+        c.execute("SELECT is_admin FROM users WHERE token = %s", (token,))
         row = c.fetchone()
         conn.close()
 
@@ -1234,11 +1124,11 @@ async def get_all_ratings(token: Optional[str] = None):
         raise HTTPException(401, "Unauthorized")
 
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_to_postgres()
         c = conn.cursor()
 
         # Check if user is admin
-        c.execute("SELECT is_admin FROM users WHERE token = ?", (token,))
+        c.execute("SELECT is_admin FROM users WHERE token = %s", (token,))
         row = c.fetchone()
 
         if not row or not row[0]:
@@ -1296,11 +1186,11 @@ async def get_rating_stats(token: Optional[str] = None):
         raise HTTPException(401, "Unauthorized")
 
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_to_postgres()
         c = conn.cursor()
 
         # Check if user is admin
-        c.execute("SELECT is_admin FROM users WHERE token = ?", (token,))
+        c.execute("SELECT is_admin FROM users WHERE token = %s", (token,))
         row = c.fetchone()
 
         if not row or not row[0]:
@@ -1357,7 +1247,6 @@ async def test_endpoint():
 # ------------------- Startup -------------------
 
 init_db()
-
 if __name__ == "__main__":
     import uvicorn
 
