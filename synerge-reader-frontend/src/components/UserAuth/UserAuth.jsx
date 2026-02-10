@@ -5,22 +5,47 @@ import { GoogleLogin } from "@react-oauth/google";
 export default function UserAuth({ setOpenAuth, setAuthToken, setNotification, setOpenSurvey, getHistory }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [email, setEmail] = useState("")
+  const [view, setView] = useState("auth") // auth | forgot
+  const [authMode, setAuthMode] = useState("login") // login | register
 
   const handleAuth = async (endpoint) => {
     try {
-      const res = await fetch(
-        (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") +
-        `/${endpoint}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            username,
-            password,
-          }),
-        }
+      let res = ""
+      if (endpoint == "register") {
+        res = await fetch(
+          (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") +
+          `/${endpoint}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              username,
+              password,
+              email
+            }),
+          }
 
-      );
+        );
+      }
+      else if (endpoint == "login") {
+
+        res = await fetch(
+          (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") +
+          `/${endpoint}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              username,
+              password,
+            }),
+          }
+
+        );
+
+
+      }
 
       if (res.status == 200) {
         const data = await res.json();
@@ -44,7 +69,7 @@ export default function UserAuth({ setOpenAuth, setAuthToken, setNotification, s
     try {
       // credentialResponse.credential is the JWT token from Google
       const googleToken = credentialResponse.credential;
-      
+
       // Send token to backend for verification
       const res = await fetch(
         (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/google-login",
@@ -77,7 +102,40 @@ export default function UserAuth({ setOpenAuth, setAuthToken, setNotification, s
     setNotification("Google login failed");
   };
 
+
+  const handleForgotPassword = async () => {
+    try {
+      let endpoint = "forgot-password"
+      const res = await fetch(
+        (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") +
+        `/${endpoint}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            email
+          }),
+        }
+
+      );
+      if (res.status == 200) {
+        setNotification(`Successful! New password sent to your email`);
+        setView("auth")
+      }
+    }
+    catch (err) {
+      console.error("Auth error:", err);
+      setNotification("Could not reset password")
+
+    }
+  }
+
+
+
+
   return (
+
+
     <div className="overlay">
       <div className="modal">
         {/* Close button */}
@@ -85,45 +143,135 @@ export default function UserAuth({ setOpenAuth, setAuthToken, setNotification, s
           X
         </button>
         <h2 className="modal-title">User Portal
-        <hr></hr></h2>
-      
+          <hr></hr></h2>
 
-        {/* Username and password */}
-        <h1 className="guides">Username</h1>
-        <input
-          className="comment-box"
-          rows="1"
-          placeholder="John Doe"
-          type="text"
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-        />
-         <h1 className="guides">Password</h1>
-        <input
-        
-          className="comment-box"
-          rows="1"
-          placeholder="*******"
-          type="password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-        />
 
-        {/* Buttons */}
-        <div className="button-group">
-          <button
-            className="submit-btn"
-            onClick={() => handleAuth("login")}
-          >
-            Log In
-          </button>
-          <button
-            className="submit-btn"
-            onClick={() => handleAuth("register")}
-          >
-            Register
-          </button>
-        </div>
+
+
+        {/* Username and password OR Forgot Password */}
+        {view === "auth" ? (
+          <>
+            {/* Username */}
+            <h1 className="guides">Username</h1>
+            <input
+              className="comment-box"
+              rows="1"
+              placeholder="John Doe"
+              type="text"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+            />
+
+            {/* Email ONLY for register */}
+            {authMode === "register" && (
+              <>
+                <h1 className="guides">Email</h1>
+                <input
+                  className="comment-box"
+                  rows="1"
+                  placeholder="Enter your email"
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                />
+              </>
+            )}
+
+            {/* Password */}
+            <h1 className="guides">Password</h1>
+            <input
+
+              className="comment-box"
+              rows="1"
+              placeholder="*******"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+
+            {/* Buttons */}
+            <div className="button-group">
+              {authMode === "login" ? (
+                <button
+                  className="submit-btn"
+                  onClick={() => handleAuth("login")}
+                >
+                  Log In
+                </button>
+              ) : (
+                <button
+                  className="submit-btn"
+                  onClick={() => handleAuth("register")}
+                >
+                  Register
+                </button>
+              )}
+            </div>
+
+            {/* Switch login/register */}
+            <button
+              onClick={() =>
+                setAuthMode(authMode === "login" ? "register" : "login")
+              }
+              style={{
+                background: "none",
+                border: "none",
+                color: "#007bff",
+                cursor: "pointer",
+                marginTop: "10px"
+              }}
+            >
+              {authMode === "login"
+                ? "Don't have an account? Register"
+                : "Already have an account? Log in"}
+            </button>
+
+            {/* Forgot password */}
+            {authMode === "login" && (
+              <button
+                onClick={() => setView("forgot")}
+                style={{
+                  background: "none",
+                  border: "none",
+                  color: "#007bff",
+                  cursor: "pointer",
+                  marginTop: "10px"
+                }}
+              >
+                Forgot password?
+              </button>
+            )}
+          </>
+        ) : (
+          <>
+            {/* Forgot Password View */}
+            <h1 className="guides">Email</h1>
+            <input
+              className="comment-box"
+              rows="1"
+              placeholder="Enter your email"
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+            />
+
+            <div className="button-group">
+              <button
+                className="submit-btn"
+                onClick={handleForgotPassword}
+              >
+                Reset Password
+              </button>
+
+              <button
+                className="submit-btn"
+                onClick={() => setView("auth")}
+              >
+                Back to Login
+              </button>
+            </div>
+          </>
+        )}
 
         {/* Google Login Section */}
         <div style={{ marginTop: "20px", textAlign: "center" }}>
@@ -144,4 +292,3 @@ export default function UserAuth({ setOpenAuth, setAuthToken, setNotification, s
     </div>
   );
 }
-
