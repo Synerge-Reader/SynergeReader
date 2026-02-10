@@ -4,9 +4,39 @@ import { zoomPlugin } from '@react-pdf-viewer/zoom';
 import '@react-pdf-viewer/core/lib/styles/index.css';
 import '@react-pdf-viewer/zoom/lib/styles/index.css';
 
-const TextPreview = ({ documents = [], onSelect, currentDocumentName = null }) => {
+const TextPreview = ({ documents = [], onSelect, currentDocumentName = null, onDeleteDocument }) => {
   const zoomPluginRef = React.useRef(zoomPlugin());
   const [activeTabIndex, setActiveTabIndex] = useState(0);
+  const [deletingDoc, setDeletingDoc] = useState(null);
+
+  // Handle delete document
+  const handleDeleteDocument = async (e, docName, index) => {
+    e.stopPropagation(); // Prevent tab switching
+
+    if (deletingDoc === docName) return; // Already deleting
+
+    setDeletingDoc(docName);
+
+    // Call parent's delete handler
+    if (onDeleteDocument) {
+      await onDeleteDocument(docName, index);
+    }
+
+    // Adjust active tab if needed
+    if (index === activeTabIndex) {
+      // If deleting active tab, switch to previous or next
+      if (index > 0) {
+        setActiveTabIndex(index - 1);
+      } else if (documents.length > 1) {
+        setActiveTabIndex(0);
+      }
+    } else if (index < activeTabIndex) {
+      // If deleting a tab before active, adjust index
+      setActiveTabIndex(prev => prev - 1);
+    }
+
+    setDeletingDoc(null);
+  };
 
   const handleMouseUp = (event, documentName) => {
     const selection = window.getSelection();
@@ -58,7 +88,7 @@ const TextPreview = ({ documents = [], onSelect, currentDocumentName = null }) =
         Document Previews
         <hr />
       </div>
-      
+
       {/* Tab Navigation */}
       <div style={{
         display: 'flex',
@@ -67,24 +97,79 @@ const TextPreview = ({ documents = [], onSelect, currentDocumentName = null }) =
         backgroundColor: '#f9f9f9'
       }}>
         {documents.map((doc, index) => (
-          <button
+          <div
             key={doc.name}
-            onClick={() => setActiveTabIndex(index)}
             style={{
-              padding: '12px 16px',
-              border: 'none',
-              backgroundColor: activeTabIndex === index ? '#fff' : '#f9f9f9',
-              borderBottom: activeTabIndex === index ? '3px solid #007bff' : 'none',
-              color: activeTabIndex === index ? '#007bff' : '#666',
-              cursor: 'pointer',
-              fontSize: '14px',
-              fontWeight: activeTabIndex === index ? '600' : '400',
-              whiteSpace: 'nowrap',
-              transition: 'all 0.2s ease'
+              display: 'flex',
+              alignItems: 'center',
+              position: 'relative',
             }}
           >
-            {doc.name}
-          </button>
+            <button
+              onClick={() => setActiveTabIndex(index)}
+              style={{
+                padding: '12px 16px',
+                paddingRight: onDeleteDocument ? '32px' : '16px',
+                border: 'none',
+                backgroundColor: activeTabIndex === index ? '#fff' : '#f9f9f9',
+                borderBottom: activeTabIndex === index ? '3px solid #007bff' : 'none',
+                color: activeTabIndex === index ? '#007bff' : '#666',
+                cursor: 'pointer',
+                fontSize: '14px',
+                fontWeight: activeTabIndex === index ? '600' : '400',
+                whiteSpace: 'nowrap',
+                transition: 'all 0.2s ease'
+              }}
+            >
+              {doc.name}
+            </button>
+            {/* Delete button for each document */}
+            {onDeleteDocument && (
+              <button
+                onClick={(e) => handleDeleteDocument(e, doc.name, index)}
+                disabled={deletingDoc === doc.name}
+                style={{
+                  position: 'absolute',
+                  right: '4px',
+                  top: '50%',
+                  transform: 'translateY(-50%)',
+                  width: '20px',
+                  height: '20px',
+                  padding: 0,
+                  border: 'none',
+                  borderRadius: '50%',
+                  backgroundColor: deletingDoc === doc.name ? '#ccc' : 'transparent',
+                  color: '#999',
+                  cursor: deletingDoc === doc.name ? 'wait' : 'pointer',
+                  fontSize: '14px',
+                  fontWeight: 'bold',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  transition: 'all 0.15s ease',
+                  opacity: 0.6,
+                }}
+                onMouseEnter={(e) => {
+                  if (deletingDoc !== doc.name) {
+                    e.currentTarget.style.backgroundColor = '#ff4444';
+                    e.currentTarget.style.color = '#fff';
+                    e.currentTarget.style.opacity = '1';
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  if (deletingDoc !== doc.name) {
+                    e.currentTarget.style.backgroundColor = 'transparent';
+                    e.currentTarget.style.color = '#999';
+                    e.currentTarget.style.opacity = '0.6';
+                  }
+                }}
+                title={`Remove ${doc.name}`}
+                aria-label={`Remove document ${doc.name}`}
+              >
+                {deletingDoc === doc.name ? '...' : '×'}
+              </button>
+            )}
+          </div>
         ))}
       </div>
 
