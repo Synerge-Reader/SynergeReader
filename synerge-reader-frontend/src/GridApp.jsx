@@ -89,18 +89,20 @@ const GridApp = () => {
   const handleAsk = async (question) => {
     setIsLoading(true);
     try {
-      // If no text is selected, use all parsed documents' text
+      // Build context: selections > documents > empty (general chat)
       let textToSend = "";
 
       if (selectedTexts && selectedTexts.length > 0) {
-        // Concatenate all selections with document context markers
+        // Use selected text(s) from documents
         textToSend = selectedTexts.map((sel, idx) =>
           `[Selection ${idx + 1} from: ${sel.documentName}]\n${sel.text}`
         ).join('\n\n---\n\n');
-      } else {
-        // Fallback: Concatenate all document texts
+      } else if (parsedDocuments && parsedDocuments.length > 0) {
+        // Fallback: Use all uploaded documents
         textToSend = parsedDocuments.map(doc => doc.text).join('\n\n---\n\n');
       }
+      // If no documents and no selections, textToSend remains empty
+      // Backend will handle this via web search or general knowledge
 
       const res = await fetch(
         (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/ask",
@@ -243,6 +245,53 @@ const GridApp = () => {
     setSelectedTexts([]);
   };
 
+  // Handle document deletion
+  const handleDeleteDocument = async (docName, index) => {
+    // Remove document from parsed documents list
+    setParsedDocuments(prevDocs => prevDocs.filter(doc => doc.name !== docName));
+
+    // Remove any text selections from this document
+    setSelectedTexts(prevSelections =>
+      prevSelections.filter(sel => sel.documentName !== docName)
+    );
+
+    // Optionally notify backend to remove from storage
+    try {
+      const response = await fetch(
+        (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + `/documents/delete`,
+        {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename: docName })
+        }
+      );
+      if (response.ok) {
+        console.log(`Document "${docName}" deleted from backend`);
+      }
+    } catch (err) {
+      console.warn('Backend document deletion failed (may not be implemented):', err);
+      // Continue anyway - frontend update is the priority
+    }
+
+    setNotification(`Document "${docName}" removed`);
+  };
+
+  // Handle model change mid-conversation
+  const handleModelChange = (previousModel, newModel) => {
+    // Add a system message to the answer to indicate model change
+    if (answer) {
+      const modelNames = {
+        "llama3.1:8b": "LLaMA 3.1 8B",
+        "OussamaELALLAM/MedExpert:latest": "MedExpert",
+        "adrienbrault/saul-instruct-v1:Q8_0": "Saul Instruct"
+      };
+      const prevName = modelNames[previousModel] || previousModel;
+      const newName = modelNames[newModel] || newModel;
+
+      setNotification(`Model changed from ${prevName} to ${newName}. Future responses will use the new model.`);
+    }
+    console.log(`Model changed: ${previousModel} → ${newModel}`);
+  };
 
   return (
     <>
@@ -294,6 +343,7 @@ const GridApp = () => {
             model={model}
             setModel={setModel}
             onAdminClick={() => setOpenAdminDashboard(true)}
+            onModelChange={handleModelChange}
           />
           <hr />
           <TitleLogo />
@@ -311,8 +361,6 @@ const GridApp = () => {
               onFileParsed={handleFileParsed}
               setIsLoading={setIsLoading}
               setError={setError}
-              model={model}
-              setModel={setModel}
               isCompact={parsedDocuments.length > 0}
             />
 
@@ -323,6 +371,7 @@ const GridApp = () => {
               <TextPreview
                 documents={parsedDocuments}
                 onSelect={handleTextSelection}
+                onDeleteDocument={handleDeleteDocument}
               />
             )}
           </div>
@@ -630,6 +679,7 @@ const GridApp = () => {
                 onClose={() => setAskOpen(false)}
                 onAsk={handleAsk}
                 selectedText={selectedTexts.length > 0 ? `${selectedTexts.length} selection(s)` : ""}
+                hasDocuments={parsedDocuments.length > 0}
               />
             </div>
           </div>

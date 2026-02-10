@@ -984,6 +984,49 @@ async def get_documents():
         raise HTTPException(500, str(e))
 
 
+class DeleteDocumentRequest(BaseModel):
+    filename: str
+
+
+@app.delete("/documents/delete")
+async def delete_document(request: DeleteDocumentRequest):
+    """Delete a document and its chunks from the database"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        # First, find the document by filename
+        c.execute("SELECT id FROM documents WHERE filename = ?", (request.filename,))
+        row = c.fetchone()
+        
+        if not row:
+            conn.close()
+            raise HTTPException(404, f"Document '{request.filename}' not found")
+        
+        doc_id = row[0]
+        
+        # Delete associated chunks first (foreign key constraint)
+        c.execute("DELETE FROM document_chunks WHERE document_id = ?", (doc_id,))
+        chunks_deleted = c.rowcount
+        
+        # Delete the document
+        c.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+        
+        conn.commit()
+        conn.close()
+        
+        return {
+            "message": "Document deleted successfully",
+            "filename": request.filename,
+            "document_id": doc_id,
+            "chunks_deleted": chunks_deleted
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @app.put("/put_ratings")
 async def put_ratings(request: RatingRequest):
     try:

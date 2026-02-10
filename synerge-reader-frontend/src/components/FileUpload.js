@@ -2,7 +2,6 @@ import React, { useRef, useState } from "react";
 import * as pdfjsLib from "pdfjs-dist/build/pdf";
 import { GlobalWorkerOptions } from "pdfjs-dist/build/pdf";
 import mammoth from "mammoth";
-import Dropdown from "./Dropdown/Dropdown.jsx";
 
 GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.js",
@@ -13,8 +12,6 @@ export default function FileUpload({
   onFileParsed,
   setIsLoading,
   setError,
-  model,
-  setModel,
   isCompact = false,
 }) {
   const fileInputRef = useRef();
@@ -224,14 +221,6 @@ export default function FileUpload({
     setDefault();
   };
 
-  const modelDisplayNames = {
-    "llama3.1:8b": "LLaMA 3.1 8B",
-    "adrienbrault/saul-instruct-v1:Q8_0": "Saul Instruct",
-    "OussamaELALLAM/MedExpert:latest": "MedExpert",
-  };
-
-  const displayName = modelDisplayNames[model] || model;
-
   // Compact mode: show a small upload bar when documents are already uploaded
   if (isCompact) {
     return (
@@ -350,19 +339,6 @@ export default function FileUpload({
       >
         Browse Files
       </button>
-
-      <Dropdown
-        title={`Selected Model: ${displayName}`}
-        options={[
-          { label: "LLaMA 3.1 8B", value: "llama3.1:8b" },
-          { label: "Saul Instruct", value: "adrienbrault/saul-instruct-v1:Q8_0" },
-          { label: "MedExpert", value: "OussamaELALLAM/MedExpert:latest" },
-        ]}
-        onSelect={(option) => {
-          setModel(option.value);
-          console.log("Selected:", option.value);
-        }}
-      />
     </div>
   );
 }
