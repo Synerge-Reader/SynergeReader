@@ -38,16 +38,26 @@ def init_db():
         sys.exit(1)
 
     cursor = conn.cursor()
+
+
+
+    
    # Users 
     cursor.execute("""
+    CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
     CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY,
-        username TEXT UNIQUE,
-        password TEXT,
-        token TEXT,
-        is_admin INTEGER DEFAULT 0
-    )
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    username TEXT NOT NULL UNIQUE,
+    password TEXT NOT NULL,
+    token TEXT,
+    is_admin INTEGER DEFAULT 0
+    );
     """)
+
+    cursor.execute("ALTER TABLE users ADD COLUMN email TEXT UNIQUE")
+
+
 
     # Documents
     cursor.execute("""
@@ -80,7 +90,7 @@ def init_db():
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS chat_history (
         id SERIAL PRIMARY KEY,
-        user_id INTEGER,
+        user_id UUID,
         ts TEXT NOT NULL,
         selected_text TEXT NOT NULL,
         question TEXT NOT NULL,
@@ -104,9 +114,11 @@ def init_db():
         FOREIGN KEY (chat_history_id) REFERENCES chat_history (id)
     )
     """)
+    
 
-    # Insert anonymous user
-   # cursor.execute("INSERT INTO users (id, username) VALUES (0, 'anonymous') ON CONFLICT (id) DO NOTHING")
+
+  
+
 
 
     conn.commit()

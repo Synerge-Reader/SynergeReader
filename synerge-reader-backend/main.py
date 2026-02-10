@@ -2,9 +2,9 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from schemas import AskRequest, AskResponse, CorrectionRequest, RatingRequest,GoogleLoginRequest,LoginRequest,RegisterRequest
-from schemas import HistoryItem,HistoryRequest, KnowledgeItem,KnowledgeInsertRequest
-import sqlite3
+from schemas import HistoryItem,HistoryRequest, KnowledgeItem,KnowledgeInsertRequest,ForgotPasswordRequest
 import os
+import string
 import datetime
 from typing import List, Optional
 from dbSetup import init_db,connect_to_postgres,test_postgres_connection
@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 import re
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
+import resend 
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -37,6 +38,7 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "172.18.0.1")
 OLLAMA_PORT = os.getenv("OLLAMA_PORT", "11434")
 DB_PATH = os.path.join(os.path.dirname(__file__), "synerge_reader.db")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+resend.api_key = os.getenv("EMAIL_KEY")
 
 # Cosine similarity threshold for determining if document context is sufficient
 # If the best similarity score is below this, we'll use external RAG sources
@@ -842,16 +844,89 @@ async def put_ratings(request: RatingRequest):
 async def register(request: RegisterRequest):
     conn = connect_to_postgres()
     c = conn.cursor()
-    c.execute("SELECT id FROM users WHERE username = %s", (request.username,))
+    c.execute("SELECT id FROM users WHERE username = %s OR email = %s", (request.username,request.email))
     if c.fetchone():
         conn.close()
-        raise HTTPException(400, "Username already exists")
+        raise HTTPException(400, "Username or email already exists")
     hashed = await hash_password(request.password)
     token = secrets.token_hex(32)
-    c.execute("INSERT INTO users (username, password, token) VALUES (%s, %s, %s)", (request.username, hashed, token))
+    c.execute("INSERT INTO users (username, password, token,email) VALUES (%s, %s, %s)", (request.username, hashed, token,request.email))
     conn.commit()
     conn.close()
+
+    params = { # improve on this message later
+    "from": "Synerge <no-reply@synergereader.ai>",
+    "to": [request.email],
+    "subject": "Welcome to SynergeReader!",
+    "html": """
+        <h2>Welcome to SynergeReader!</h2>
+
+        <p>Your account has been successfully created.</p>
+
+        <p>SynergeReader helps you read, analyze, and interact with documents more intelligently — all in one place.</p>
+
+        <p><b>What you can do next:</b></p>
+        <ul>
+            <li>Upload and read documents</li>
+            <li>Ask questions and get contextual answers</li>
+        </ul>
+
+        <p>A user guide will be available inside the app.</p>
+
+        <p>— The SynergeReader Team</p>
+    """
+    }
+
+    email = resend.Emails.send(params)
+
     return {"message": "Registered", "token": token}
+
+
+@app.post("/forgot-password")
+async def forgot_password(request: ForgotPasswordRequest):
+    conn = connect_to_postgres()
+    c = conn.cursor()
+
+    c.execute(
+        "SELECT id, email FROM users WHERE email = %s",
+        (request.email,)
+    )
+    user = c.fetchone()
+
+    if not user:
+        conn.close()
+        raise HTTPException(400, "User not found")
+
+    user_id, email = user
+
+    new_password = ''.join(
+        secrets.choice(string.ascii_letters + string.digits)
+        for _ in range(12)
+    )
+
+    hashed = await hash_password(new_password)
+
+    c.execute(
+        "UPDATE users SET password = %s WHERE id = %s",
+        (hashed, user_id)
+    )
+    conn.commit()
+    conn.close()
+
+    params = {
+    "from": "Synerge <no-reply@synergereader.ai>",
+    "to": [email],
+    "subject": "Your new password",
+    "html": f"""
+        <p>Your password has been reset.</p>
+        <p><b>New password:</b> {new_password}</p>
+        <p>Please log in and change it immediately.</p>
+    """
+}
+
+    email_response = resend.Emails.send(params)
+
+    return {"message": "New password sent to your email"}
 
 
 @app.post("/login")

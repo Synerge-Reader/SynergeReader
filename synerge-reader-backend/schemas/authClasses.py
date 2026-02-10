@@ -5,7 +5,7 @@ class GoogleLoginRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    email: str
+    #email: str
     username: str
     password: str
 
@@ -13,4 +13,7 @@ class RegisterRequest(BaseModel):
     username: str
     password: str
     email: str
+
+class ForgotPasswordRequest(BaseModel):
+    email : str
 
