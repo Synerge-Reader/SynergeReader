@@ -4,17 +4,25 @@ import TextPreview from "./components/TextPreview";
 import AskModal from "./components/AskModal";
 import TitleLogo from "./components/TitleLogo";
 import Top from "./components/Top";
-import RatingModal from "./components/RatingModal/RatingModal.jsx";
 import UserAuth from "./components/UserAuth/UserAuth.jsx";
 import Spinner from './components/Spinner/Spinner'
 import Notifier from './components/Notifier/Notifier'
 import Markdown from "react-markdown";
 import SurveyModal from "./components/Survey/SurveyModal.jsx";
-import CorrectionModal from "./components/CorrectionModal/CorrectionModal.jsx";
 import AdminDashboard from "./components/AdminDashboard/AdminDashboard.jsx";
 import MultiTextSelector from "./components/MultiTextSelector.js";
 import './GridApp.css'
 import './App.css'
+
+const stripStreamControls = (text) => text
+  .replace(/__SEARCHING__\s*/g, "")
+  .replace(/__CONTEXT__[\s\S]*?__\s*/g, "")
+  .replace(/__READY__\s*/g, "")
+  .replace(/__ENTRY_ID__\d+__\s*/g, "")
+  .replace(/__ERROR__[\s\S]*?__\s*/g, "")
+  .replace(/^CONTEXT\{[\s\S]*?\}\s*/i, "");
+
+const cleanStreamText = (text) => stripStreamControls(text).trim();
 
 const GridApp = () => {
   const [parsedDocuments, setParsedDocuments] = useState([]);
@@ -22,19 +30,17 @@ const GridApp = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
   const [backendMsg, setBackendMsg] = useState("");
-  const [askOpen, setAskOpen] = useState(true);
   const [answer, setAnswer] = useState(null);
   const [history, setHistory] = useState([]);
   const [openHistory, setOpenHistory] = useState(false);
-  const [model, setModel] = useState("llama3.1:8b");
-  const [openRating, setOpenRating] = useState(false);
+  const [model, setModel] = useState("qwen3:latest");
   const [openAuth, setOpenAuth] = useState(false);
   const [openSurvey, setOpenSurvey] = useState(false);
   const [authToken, setAuthToken] = useState('')
   const [notification, setNotification] = useState('')
-  const [openCorrection, setOpenCorrection] = useState(false);
-  const [correctionEntry, setCorrectionEntry] = useState(null);
   const [openAdminDashboard, setOpenAdminDashboard] = useState(false);
+  const [activeDocumentName, setActiveDocumentName] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
 
 
   useEffect(() => {
@@ -88,21 +94,17 @@ const GridApp = () => {
 
   const handleAsk = async (question) => {
     setIsLoading(true);
+    setStatusMessage("Finding the right context...");
+    setError("");
     try {
-      // Build context: selections > documents > empty (general chat)
+      // Build context from explicit selections only. Uploaded documents are retrieved by backend RAG.
       let textToSend = "";
 
       if (selectedTexts && selectedTexts.length > 0) {
-        // Use selected text(s) from documents
         textToSend = selectedTexts.map((sel, idx) =>
           `[Selection ${idx + 1} from: ${sel.documentName}]\n${sel.text}`
         ).join('\n\n---\n\n');
-      } else if (parsedDocuments && parsedDocuments.length > 0) {
-        // Fallback: Use all uploaded documents
-        textToSend = parsedDocuments.map(doc => doc.text).join('\n\n---\n\n');
       }
-      // If no documents and no selections, textToSend remains empty
-      // Backend will handle this via web search or general knowledge
 
       const res = await fetch(
         (process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + "/ask",
@@ -113,7 +115,9 @@ const GridApp = () => {
             selected_text: textToSend,
             question,
             model,
-            auth_token: authToken
+            auth_token: authToken,
+            active_document_name: activeDocumentName || undefined,
+            selections: selectedTexts,
           }),
         },
       );
@@ -123,24 +127,31 @@ const GridApp = () => {
       const reader = res.body.getReader();
       const decoder = new TextDecoder("utf-8");
       let fullText = "";
+      let streamBuffer = "";
       let contextChunks = [];
       let citations = [];
       let apaCitations = [];
       let hasExternalSources = false;
-      let citationNote = "No external sources used";
+      let citationNote = "";
       let similarityScore = 0;
       let contextProcessed = false;
+      let streamFailed = false;
 
       // Stream and process in real-time
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
-        const chunk = decoder.decode(value, { stream: true });
+        streamBuffer += decoder.decode(value, { stream: true });
 
-        // Handle context metadata
-        if (chunk.includes("__CONTEXT__") && !contextProcessed) {
-          const contextMatch = chunk.match(/__CONTEXT__({.+?})__/s);
+        if (streamBuffer.includes("__SEARCHING__")) {
+          streamBuffer = streamBuffer.replace(/__SEARCHING__\s*/g, "");
+          setStatusMessage("Searching the selected document...");
+        }
+
+        // Handle context metadata. It may arrive split across several chunks.
+        if (streamBuffer.includes("__CONTEXT__") && !contextProcessed) {
+          const contextMatch = streamBuffer.match(/__CONTEXT__({[\s\S]*?})__/);
           if (contextMatch) {
             try {
               const contextData = JSON.parse(contextMatch[1]);
@@ -148,37 +159,46 @@ const GridApp = () => {
               citations = contextData.citations || [];
               apaCitations = contextData.apa_citations || [];
               hasExternalSources = contextData.has_external_sources || false;
-              citationNote = contextData.citation_note || "No external sources used";
+              citationNote = contextData.citation_note || "";
               similarityScore = contextData.similarity_score || 0;
               contextProcessed = true;
+              streamBuffer = streamBuffer.replace(contextMatch[0], "");
 
               console.log("DEBUG [Frontend]: Context parsed, starting stream display");
+              setStatusMessage("Generating answer...");
               setIsLoading(false);
             } catch (e) {
               console.error("Error parsing context:", e);
             }
+          } else {
+            continue;
           }
-          continue;
         }
 
-        // Skip control markers
-        if (chunk.includes("__READY__") || chunk.includes("__ENTRY_ID__")) {
-          const entryIdMatch = chunk.match(/__ENTRY_ID__(\d+)__/);
-          if (entryIdMatch) {
-            console.log("Entry ID:", entryIdMatch[1]);
-          }
-          continue;
-        }
+        // Remove control markers while preserving any answer text that shares the chunk.
+        streamBuffer = streamBuffer.replace(/__READY__\n?/g, "");
+        streamBuffer = streamBuffer.replace(/__ENTRY_ID__(\d+)__/g, (_, id) => {
+          console.log("Entry ID:", id);
+          return "";
+        });
 
-        // Skip error markers
-        if (chunk.includes("__ERROR__")) {
-          continue;
+        // Skip error markers. Incomplete markers are kept in the buffer until complete.
+        if (streamBuffer.includes("__ERROR__")) {
+          const errorMatch = streamBuffer.match(/__ERROR__(.*?)__/s);
+          if (errorMatch) {
+            streamFailed = true;
+            setError(errorMatch[1].trim() || "Could not get answer from backend.");
+            streamBuffer = streamBuffer.replace(errorMatch[0], "");
+          } else {
+            continue;
+          }
         }
 
         // Clean up the chunk (remove newlines used as delimiters)
-        const cleanChunk = chunk.replace(/\n$/, "");
+        const cleanChunk = stripStreamControls(streamBuffer.replace(/\n$/, ""));
         if (cleanChunk) {
           fullText += cleanChunk;
+          streamBuffer = "";
           console.log(`DEBUG [Frontend]: Streaming token, fullText length: ${fullText.length}`);
 
           // Update UI in real-time as we receive tokens
@@ -193,9 +213,6 @@ const GridApp = () => {
             similarity_score: similarityScore,
             relevant_history: [],
           });
-
-          // Small delay to allow React to render
-          await new Promise(resolve => setTimeout(resolve, 5));
         }
       }
 
@@ -207,9 +224,15 @@ const GridApp = () => {
         fullText = fullText.replace(/__ENTRY_ID__\d+__/, "").trim();
       }
 
+      if (streamFailed) {
+        return;
+      }
+
+      const displayAnswer = cleanStreamText(fullText) || "The model did not return any text.";
+
       setAnswer({
         question,
-        answer: fullText,
+        answer: displayAnswer,
         context_chunks: contextChunks,
         citations: citations,
         apa_citations: apaCitations,
@@ -219,10 +242,12 @@ const GridApp = () => {
         relevant_history: [],
         entryId: entryId,
       });
+
     } catch (err) {
       setError("Could not get answer from backend.");
     } finally {
       setIsLoading(false);
+      setStatusMessage("");
       getHistory()
     }
   };
@@ -281,7 +306,7 @@ const GridApp = () => {
     // Add a system message to the answer to indicate model change
     if (answer) {
       const modelNames = {
-        "llama3.1:8b": "LLaMA 3.1 8B",
+        "qwen3:latest": "Qwen3",
         "OussamaELALLAM/MedExpert:latest": "MedExpert",
         "adrienbrault/saul-instruct-v1:Q8_0": "Saul Instruct"
       };
@@ -298,8 +323,10 @@ const GridApp = () => {
       <div className="parent">
         {notification && <Notifier message={notification} setNotification={setNotification} />}
         {isLoading && <Spinner />}
-        {openRating && (
-          <RatingModal setOpenRating={setOpenRating} entryId={answer?.entryId} />
+        {statusMessage && (
+          <div style={{ textAlign: "center", marginTop: 8, color: "#475569", fontSize: "0.95rem" }}>
+            {statusMessage}
+          </div>
         )}
         {openAuth && (
           <UserAuth
@@ -316,14 +343,6 @@ const GridApp = () => {
             setOpenSurvey={setOpenSurvey}
 
 
-          />
-        )}
-        {openCorrection && correctionEntry && (
-          <CorrectionModal
-            setOpenCorrection={setOpenCorrection}
-            entryId={correctionEntry.entryId}
-            originalQuestion={correctionEntry.question}
-            originalAnswer={correctionEntry.answer}
           />
         )}
         {openAdminDashboard && (
@@ -368,12 +387,13 @@ const GridApp = () => {
             {/*  {isLoading && <div className="loading-spinner">Processing...</div>} */}
 
             {parsedDocuments.length > 0 && (
-              <TextPreview
-                documents={parsedDocuments}
-                onSelect={handleTextSelection}
-                onDeleteDocument={handleDeleteDocument}
-              />
-            )}
+            <TextPreview
+              documents={parsedDocuments}
+              onSelect={handleTextSelection}
+              onDeleteDocument={handleDeleteDocument}
+              onActiveDocumentChange={setActiveDocumentName}
+            />
+          )}
           </div>
         </div>
 
@@ -479,82 +499,24 @@ const GridApp = () => {
                         padding: 20,
                       }}
                     >
-                      <h3>Response </h3>
                       <div style={{ marginBottom: 16 }}>
-                        <strong>Question:</strong> {answer.question}
-                      </div>
-                      <div style={{ marginBottom: 16 }}>
-                        <strong>Answer:</strong>
-                        <div
-                          onClick={() => setOpenRating(true)}
-                          style={{
-                            cursor: "pointer",
-                            display: "inline-block",
-                            marginLeft: 8,
-                          }}
-                        >
-                          <Markdown>{answer.answer}</Markdown>
+                        <div style={{ fontSize: "0.9rem", fontWeight: 700, color: "#334155", marginBottom: 6 }}>
+                          Question
                         </div>
-                        <div style={{ marginTop: '10px' }}>
-                          <button
-                            onClick={() => {
-                              setCorrectionEntry({
-                                entryId: answer.entryId,
-                                question: answer.question,
-                                answer: answer.answer
-                              });
-                              setOpenCorrection(true);
-                            }}
-                            style={{
-                              background: 'none',
-                              border: '1px solid #2b926e',
-                              color: '#2b926e',
-                              padding: '5px 10px',
-                              borderRadius: '4px',
-                              cursor: 'pointer',
-                              fontSize: '0.85em'
-                            }}
-                          >
-                            Provide Feedback / Correct Answer
-                          </button>
+                        <div style={{ color: "#111827", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
+                          {answer.question}
                         </div>
                       </div>
-                      {answer.context_chunks &&
-                        answer.context_chunks.length > 0 && (
-                          <details style={{ marginBottom: 16 }}>
-                            <summary
-                              style={{ cursor: "pointer", fontWeight: "bold" }}
-                            >
-                              Relevant Context
-                            </summary>
-                            <div
-                              style={{
-                                background: "#f0f8ff",
-                                padding: 12,
-                                borderRadius: 4,
-                                marginTop: 8,
-                              }}
-                            >
-                              {answer.context_chunks.map((chunk, idx) => (
-                                <div
-                                  key={idx}
-                                  style={{
-                                    marginBottom: 8,
-                                    fontSize: "0.9em",
-                                  }}
-                                >
-                                  {chunk.substring(0, 150)}...
-                                </div>
-                              ))}
-                            </div>
-                          </details>
-                        )}
-                      {/* Citations Section - Always show */}
-                      <details style={{ marginBottom: 16 }} open>
+                      <div style={{ marginBottom: 8, fontSize: "0.9rem", fontWeight: 700, color: "#334155" }}>
+                        Answer
+                      </div>
+                      <Markdown>{answer.answer}</Markdown>
+                      {false && (
+                        <details style={{ marginBottom: 16 }} open>
                         <summary
                           style={{ cursor: "pointer", fontWeight: "bold" }}
                         >
-                          Citations (APA Format)
+                          {""}
                         </summary>
                         <div
                           style={{
@@ -577,7 +539,7 @@ const GridApp = () => {
                               borderLeft: `3px solid ${answer.has_external_sources ? "#1565c0" : "#2e7d32"}`
                             }}
                           >
-                            {answer.citation_note || "No external sources used"}
+                            {answer.citation_note || ""}
                           </div>
 
                           {/* APA Citations */}
@@ -629,12 +591,13 @@ const GridApp = () => {
                             ))
                           ) : (
                             <div style={{ color: "#666", fontStyle: "italic" }}>
-                              No citations available for this response.
+                              {""}
                             </div>
                           )}
                         </div>
-                      </details>
-                      {answer.relevant_history &&
+                        </details>
+                      )}
+                      {false && answer.relevant_history &&
                         answer.relevant_history.length > 0 && (
                           <details>
                             <summary
@@ -676,7 +639,7 @@ const GridApp = () => {
             <div className="main-text-Box">
               <AskModal
                 open
-                onClose={() => setAskOpen(false)}
+                onClose={() => {}}
                 onAsk={handleAsk}
                 selectedText={selectedTexts.length > 0 ? `${selectedTexts.length} selection(s)` : ""}
                 hasDocuments={parsedDocuments.length > 0}

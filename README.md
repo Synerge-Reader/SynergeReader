@@ -1,6 +1,6 @@
 # SynergeReader
 
-A browser-based document reader with AI-powered question answering capabilities. Upload PDF, DOCX, or TXT documents, select text, and ask questions to get intelligent answers using vector similarity search and LLM integration.
+A browser-based document reader with AI-powered question answering capabilities. Upload PDF, DOCX, or TXT documents, select text, and ask questions to get intelligent answers using PostgreSQL pgvector search and LLM integration.
 
 ## Features
 
@@ -9,7 +9,7 @@ A browser-based document reader with AI-powered question answering capabilities.
 - **Document Upload & Processing**: Support for PDF, DOCX, and TXT files (max 20MB)
 - **Local Text Parsing**: Client-side parsing using pdf.js and mammoth.js
 - **Text Selection**: Interactive text selection with automatic question modal
-- **Vector Database**: ChromaDB integration for document chunking and embedding
+- **Vector Database**: PostgreSQL pgvector integration for document chunking and embedding
 - **Question Analysis**: Intelligent question analysis and intent recognition
 - **Vector Similarity Search**: Find relevant document chunks using embeddings
 - **History Retrieval**: Smart retrieval of relevant past Q&A pairs
@@ -20,16 +20,14 @@ A browser-based document reader with AI-powered question answering capabilities.
 ## Architecture
 
 ```
-Frontend (React) ←→ FastAPI Backend ←→ ChromaDB (Vector DB)
-                              ↓
-                        SQLite (History)
+Frontend (React) ←→ FastAPI Backend ←→ PostgreSQL + pgvector
 ```
 
 ### Backend Components
 - **FastAPI**: Modern async web framework
-- **ChromaDB**: Vector database for document embeddings
+- **PostgreSQL + pgvector**: Vector database for document embeddings
 - **Sentence Transformers**: Text embedding generation
-- **SQLite**: Chat history storage
+- **PostgreSQL**: Chat history storage
 - **OpenRouter API**: LLM integration
 
 ### Frontend Components
@@ -99,7 +97,7 @@ npm start
 2. **Parsing**: Extract text using appropriate parser (pdf.js/mammoth.js)
 3. **Chunking**: Split text into overlapping chunks (1000 chars, 200 overlap)
 4. **Embedding**: Generate embeddings using sentence-transformers
-5. **Storage**: Store chunks and embeddings in ChromaDB
+5. **Storage**: Store chunks and embeddings in PostgreSQL pgvector
 
 ### Question Answering Pipeline
 1. **Analysis**: Analyze question intent and extract key terms
@@ -107,7 +105,7 @@ npm start
 3. **History Retrieval**: Find relevant past Q&A pairs
 4. **Prompt Building**: Construct comprehensive prompt with context
 5. **LLM Call**: Generate answer using OpenRouter API
-6. **Storage**: Save Q&A to SQLite history
+6. **Storage**: Save Q&A to PostgreSQL history
 
 ## Configuration
 
@@ -120,7 +118,7 @@ npm start
 ### Model Configuration
 - **Embedding Model**: `all-MiniLM-L6-v2` (sentence-transformers)
 - **LLM Model**: `meta-llama/llama-3.3-70b-instruct:free` (OpenRouter)
-- **Vector Space**: Cosine similarity (ChromaDB)
+- **Vector Space**: Cosine distance in pgvector
 
 ## Development
 
@@ -131,7 +129,7 @@ synerge-reader/
 │   ├── main.py              # FastAPI application
 │   ├── requiredInstall.txt  # Python dependencies
 │   ├── Dockerfile          # Backend container
-│   └── synerge_reader.db   # SQLite database
+│   └── dbSetup.py          # PostgreSQL schema setup
 ├── synerge-reader-frontend/
 │   ├── src/
 │   │   ├── App.jsx         # Main application
@@ -149,7 +147,7 @@ synerge-reader/
 - **Question Analysis**: Intent recognition and key term extraction
 - **Vector Search**: Similarity-based document retrieval
 - **LLM Integration**: Enhanced prompt building and API calls
-- **History Management**: SQLite CRUD operations
+- **History Management**: PostgreSQL CRUD operations
 
 #### Frontend Components
 - **FileUpload.js**: Multi-format file upload with parsing
@@ -161,7 +159,7 @@ synerge-reader/
 
 - **Chunking Strategy**: Overlapping chunks preserve context across boundaries
 - **Embedding Caching**: Sentence transformers model loaded once
-- **Vector Search**: Efficient similarity search with ChromaDB
+- **Vector Search**: Efficient similarity search with pgvector
 - **Response Streaming**: Future enhancement for real-time answers
 
 ## Security
@@ -197,7 +195,7 @@ synerge-reader/
    - Check API rate limits
 
 4. **Vector Search Issues**
-   - Ensure ChromaDB is properly initialized
+   - Ensure PostgreSQL is running and the vector extension is enabled
    - Check embedding model download
 
 ### Logs
@@ -219,7 +217,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## Acknowledgments
 
 - [FastAPI](https://fastapi.tiangolo.com/) for the backend framework
-- [ChromaDB](https://www.trychroma.com/) for vector database
+- [pgvector](https://github.com/pgvector/pgvector) for vector database
 - [Sentence Transformers](https://www.sbert.net/) for embeddings
 - [OpenRouter](https://openrouter.ai/) for LLM access
 - [React](https://reactjs.org/) for the frontend framework

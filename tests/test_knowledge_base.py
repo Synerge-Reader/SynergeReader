@@ -64,7 +64,7 @@ def test_ask_with_kb():
     test_question = {
         "selected_text": "This is a test document about France.",
         "question": "What is the capital city of France?",
-        "model": "llama3.1:8b",
+        "model": "qwen3:latest",
         "auth_token": None
     }
     
@@ -108,7 +108,7 @@ def test_submit_correction():
     ask_response = requests.post(f"{BASE_URL}/ask", json={
         "selected_text": "Test text",
         "question": "What is 2+2?",
-        "model": "llama3.1:8b",
+        "model": "qwen3:latest",
         "auth_token": None
     }, stream=True)
     

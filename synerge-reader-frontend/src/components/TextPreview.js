@@ -4,7 +4,7 @@ import { zoomPlugin } from '@react-pdf-viewer/zoom';
 import '@react-pdf-viewer/core/lib/styles/index.css';
 import '@react-pdf-viewer/zoom/lib/styles/index.css';
 
-const TextPreview = ({ documents = [], onSelect, currentDocumentName = null, onDeleteDocument }) => {
+const TextPreview = ({ documents = [], onSelect, currentDocumentName = null, onDeleteDocument, onActiveDocumentChange }) => {
   const zoomPluginRef = React.useRef(zoomPlugin());
   const [activeTabIndex, setActiveTabIndex] = useState(0);
   const [deletingDoc, setDeletingDoc] = useState(null);
@@ -56,6 +56,13 @@ const TextPreview = ({ documents = [], onSelect, currentDocumentName = null, onD
       onSelect && onSelect(selectionObject, true);
     }
   };
+
+  useEffect(() => {
+    const activeDocument = documents[activeTabIndex];
+    if (onActiveDocumentChange) {
+      onActiveDocumentChange(activeDocument ? activeDocument.name : "");
+    }
+  }, [activeTabIndex, documents, onActiveDocumentChange]);
 
   // Cleanup URLs only when component unmounts
   useEffect(() => {
