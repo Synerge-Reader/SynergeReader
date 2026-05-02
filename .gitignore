@@ -1,2 +1,7 @@
 .env
 *.db
+# Local credentials and documentation — never commit
+Credentials and Deployment.pdf
+*.docx
+synerge-reader-backend/venv/
+*.backup_apr26
