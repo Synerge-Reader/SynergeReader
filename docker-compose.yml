@@ -11,7 +11,6 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
-    command: sh -lc "ollama serve & sleep 5 && ollama pull qwen3:latest && ollama pull DC1LEX/Qwen3-Embedding-0.6B-f16:latest && wait"
     restart: unless-stopped
   db:
     image: pgvector/pgvector:pg17
@@ -20,7 +19,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -43,7 +42,7 @@ services:
       - OLLAMA_BASE_URL=http://ollama:11434
       - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
-      - DB_CONNECTION_STRING=postgresql://postgres:postgres@db:5432/synergereader
+      - DB_CONNECTION_STRING=${DB_CONNECTION_STRING}
       - EMAIL_KEY=${EMAIL_KEY}
     depends_on:
       ollama:
