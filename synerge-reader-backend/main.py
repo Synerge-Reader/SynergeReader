@@ -6,21 +6,20 @@ from schemas import HistoryItem,HistoryRequest, KnowledgeItem,KnowledgeInsertReq
 import os
 import string
 import datetime
+import re
 from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor
 from dbSetup import init_db,connect_to_postgres,test_postgres_connection
 import requests
 import json
+import time
 from pydantic import BaseModel
 import bcrypt
 import secrets
-import psycopg2
-import numpy as np
 from dotenv import load_dotenv
-import re
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 import resend 
-from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -36,176 +35,124 @@ app.add_middleware(
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "172.18.0.1")
 OLLAMA_PORT = os.getenv("OLLAMA_PORT", "11434")
-DB_PATH = os.path.join(os.path.dirname(__file__), "synerge_reader.db")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "").strip()
+OLLAMA_FALLBACK_HOSTS = [
+    host.strip()
+    for host in os.getenv(
+        "OLLAMA_FALLBACK_HOSTS",
+        "host.docker.internal,172.18.0.1,127.0.0.1,localhost",
+    ).split(",")
+    if host.strip()
+]
+OLLAMA_CONNECT_TIMEOUT = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "1.5"))
+OLLAMA_READ_TIMEOUT = float(os.getenv("OLLAMA_READ_TIMEOUT", "60"))
+OLLAMA_EMBED_CONCURRENCY = int(os.getenv("OLLAMA_EMBED_CONCURRENCY", "4"))
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_BASE_URL = os.getenv(
+    "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+).rstrip("/")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/auto").strip()
+OPENROUTER_HTTP_REFERER = os.getenv("OPENROUTER_HTTP_REFERER", "http://localhost")
+OPENROUTER_TITLE = os.getenv("OPENROUTER_TITLE", "SynergeReader")
+_ACTIVE_OLLAMA_BASE_URL = None
+_OLLAMA_HEALTH_CHECKED_AT = 0
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 resend.api_key = os.getenv("EMAIL_KEY")
-
-# Cosine similarity threshold for determining if document context is sufficient
-# If the best similarity score is below this, we'll use external RAG sources
-SIMILARITY_THRESHOLD = 0.85
+# ------------------- Utilities -------------------
 
 
-def perform_web_search(query: str, num_results: int = 3) -> List[dict]:
-    """
-    Perform a web search using DuckDuckGo and return structured results.
-    Returns a list of dicts with title, url, snippet, and access_date.
-    """
-    try:
-        # Using DuckDuckGo HTML search (no API key needed)
-        search_url = "https://html.duckduckgo.com/html/"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
-        response = requests.post(
-            search_url, data={"q": query}, headers=headers, timeout=2
-        )
+def ollama_base_urls() -> list[str]:
+    """Return Ollama base URLs in priority order."""
+    if OLLAMA_BASE_URL:
+        return [OLLAMA_BASE_URL.rstrip("/")]
 
-        if response.status_code != 200:
-            print(f"DEBUG [Web Search]: HTTP {response.status_code}, using fallback")
-            return _get_fallback_results(query, num_results)
+    urls = [f"http://{OLLAMA_HOST}:{OLLAMA_PORT}"]
+    for host in OLLAMA_FALLBACK_HOSTS:
+        url = f"http://{host}:{OLLAMA_PORT}"
+        if url not in urls:
+            urls.append(url)
+    return urls
 
-        # Parse results from HTML
-        results = []
-        html_content = response.text
 
-        # Regex patterns for parsing results
+def get_active_ollama_base_url() -> str:
+    """Resolve and cache the first reachable Ollama endpoint."""
+    global _ACTIVE_OLLAMA_BASE_URL, _OLLAMA_HEALTH_CHECKED_AT
 
-        # Try multiple regex patterns for robustness
-        patterns = [
-            r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([^<]+)</a>',
-            r'<a[^>]*href="([^"]+)"[^>]*class="[^"]*result__a[^"]*"[^>]*>([^<]+)</a>',
-            r'<a[^>]+href="(https?://[^"]+)"[^>]*>([^<]+)</a>',  # Generic link
-        ]
+    now = time.time()
+    if _ACTIVE_OLLAMA_BASE_URL and now - _OLLAMA_HEALTH_CHECKED_AT < 30:
+        return _ACTIVE_OLLAMA_BASE_URL
 
-        matches = []
-        for pattern in patterns:
-            matches = re.findall(pattern, html_content)
-            if matches:
-                print(
-                    f"DEBUG [Web Search]: Pattern matched, found {len(matches)} results"
-                )
-                break
-
-        if not matches:
-            print(f"DEBUG [Web Search]: No regex matches, using fallback")
-            return _get_fallback_results(query, num_results)
-
-        # Find snippets
-        snippet_pattern = r'<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([^<]+)</a>'
-        snippets = re.findall(snippet_pattern, html_content)
-
-        print(f"DEBUG [Web Search]: Found {len(matches)} matches for query: '{query}'")
-
-        for i, (url, title) in enumerate(matches[:num_results]):
-            snippet = snippets[i] if i < len(snippets) else f"Information about {title}"
-            results.append(
-                {
-                    "title": title.strip(),
-                    "url": url,
-                    "snippet": snippet.strip()
-                    if snippet.strip()
-                    else f"Search result for: {query}",
-                    "access_date": datetime.datetime.now().strftime("%Y, %B %d"),
-                }
+    errors = []
+    for base_url in ollama_base_urls():
+        try:
+            resp = requests.get(
+                f"{base_url}/api/tags",
+                timeout=(OLLAMA_CONNECT_TIMEOUT, 5),
             )
+            resp.raise_for_status()
+            _ACTIVE_OLLAMA_BASE_URL = base_url
+            _OLLAMA_HEALTH_CHECKED_AT = now
+            return base_url
+        except Exception as e:
+            errors.append(f"{base_url}: {e}")
 
-        print(f"DEBUG [Web Search]: Returning {len(results)} results")
-        if results:
-            print(
-                f"DEBUG [Web Search]: Sample result - Title: '{results[0]['title'][:50]}...', URL: {results[0]['url'][:50]}..."
-            )
-
-        return results if results else _get_fallback_results(query, num_results)
-
-    except Exception as e:
-        print(f"Web search error: {e}, using fallback")
-        return _get_fallback_results(query, num_results)
+    _ACTIVE_OLLAMA_BASE_URL = None
+    _OLLAMA_HEALTH_CHECKED_AT = now
+    raise RuntimeError("Ollama is not reachable. Checked " + " | ".join(errors))
 
 
-def _get_fallback_results(query: str, num_results: int = 3) -> List[dict]:
-    """
-    Fallback function to generate placeholder web search results.
-    This ensures citations always appear when web search is triggered.
-    """
-    print(
-        f"DEBUG [Fallback]: Generating {num_results} fallback results for query: '{query}'"
+def post_ollama(endpoint: str, payload: dict, *, stream: bool = False, timeout: int = 60):
+    base_url = get_active_ollama_base_url()
+    return requests.post(
+        f"{base_url}{endpoint}",
+        json=payload,
+        stream=stream,
+        timeout=(OLLAMA_CONNECT_TIMEOUT, timeout or OLLAMA_READ_TIMEOUT),
     )
 
-    results = []
-    for i in range(num_results):
-        results.append(
-            {
-                "title": f"Web Search Result {i + 1} for: {query[:50]}",
-                "url": f"https://www.example.com/search?q={query.replace(' ', '+')}&result={i + 1}",
-                "snippet": f"This is a web search result related to: {query}. External source information would appear here.",
-                "access_date": datetime.datetime.now().strftime("%Y, %B %d"),
-            }
-        )
 
-    return results
+def stream_openrouter_chat(messages: list[dict], model: str = OPENROUTER_MODEL):
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is not configured")
 
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": OPENROUTER_HTTP_REFERER,
+        "X-Title": OPENROUTER_TITLE,
+    }
+    payload = {
+        "model": model or OPENROUTER_MODEL,
+        "messages": messages,
+        "stream": True,
+        "temperature": 0.7,
+        "max_tokens": 1000,
+    }
 
-def format_apa_citation(citation_data: dict, source_type: str = "document") -> str:
-    """
-    Format citation data in APA 7th edition format.
-
-    For documents: Author, A. A. (Year). Title. Source. URL
-    For web sources: Author/Organization. (Year, Month Day). Title. Website Name. URL
-    """
-    if source_type == "web":
-        # Web source APA format
-        # Format: *Title*. (Year, Month Day). Retrieved from URL
-        title = citation_data.get("title", "No Title")
-        url = citation_data.get("url", "")
-        access_date = citation_data.get(
-            "access_date", datetime.datetime.now().strftime("%Y, %B %d")
-        )
-
-        apa = f"*{title}*. ({access_date}). Retrieved from {url}"
-        return apa
-
-    else:
-        # Document source APA format
-        author = citation_data.get("author", "")
-        title = citation_data.get("title", citation_data.get("filename", "Untitled"))
-        pub_date = citation_data.get("publication_date", "n.d.")
-        source = citation_data.get("source", "")
-        doi_url = citation_data.get("doi_url", "")
-
-        # Build APA citation
-        parts = []
-
-        # Author (or title if no author)
-        if author:
-            parts.append(f"{author}")
-
-        # Year
-        year = pub_date if pub_date else "n.d."
-        parts.append(f"({year})")
-
-        # Title (italicized for books/reports, in quotes for articles)
-        if title:
-            parts.append(f"*{title}*")
-
-        # Source/Publisher
-        if source:
-            parts.append(f"{source}")
-
-        # DOI or URL
-        if doi_url:
-            if doi_url.startswith("http"):
-                parts.append(f"Retrieved from {doi_url}")
-            else:
-                parts.append(f"https://doi.org/{doi_url}")
-
-        return ". ".join(parts) if parts else "No citation information available"
-
-
-
-
-
-
-# ------------------- Utilities -------------------
+    with requests.post(
+        f"{OPENROUTER_BASE_URL}/chat/completions",
+        headers=headers,
+        json=payload,
+        stream=True,
+        timeout=(10, 90),
+    ) as r:
+        r.raise_for_status()
+        for raw_line in r.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            if raw_line.startswith("data: "):
+                data = raw_line[6:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                    delta = chunk["choices"][0].get("delta", {})
+                    token = delta.get("content", "")
+                    if token:
+                        yield token
+                except Exception:
+                    continue
 
 
 def chunk_text(text: str, max_chunk_size: int = 500) -> list:
@@ -235,115 +182,156 @@ def embed_chunks(
     if not chunks:
         return []
 
-    embeddings = []
-    url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/embeddings"
+    def fetch_embeddings(endpoint: str, payload: dict):
+        resp = post_ollama(endpoint, payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if "embeddings" in data:
+            return data["embeddings"]
+        if "embedding" in data:
+            return [data["embedding"]]
+        return []
 
-    for chunk in chunks:
+    try:
+        embeddings = fetch_embeddings(
+            "/api/embed",
+            {"model": model, "input": chunks, "keep_alive": OLLAMA_KEEP_ALIVE},
+        )
+        if len(embeddings) == len(chunks):
+            return embeddings
+    except Exception:
+        pass
+
+    def embed_one(chunk: str) -> List[float]:
         try:
-            resp = requests.post(
-                url, json={"model": model, "prompt": chunk}, timeout=30
+            embeddings = fetch_embeddings(
+                "/api/embed",
+                {"model": model, "input": chunk, "keep_alive": OLLAMA_KEEP_ALIVE},
+            )
+            if embeddings:
+                return embeddings[0]
+        except Exception:
+            pass
+
+        try:
+            resp = post_ollama(
+                "/api/embeddings",
+                {"model": model, "prompt": chunk, "keep_alive": OLLAMA_KEEP_ALIVE},
+                timeout=30,
             )
             resp.raise_for_status()
-            embeddings.append(resp.json().get("embedding", []))
+            data = resp.json()
+            return data.get("embedding", data.get("embeddings", [[0.0] * 384])[0])
         except Exception:
-            embeddings.append([0.0] * 384)
-    return embeddings
+            return [0.0] * 384
+
+    if len(chunks) == 1:
+        return [embed_one(chunks[0])]
+
+    max_workers = max(1, min(OLLAMA_EMBED_CONCURRENCY, len(chunks)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        return list(executor.map(embed_one, chunks))
 
 
-def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
-    if not vec1 or not vec2:
-        return 0.0
-    v1 = np.array(vec1)
-    v2 = np.array(vec2)
-    dot = np.dot(v1, v2)
-    n1 = np.linalg.norm(v1)
-    n2 = np.linalg.norm(v2)
-    return dot / (n1 * n2) if n1 and n2 else 0.0
-
-
-def get_relevant_chunks(question: str, top_k: int = 3) -> List[dict]:
-    """Get relevant chunks with citation information"""
+def get_relevant_chunks(
+    question: str, top_k: int = 3, document_names: Optional[List[str]] = None
+) -> List[dict]:
+    """Get relevant chunks ranked by embedding similarity."""
+    conn = None
     try:
         conn = connect_to_postgres()
+        if conn is None:
+            return []
         c = conn.cursor()
-        c.execute("""
-            SELECT dc.chunk_text, dc.embedding_json, dc.document_id,
-                   d.filename, d.author, d.title, d.publication_date, d.source, d.doi_url
-            FROM document_chunks dc
-            JOIN documents d ON dc.document_id = d.id
-        """)
-        rows = c.fetchall()
-        conn.close()
-
-        if not rows:
-            return []
-
-        q_vec = np.array(embed_chunks([question])[0])
-        norm_q = np.linalg.norm(q_vec)
-        if norm_q == 0:
-            return []
-
-        # Vectorized calculation
-        embeddings = []
-        valid_rows = []
-
-        for row in rows:
-            try:
-                emb = json.loads(row[1])
-                if len(emb) == len(q_vec):
-                    embeddings.append(emb)
-                    valid_rows.append(row)
-            except Exception:
-                continue
-
-        if not embeddings:
-            return []
-
-        # Convert to numpy array for fast calculation
-        emb_matrix = np.array(embeddings)
-
-        # Calculate dot products
-        dots = np.dot(emb_matrix, q_vec)
-
-        # Calculate norms
-        norms = np.linalg.norm(emb_matrix, axis=1)
-
-        # Calculate similarities (avoid division by zero)
-        mask = norms > 0
-        sims = np.zeros_like(dots)
-        sims[mask] = dots[mask] / (norms[mask] * norm_q)
-
-        # Get top K indices
-        # Use simple sort if few items, partition if many
-        if len(sims) > top_k:
-            # fast partition for top k (unsorted)
-            top_indices = np.argpartition(sims, -top_k)[-top_k:]
-            # sort these top k
-            top_indices = top_indices[np.argsort(sims[top_indices])[::-1]]
+        question_embedding = embed_chunks([question])[0]
+        if document_names:
+            c.execute(
+                """
+                SELECT
+                    dc.chunk_text,
+                    1 - (dc.embedding <=> %s::vector) AS similarity
+                FROM document_chunks dc
+                JOIN documents d ON d.id = dc.document_id
+                WHERE dc.embedding IS NOT NULL
+                  AND d.filename = ANY(%s)
+                ORDER BY dc.embedding <=> %s::vector
+                LIMIT %s
+                """,
+                (question_embedding, document_names, question_embedding, top_k),
+            )
         else:
-            top_indices = np.argsort(sims)[::-1]
+            c.execute(
+                """
+                SELECT
+                    dc.chunk_text,
+                    1 - (dc.embedding <=> %s::vector) AS similarity
+                FROM document_chunks dc
+                WHERE dc.embedding IS NOT NULL
+                ORDER BY dc.embedding <=> %s::vector
+                LIMIT %s
+                """,
+                (question_embedding, question_embedding, top_k),
+            )
+        rows = c.fetchall()
 
         scored = []
-        for idx in top_indices:
-            row = valid_rows[idx]
-            text, _, doc_id, filename, author, title, pub_date, source, doi_url = row
-
-            citation = {
-                "filename": filename,
-                "author": author,
-                "title": title,
-                "publication_date": pub_date,
-                "source": source,
-                "doi_url": doi_url,
-            }
-            scored.append(
-                {"text": text, "similarity": float(sims[idx]), "citation": citation}
-            )
+        for text, similarity in rows:
+            scored.append({"text": text, "similarity": float(similarity)})
 
         return scored
     except Exception as e:
         print(f"Error in get_relevant_chunks: {e}")
         return []
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def get_documents_by_filenames(document_names: List[str]) -> List[dict]:
+    if not document_names:
+        return []
+
+    conn = None
+    try:
+        conn = connect_to_postgres()
+        if conn is None:
+            return []
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT filename, title, content
+            FROM documents
+            WHERE filename = ANY(%s)
+            """,
+            (document_names,),
+        )
+        rows = c.fetchall()
+        return [
+            {"filename": r[0], "title": r[1], "content": r[2]}
+            for r in rows
+        ]
+    except Exception as e:
+        print(f"Error retrieving documents by filename: {e}")
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def is_summary_question(question: str) -> bool:
+    normalized = question.lower()
+    summary_markers = [
+        "summary",
+        "summarize",
+        "summarise",
+        "overview",
+        "briefly",
+        "in short",
+        "1-2 sentences",
+        "one or two sentences",
+        "write the summary",
+    ]
+    return any(marker in normalized for marker in summary_markers)
 
 
 def get_relevant_history(
@@ -353,17 +341,22 @@ def get_relevant_history(
         conn = connect_to_postgres()
         c = conn.cursor()
 
-        user_id = 0
+        user_id = None
         if token:
             c.execute("SELECT id FROM users WHERE token = %s", (token,))
             row = c.fetchone()
             if row:
                 user_id = row[0]
 
-        c.execute("INSERT INTO users (id, username) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING", (0, "anonymous"))
-        conn.commit()
-
-        c.execute("SELECT id, ts, selected_text, question, answer FROM chat_history WHERE user_id = %s ORDER BY id DESC LIMIT 20", (user_id,))
+        if user_id:
+            c.execute(
+                "SELECT id, ts, selected_text, question, answer FROM chat_history WHERE user_id = %s ORDER BY id DESC LIMIT 20",
+                (user_id,),
+            )
+        else:
+            c.execute(
+                "SELECT id, ts, selected_text, question, answer FROM chat_history WHERE user_id IS NULL ORDER BY id DESC LIMIT 20"
+            )
         rows = c.fetchall()
         conn.close()
 
@@ -477,32 +470,44 @@ async def upload_documents(
             embeddings = embed_chunks(chunks)
 
             conn = connect_to_postgres()
-            c = conn.cursor()
-            c.execute(
-             """INSERT INTO documents
-            (filename, upload_timestamp, content, author, title, publication_date, source, doi_url)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id""",
-            (
-            f.filename,
-            datetime.datetime.now().isoformat(),
-            text,
-            author,
-            title,
-            publication_date,
-            source,
-            doi_url,
-            ),
-            )
+            if conn is None:
+                raise HTTPException(500, "Failed to connect to PostgreSQL")
+            try:
+                c = conn.cursor()
+                c.execute(
+                    """
+                    INSERT INTO documents
+                    (filename, upload_timestamp, content, author, title, publication_date, source, doi_url)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        f.filename,
+                        datetime.datetime.now().isoformat(),
+                        text,
+                        author,
+                        title,
+                        publication_date,
+                        source,
+                        doi_url,
+                    ),
+                )
 
-            doc_id = c.fetchone()[0]
+                doc_id = c.fetchone()[0]
 
-            for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
-               c.execute("INSERT INTO document_chunks (document_id, chunk_text, chunk_index, embedding_json) VALUES (%s, %s, %s, %s)", (doc_id, chunk, i, json.dumps(emb)))
+                for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+                    c.execute(
+                        """
+                        INSERT INTO document_chunks
+                        (document_id, chunk_text, chunk_index, embedding)
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                        (doc_id, chunk, i, emb),
+                    )
 
-
-            conn.commit()
-            conn.close()
+                conn.commit()
+            finally:
+                conn.close()
 
             results.append(
                 {
@@ -510,13 +515,6 @@ async def upload_documents(
                     "filename": f.filename,
                     "document_id": doc_id,
                     "chunks_count": len(chunks),
-                    "citation": {
-                        "author": author,
-                        "title": title,
-                        "publication_date": publication_date,
-                        "source": source,
-                        "doi_url": doi_url,
-                    },
                 }
             )
         except Exception as e:
@@ -528,177 +526,148 @@ async def upload_documents(
 
 @app.post("/ask")
 async def ask_question(request: AskRequest):
-    context_chunks_with_citations = get_relevant_chunks(request.question, top_k=2)
-    history = get_relevant_history(
-        request.question, request.selected_text, token=request.auth_token
+    system_prompt = (
+        "You are SynergeReader, a document assistant. "
+        "Answer only from the provided context when possible. "
+        "If the context is insufficient, say what is missing instead of guessing. "
+        "Do not include internal tags, JSON, or the words CONTEXT/QUESTION in the answer."
     )
-
-    # Get relevant knowledge base entries
-    kb_entries = get_relevant_knowledge_base(request.question, limit=2)
-
-    # Check if we have any document context and how relevant it is
-    best_similarity = 0.0
-    use_external_rag = False
-    external_sources = []
-
-    if context_chunks_with_citations:
-        best_similarity = max(
-            chunk["similarity"] for chunk in context_chunks_with_citations
-        )
-
-    # Smart RAG Logic:
-    # - If NO documents exist: use web search
-    # - If similarity is below SIMILARITY_THRESHOLD: question is likely unrelated to docs, use web search
-    # - Otherwise: use documents and let LLM answer from them
-    # Using the configurable SIMILARITY_THRESHOLD defined at the top of the file
-
-    print(f"DEBUG: Question: '{request.question}'")
-    if context_chunks_with_citations:
-        print(f"DEBUG: Best Document Similarity: {best_similarity:.4f}")
-    else:
-        print("DEBUG: No documents in database")
-
-    if not context_chunks_with_citations or len(context_chunks_with_citations) == 0:
-        print("No documents found in database, using external RAG...")
-        use_external_rag = True
-        external_sources = perform_web_search(request.question, num_results=3)
-    elif best_similarity < SIMILARITY_THRESHOLD:
-        print(
-            f"Low similarity ({best_similarity:.3f} < {SIMILARITY_THRESHOLD}), attempting external RAG..."
-        )
-        external_sources = perform_web_search(request.question, num_results=3)
-
-        if external_sources:
-            print(f"External RAG successful: Found {len(external_sources)} sources.")
-            use_external_rag = True
-        else:
-            print(
-                "External RAG failed (no results). Falling back to document chunks despite low similarity."
-            )
-            use_external_rag = False  # Fallback to docs
-
-    # Build context for LLM (without citation details in prompt - citations only in the citations section)
-    prompt_text = ""
-    citations_list = []
-    apa_citations_list = []  # For APA formatted display
-
-    source_counter = 1
-
-    # Add document sources ONLY if not using external RAG (documents are relevant OR web search failed)
-    if context_chunks_with_citations and not use_external_rag:
-        for chunk_data in context_chunks_with_citations:
-            chunk_text = chunk_data["text"]
-            citation = chunk_data["citation"]
-
-            # Add chunk text to prompt WITHOUT citation details
-            prompt_text += f"\n\n{chunk_text}"
-
-            # Format APA citation for display only
-            apa_citation = format_apa_citation(citation, source_type="document")
-            apa_citations_list.append(
-                {"source_num": source_counter, "apa": apa_citation, "type": "document"}
-            )
-
-            # Simple citation reference for internal tracking
-            citation_str = f"[Source {source_counter}]"
-            if citation.get("title"):
-                citation_str += f" {citation['title']}"
-            citations_list.append(citation_str)
-            source_counter += 1
-
-    # Add external sources when question is unrelated to documents
-    if use_external_rag and external_sources:
-        for ext_source in external_sources:
-            # Add snippet to prompt WITHOUT citation details
-            prompt_text += f"\n\n{ext_source['snippet']}"
-
-            citation_str = f"[Source {source_counter}] {ext_source['title']}"
-            citations_list.append(citation_str)
-
-            # Format APA citation for web sources
-            apa_citation = format_apa_citation(ext_source, source_type="web")
-            apa_citations_list.append(
-                {"source_num": source_counter, "apa": apa_citation, "type": "external"}
-            )
-            source_counter += 1
-
-    # Debug logging for citation data
-    print(f"DEBUG [Citations]: Total citations prepared: {len(apa_citations_list)}")
-    if apa_citations_list:
-        print(f"DEBUG [Citations]: Sample APA citation: {apa_citations_list[0]}")
-
-    if request.selected_text:
-        prompt_text += "\n\n" + request.selected_text
-
-    # Add knowledge base entries to the prompt if available
-    kb_context = ""
-    if kb_entries:
-        kb_context = "\n\n<knowledge_base>\nThe following are verified answers from the knowledge base:\n"
-        for entry in kb_entries:
-            kb_context += f"\nQ: {entry['question']}\nA: {entry['answer']}\n"
-        kb_context += "</knowledge_base>\n"
-
-    # Simplified prompt without citation instructions (citations handled in UI)
-    prompt = f"{kb_context}<context>\n{prompt_text}\n</context>\n\n<question>\n{request.question}\n</question>\n\nPlease answer the question based on the context provided above. Be concise and helpful."
 
     answer_parts = []
     entry_id = None
+    selected_items = list(request.selections or [])
+    raw_selected_text = (request.selected_text or "").strip()
+    selected_document_names = []
+
+    for selection in selected_items:
+        if selection.document_name and selection.document_name not in selected_document_names:
+            selected_document_names.append(selection.document_name)
+
+    if request.active_document_name and request.active_document_name not in selected_document_names:
+        selected_document_names.append(request.active_document_name)
+
+    def build_context() -> tuple[str, List[dict], float, str]:
+        if selected_items:
+            prompt_text = "\n\n---\n\n".join(
+                f"[Selection {index + 1} from: {selection.document_name}]\n{selection.text}"
+                for index, selection in enumerate(selected_items)
+            )
+            return prompt_text, [{"text": prompt_text, "similarity": 1.0}], 1.0, "selected_text"
+
+        if raw_selected_text:
+            return raw_selected_text, [{"text": raw_selected_text, "similarity": 1.0}], 1.0, "selected_text"
+
+        if request.active_document_name:
+            documents = get_documents_by_filenames([request.active_document_name])
+            if documents:
+                document = documents[0]
+                document_text = document["content"] or ""
+                if len(document_text) > 14000:
+                    document_text = (
+                        document_text[:14000]
+                        + "\n\n[Truncated to keep the prompt responsive.]"
+                    )
+                display_name = document["title"] or document["filename"]
+                prompt_text = (
+                    f"Document title: {display_name}\n"
+                    f"Document file: {document['filename']}\n\n"
+                    f"{document_text}"
+                )
+                return prompt_text, [{"text": prompt_text, "similarity": 1.0}], 1.0, "active_document"
+
+        scoped_names = [
+            name for name in selected_document_names if name and name != request.active_document_name
+        ]
+        if request.active_document_name and request.active_document_name not in scoped_names:
+            scoped_names.insert(0, request.active_document_name)
+
+        if scoped_names and is_summary_question(request.question):
+            scoped_documents = get_documents_by_filenames(scoped_names)
+            if scoped_documents:
+                parts = []
+                for document in scoped_documents:
+                    document_text = document["content"] or ""
+                    if len(document_text) > 12000:
+                        document_text = (
+                            document_text[:12000]
+                            + "\n\n[Truncated to keep the prompt responsive.]"
+                        )
+                    display_name = document["title"] or document["filename"]
+                    parts.append(
+                        f"Document title: {display_name}\n"
+                        f"Document file: {document['filename']}\n\n"
+                        f"{document_text}"
+                    )
+                prompt_text = "\n\n---\n\n".join(parts)
+                return prompt_text, [{"text": part, "similarity": 1.0} for part in parts], 1.0, "summary_document"
+
+        if scoped_names:
+            context_chunks = get_relevant_chunks(
+                request.question, top_k=4, document_names=scoped_names
+            )
+        else:
+            context_chunks = get_relevant_chunks(request.question, top_k=4)
+
+        prompt_text = ""
+        for chunk_data in context_chunks:
+            prompt_text += f"\n\n{chunk_data['text']}"
+
+        best_similarity = max(
+            (chunk["similarity"] for chunk in context_chunks), default=0.0
+        )
+        return prompt_text, context_chunks, best_similarity, "retrieval"
+
+    def build_prompt(prompt_text: str) -> str:
+        return f"""<context>
+{prompt_text}
+</context>
+
+<question>
+{request.question}
+</question>
+
+Answer using only the provided context when it contains relevant information.
+If the context is insufficient, say what is missing instead of guessing.
+Do not include internal tags, metadata, JSON, or the words CONTEXT/QUESTION in the answer.
+If a specific document or highlighted excerpt was provided, treat it as the primary source and do not mix in unrelated documents.
+Keep the answer concise, structured, and directly responsive to the question."""
 
     def stream_generate():
         nonlocal answer_parts, entry_id
+        yield "__SEARCHING__\n"
 
-        # Determine if external sources were used
-        has_external_sources = use_external_rag and len(external_sources) > 0
-
-        # Determine citation note message
-        if not has_external_sources:
-            if best_similarity < SIMILARITY_THRESHOLD and context_chunks_with_citations:
-                citation_note = f"No external sources found. Showing best available documents (low relevance: {best_similarity:.2f})."
-            else:
-                citation_note = "No external sources used"
-        elif not context_chunks_with_citations:
-            citation_note = "External sources used (no documents in database)"
-        else:
-            citation_note = f"External sources used (question unrelated to uploaded documents, similarity: {best_similarity:.2f})"
-
-        # Send context data including external source flag and APA citations
-        context_data = {
-            "context_chunks": [
-                chunk_data["text"] for chunk_data in context_chunks_with_citations
-            ]
-            if context_chunks_with_citations and not use_external_rag
-            else [],
-            "citations": citations_list,
-            "apa_citations": apa_citations_list,
-            "has_external_sources": has_external_sources,
-            "similarity_score": best_similarity,
-            "citation_note": citation_note,
-        }
-
-        print(
-            f"DEBUG [Stream]: Sending context_data with {len(apa_citations_list)} APA citations"
-        )
-        print(f"DEBUG [Stream]: has_external_sources = {has_external_sources}")
-        if apa_citations_list:
-            print(
-                f"DEBUG [Stream]: First APA citation type: {apa_citations_list[0].get('type', 'unknown')}"
-            )
-
-        yield f"__CONTEXT__{json.dumps(context_data)}__\n\n"
-        
-        print("DEBUG: Context sent. Starting LLM streaming...")
-        yield "__READY__\n"
-
-        url = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/generate"
-        payload = {
-            "model": request.model,
-            "prompt": prompt,
-            "max_tokens": 1000,
-            "temperature": 0.7,
-            "stream": True,
-        }
+        stream_error = None
         try:
-            with requests.post(url, json=payload, stream=True, timeout=60) as r:
+            prompt_text, context_chunks, best_similarity, context_source = build_context()
+            prompt = build_prompt(prompt_text)
+            fallback_messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ]
+            context_data = {
+                "context_chunks": [chunk_data["text"] for chunk_data in context_chunks],
+                "similarity_score": best_similarity,
+                "context_source": context_source,
+                "active_document_name": request.active_document_name,
+            }
+
+            yield f"__CONTEXT__{json.dumps(context_data)}__\n\n"
+            yield "__READY__\n"
+
+            payload = {
+                "model": request.model,
+                "prompt": prompt,
+                "max_tokens": 1000,
+                "temperature": 0.7,
+                "stream": True,
+                "keep_alive": OLLAMA_KEEP_ALIVE,
+            }
+        except Exception as e:
+            yield f"__ERROR__Failed to build document context: {e}__"
+            return
+
+        try:
+            with post_ollama("/api/generate", payload, stream=True, timeout=60) as r:
                 r.raise_for_status()
                 buffer = ""
                 token_count = 0
@@ -716,9 +685,8 @@ async def ask_question(request: AskRequest):
                                     token = data.get("response", "")
                                     if token:
                                         token_count += 1
-                                        print(f"DEBUG: Yielding token #{token_count}: {repr(token[:50])}")
                                         answer_parts.append(token)
-                                        yield token + "\n"
+                                        yield token
                                 except Exception as e:
                                     print(f"DEBUG: JSON parse error: {e}")
                                     continue
@@ -729,22 +697,45 @@ async def ask_question(request: AskRequest):
                         token = data.get("response", "")
                         if token:
                             token_count += 1
-                            print(f"DEBUG: Yielding final token #{token_count}: {repr(token[:50])}")
                             answer_parts.append(token)
                             yield token
                     except Exception:
                         pass
                 print(f"DEBUG: Streaming complete. Total tokens: {token_count}")
         except Exception as e:
-            print(f"DEBUG: Exception during streaming: {e}")
-            yield f"__ERROR__LLM streaming error: {e}__"
+            stream_error = str(e)
+            if OPENROUTER_API_KEY:
+                try:
+                    answer_parts.clear()
+                    for token in stream_openrouter_chat(
+                        fallback_messages, model=OPENROUTER_MODEL
+                    ):
+                        answer_parts.append(token)
+                        yield token
+                    stream_error = None
+                except Exception as fallback_error:
+                    print(f"DEBUG: OpenRouter fallback failed: {fallback_error}")
+                    response = getattr(fallback_error, "response", None)
+                    if response is not None:
+                        yield f"__ERROR__LLM request failed with HTTP {response.status_code}. Check model access in OpenRouter.__"
+                    else:
+                        yield "__ERROR__The local LLM server is not reachable and OpenRouter fallback is unavailable.__"
+            else:
+                response = getattr(e, "response", None)
+                if response is not None:
+                    yield f"__ERROR__LLM request failed with HTTP {response.status_code}. Check that model '{request.model}' is installed in Ollama.__"
+                else:
+                    yield "__ERROR__The local LLM server is not reachable. Start Ollama or update OLLAMA_BASE_URL / OLLAMA_PORT in .env.__"
+
+        if stream_error or not answer_parts:
+            return
 
         full_answer = "".join(answer_parts)
         try:
             conn = connect_to_postgres()
             c = conn.cursor()
 
-            user_id = 0
+            user_id = None
             if request.auth_token:
                 c.execute("SELECT id FROM users WHERE token = %s", (request.auth_token,))
                 row = c.fetchone()
@@ -759,7 +750,7 @@ async def ask_question(request: AskRequest):
                 """,
                 (
                     datetime.datetime.now().isoformat(),
-                    request.selected_text,
+                    request.selected_text or "",
                     request.question,
                     full_answer,
                     user_id,
@@ -787,7 +778,7 @@ async def ask_question(request: AskRequest):
 
 @app.post("/history", response_model=List[HistoryItem])
 async def get_history(request: HistoryRequest):
-    user_id = 0
+    user_id = None
     if request.token:
         conn = connect_to_postgres()
         c = conn.cursor()
@@ -802,7 +793,15 @@ async def get_history(request: HistoryRequest):
     try:
         conn = connect_to_postgres()
         c = conn.cursor()
-        c.execute("SELECT id, ts, selected_text, question, answer FROM chat_history WHERE user_id = %s ORDER BY id DESC LIMIT 20", (user_id,))
+        if user_id:
+            c.execute(
+                "SELECT id, ts, selected_text, question, answer FROM chat_history WHERE user_id = %s ORDER BY id DESC LIMIT 20",
+                (user_id,),
+            )
+        else:
+            c.execute(
+                "SELECT id, ts, selected_text, question, answer FROM chat_history WHERE user_id IS NULL ORDER BY id DESC LIMIT 20"
+            )
         rows = c.fetchall()
         conn.close()
         return [
@@ -850,12 +849,15 @@ class DeleteDocumentRequest(BaseModel):
 @app.delete("/documents/delete")
 async def delete_document(request: DeleteDocumentRequest):
     """Delete a document and its chunks from the database"""
+    conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect_to_postgres()
+        if conn is None:
+            raise HTTPException(500, "Failed to connect to PostgreSQL")
         c = conn.cursor()
         
         # First, find the document by filename
-        c.execute("SELECT id FROM documents WHERE filename = ?", (request.filename,))
+        c.execute("SELECT id FROM documents WHERE filename = %s", (request.filename,))
         row = c.fetchone()
         
         if not row:
@@ -865,14 +867,13 @@ async def delete_document(request: DeleteDocumentRequest):
         doc_id = row[0]
         
         # Delete associated chunks first (foreign key constraint)
-        c.execute("DELETE FROM document_chunks WHERE document_id = ?", (doc_id,))
+        c.execute("DELETE FROM document_chunks WHERE document_id = %s", (doc_id,))
         chunks_deleted = c.rowcount
         
         # Delete the document
-        c.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+        c.execute("DELETE FROM documents WHERE id = %s", (doc_id,))
         
         conn.commit()
-        conn.close()
         
         return {
             "message": "Document deleted successfully",
@@ -884,6 +885,9 @@ async def delete_document(request: DeleteDocumentRequest):
         raise
     except Exception as e:
         raise HTTPException(500, str(e))
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 @app.put("/put_ratings")

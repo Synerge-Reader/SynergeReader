@@ -1,9 +1,33 @@
-version: "3.8"
 networks:
   default:
     external: true
     name: agent_network
 services:
+  ollama:
+    image: ollama/ollama:latest
+    environment:
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE}
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: synergereader
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d synergereader"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
   backend:
     build:
       context: ./synerge-reader-backend
@@ -13,14 +37,18 @@ services:
     volumes:
       - ./synerge-reader-backend:/app
       - chroma_data:/app/chroma_db
-      - sqlite_data:/app/db
     environment:
       - PYTHONUNBUFFERED=1
-      - OLLAMA_HOST=${OLLAMA_HOST}
-      - OLLAMA_PORT=${OLLAMA_PORT}
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
       - DB_CONNECTION_STRING=${DB_CONNECTION_STRING}
       - EMAIL_KEY=${EMAIL_KEY}
+    depends_on:
+      ollama:
+        condition: service_started
+      db:
+        condition: service_healthy
     restart: unless-stopped
   frontend:
     build:
@@ -52,4 +80,5 @@ services:
     restart: unless-stopped
 volumes:
   chroma_data:
-  sqlite_data:
+  ollama_data:
+  pgdata:

@@ -1,4 +1,4 @@
-# System Architecture: Citations & Knowledge Base
+# System Architecture: Retrieval & Knowledge Base
 
 ## Overall System Flow
 
@@ -22,7 +22,7 @@
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                   DATABASE (SQLite)                             │
+│              DATABASE (PostgreSQL + pgvector)                  │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
 │  │  documents   │  │ chat_history │  │  knowledge_base      │  │
 │  │  (citations) │  │              │  │  (corrections)       │  │
@@ -251,7 +251,7 @@
 │  │ document_id (FK) ──► documents.id                     │  │
 │  │ chunk_text                                            │  │
 │  │ chunk_index                                           │  │
-│  │ embedding_json                                        │  │
+│  │ embedding vector(384)                                 │  │
 │  └───────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 

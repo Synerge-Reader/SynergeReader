@@ -3,14 +3,12 @@ import { useState, useEffect } from "react";
 
 // Model to Domain mapping
 const MODEL_DOMAIN_MAP = {
-  "llama3.1:8b": "General Domain",
   "qwen3:latest": "General Domain",
   "OussamaELALLAM/MedExpert:latest": "Medical Domain",
   "adrienbrault/saul-instruct-v1:Q8_0": "Legal Domain",
 };
 
 const MODEL_OPTIONS = [
-  { label: "LLaMA 3.1 8B", value: "llama3.1:8b", domain: "General Domain" },
   { label: "Qwen3", value: "qwen3:latest", domain: "General Domain" },
   { label: "MedExpert", value: "OussamaELALLAM/MedExpert:latest", domain: "Medical Domain" },
   { label: "Saul Instruct", value: "adrienbrault/saul-instruct-v1:Q8_0", domain: "Legal Domain" },
