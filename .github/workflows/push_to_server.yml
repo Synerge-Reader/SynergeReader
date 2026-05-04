@@ -1,9 +1,7 @@
 name: Deploy SynergeReader
-
 # 1️⃣ Manual trigger
 on:
   workflow_dispatch:
-
 jobs:
   deploy:
     runs-on: self-hosted
@@ -11,18 +9,24 @@ jobs:
     steps:
       - name: Check Runner User
         run: whoami
-
       - name: Checkout Repo
         uses: actions/checkout@v3
-
       # 2️⃣ Get runner IP and set as environment variable
       - name: Get Runner IP
         id: get_ip
         run: |
           IP=$(hostname -I | awk '{print $1}')
           echo "RUNNER_IP=$IP" >> $GITHUB_ENV
-
-      # 3️⃣ Sync repository to target directory
+      # 3️⃣ Backup current deployment before overwriting
+      - name: Backup Current Deployment
+        run: |
+          if [ -d "/mnt/2025-legalread/repo" ]; then
+            cp -r /mnt/2025-legalread/repo /mnt/2025-legalread/repo-backup
+            echo "Backup completed successfully"
+          else
+            echo "No existing deployment to back up — skipping"
+          fi
+      # 4️⃣ Sync repository to target directory
       - name: Sync Repo to Target Directory
         run: |
           echo "Before step: $(whoami)"
@@ -30,18 +34,22 @@ jobs:
           mkdir -p $TARGET_DIR
           rsync -av --exclude='.github' ./ $TARGET_DIR/
           echo "After step: $(whoami)"
-
+      # 5️⃣ Build first while site is live, then do a quick swap
       - name: Build & Start Containers
         run: |
+          set -e
           echo "Before step: $(whoami)"
           cd /mnt/2025-legalread/repo
-          docker-compose down
+          echo "Building new images — site remains live during this step..."
           docker-compose build --no-cache
+          echo "Swapping containers — brief downtime starts here..."
+          docker-compose down
           docker-compose up -d
+          echo "Containers back online."
           echo "After step: $(whoami)"
-
       - name: Show Container Status
         run: |
           echo "Before step: $(whoami)"
           docker ps
           echo "After step: $(whoami)"
+          
