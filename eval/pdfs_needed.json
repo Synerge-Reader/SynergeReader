@@ -1,0 +1,26 @@
+[
+  {
+    "document_name": "Apple_Environmental_Progress_Report_2024",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/Apple_Environmental_Progress_Report_2024.pdf"
+  },
+  {
+    "document_name": "Samsung_Electronics_Sustainability_Report_2024_ENG",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/Samsung_Electronics_Sustainability_Report_2024_ENG.pdf"
+  },
+  {
+    "document_name": "bnp_paribas_2023_climate_report",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/bnp_paribas_2023_climate_report.pdf"
+  },
+  {
+    "document_name": "SUEZ_SD_Progress report 2023",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/SUEZ_SD_Progress report 2023.pdf"
+  },
+  {
+    "document_name": "2024 Alibaba Group Environmental, Social and Governance Report-0809",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/2024 Alibaba Group Environmental, Social and Governance Report-0809.pdf"
+  },
+  {
+    "document_name": "2023sr_en",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/2023sr_en.pdf"
+  }
+]

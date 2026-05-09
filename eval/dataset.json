@@ -1,0 +1,137 @@
+[
+  {
+    "question": "According to the company's Disclosure from FY2023, which topics have been assessed to be material?",
+    "expected_answer": "According to the company's statement for fiscal 2023, the following topics are considered material: Emissions (including carbon neutrality, clean electricity), Materials (recycled and renewable materials, recycled cobalt, tin, gold, and rare earth elements, remove plastics), Resources (water, waste).",
+    "document_name": "Apple_Environmental_Progress_Report_2024",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/Apple_Environmental_Progress_Report_2024.pdf",
+    "pdfqa_id": "0",
+    "answer_type": null,
+    "model": "qwen3"
+  },
+  {
+    "question": "Does the company operate in a high emitting sector as of FY2023?",
+    "expected_answer": "Not available in the retrieved information.",
+    "document_name": "Apple_Environmental_Progress_Report_2024",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/Apple_Environmental_Progress_Report_2024.pdf",
+    "pdfqa_id": "1",
+    "answer_type": null,
+    "model": "qwen3"
+  },
+  {
+    "question": "What is the company's carbon intensity (in TCO₂ per million USD) for FY2023? If not available, calculate it by dividing the total carbon emissions by the year's revenue.",
+    "expected_answer": "Not available in the retrieved information.",
+    "document_name": "Apple_Environmental_Progress_Report_2024",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/Apple_Environmental_Progress_Report_2024.pdf",
+    "pdfqa_id": "2",
+    "answer_type": null,
+    "model": "qwen3"
+  },
+  {
+    "question": "According to the company's Disclosure from FY2023, which topics have been assessed to be material?",
+    "expected_answer": "According to the company's statement for fiscal 2023, the following topics are considered important: Environmental (Climate Change and Energy, Water, Resource Circularity and Waste), Social (Working Conditions - Employees, Supply Chain, Information Security and Protection, Product Quality and Safety) and Governance(Business Conduct).",
+    "document_name": "Samsung_Electronics_Sustainability_Report_2024_ENG",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/Samsung_Electronics_Sustainability_Report_2024_ENG.pdf",
+    "pdfqa_id": "3",
+    "answer_type": null,
+    "model": "qwen3"
+  },
+  {
+    "question": "Does the company have a decarbonization trajectory compatible with a 1.5 or 2 degree scenario?",
+    "expected_answer": "Samsung Electronics does not explicitly state that its decarbonization pathway is formally validated or fully aligned with a 1.5°C scenario. However, the company does incorporate a “2°C or lower” scenario into its climate strategy planning, as part of its TCFD-aligned approach. They discuss “aggressive action” scenarios that require ambitious targets, including expanded renewable energy, improved product energy efficiency, and continued investment in ultra-low-power semiconductors. Overall, their public commitments are net zero (Scope 1 and 2) by 2030 for the DX Division and by 2050 for the DS Division, along with efforts to reduce value-chain emissions.",
+    "document_name": "Samsung_Electronics_Sustainability_Report_2024_ENG",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/Samsung_Electronics_Sustainability_Report_2024_ENG.pdf",
+    "pdfqa_id": "4",
+    "answer_type": null,
+    "model": "qwen3"
+  },
+  {
+    "question": "Does the company operate in a high emitting sector as of FY2023?",
+    "expected_answer": "Not available in the retrieved information.",
+    "document_name": "Samsung_Electronics_Sustainability_Report_2024_ENG",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/Samsung_Electronics_Sustainability_Report_2024_ENG.pdf",
+    "pdfqa_id": "5",
+    "answer_type": null,
+    "model": "qwen3"
+  },
+  {
+    "question": "What is the total carbon footprint of the company, that is the sum of the scopes 1, 2 and 3 emissions (in TCO2e), for FY2023? If the total value is directly available, provide it instead of calculating the sum.",
+    "expected_answer": "Not available in the retrieved information",
+    "document_name": "Samsung_Electronics_Sustainability_Report_2024_ENG",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/Samsung_Electronics_Sustainability_Report_2024_ENG.pdf",
+    "pdfqa_id": "6",
+    "answer_type": null,
+    "model": "qwen3"
+  },
+  {
+    "question": "Does the company operate in a high emitting sector as of FY2023?",
+    "expected_answer": "Not available in the retrieved information.",
+    "document_name": "bnp_paribas_2023_climate_report",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/bnp_paribas_2023_climate_report.pdf",
+    "pdfqa_id": "7",
+    "answer_type": null,
+    "model": "qwen3"
+  },
+  {
+    "question": "Has the company identified significant decarbonization levers ? If yes, detail them.",
+    "expected_answer": "Yes, BNP Paribas has identified significant decarbonization levers to support its net-zero goals and the transition to a low-carbon economy:\n\nLow-Carbon Financing: allocated €32 billion to low-carbon energy by 2023, targeting 90% of its energy financing toward low-carbon energy by 2030. Discontinued financing for new oil and gas projects and committed to reducing oil financing by 80% and gas financing by 30% by 2030.\n\nSectoral Policies: full exit from thermal coal financing by 2030 in OECD/EU countries and 2040 globally.\n\nSupport for Renewable Energy and Clean Technologies: funded projects like offshore wind farms, solar projects, and energy storage systems globally.\n\nDecarbonizing Client Portfolios: supported corporate and institutional clients' transition through the Low-Carbon Transition Group, providing tools and financing for green hydrogen, battery manufacturing, and other technologies.\n\nSustainable Mobility and Green Investments: investments in electric vehicle (EV) manufacturing, battery gigafactories, and charging infrastructure.\n\nOperational Emission Reductions: reduced its operational carbon footprint to 1.56 tCO₂e per FTE in 2023, exceeding targets for 2025.",
+    "document_name": "bnp_paribas_2023_climate_report",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/bnp_paribas_2023_climate_report.pdf",
+    "pdfqa_id": "8",
+    "answer_type": null,
+    "model": "qwen3"
+  },
+  {
+    "question": "Does the company operate in a high emitting sector as of FY2023?",
+    "expected_answer": "Not available in the retrieved information.",
+    "document_name": "SUEZ_SD_Progress report 2023",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/SUEZ_SD_Progress report 2023.pdf",
+    "pdfqa_id": "9",
+    "answer_type": null,
+    "model": "qwen3"
+  },
+  {
+    "question": "Has the company identified significant decarbonization levers ? If yes, detail them.",
+    "expected_answer": "Yes, Suez has identified decarbonization levers:\n\nSelf-Sufficiency in Renewable Energy: achieved electricity self-sufficiency in Europe by producing energy from waste and wastewater.\n\nGreen Energy Transition & Carbon Reduction: launched large-scale projects such as the anaerobic digester at the Pau wastewater treatment plant in France to generate energy from waste. Increased use of Solid Recovered Fuel (SRF), replacing gas and coal, reducing emissions from industrial processes.\n\nReduction of Scope 1 & 2 Emissions: decreased Scope 1 & 2 emissions from recycling and recovery activities by 11.3% between 2021 and 2023. Improved biogas capture at waste storage sites in Morocco, France, and the UK.\n\nSustainable Electricity Consumption: over 30% of Suez’s electricity consumption in Europe now comes from renewable or recycled energy. Signed Power Purchase Agreements (PPAs) for solar photovoltaic energy, with 14 new solar farms in development.\n\nDecarbonization of Waste Collection: in Limoges (France), replaced diesel trucks with 16 electric and 10 biofuel-powered vehicles, reducing GHG emissions by 93%.\n\nCarbon Capture Investments: investing tens of millions of euros in carbon capture technologies for waste-to-energy facilities, with feasibility studies underway in France and the UK.",
+    "document_name": "SUEZ_SD_Progress report 2023",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/SUEZ_SD_Progress report 2023.pdf",
+    "pdfqa_id": "10",
+    "answer_type": null,
+    "model": "qwen3"
+  },
+  {
+    "question": "What is the scope 1, 2 and 3 emissions (in TCO2e) of the company for FY2023? Provide the values for each scope individually.",
+    "expected_answer": "Not available in the retrieved information",
+    "document_name": "SUEZ_SD_Progress report 2023",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/SUEZ_SD_Progress report 2023.pdf",
+    "pdfqa_id": "11",
+    "answer_type": null,
+    "model": "qwen3"
+  },
+  {
+    "question": "Does the company have a decarbonization trajectory compatible with a 1.5 or 2 degree scenario?",
+    "expected_answer": "No, the company has several projects to decarbonize because they have an informal commitment to be carbon neutral. However they do not provide information regarding their alignement or formal commitment  to be carbon neutral for a 1.5 or 2 degree scenario. The different climate scenarios are not mentionned",
+    "document_name": "2024 Alibaba Group Environmental, Social and Governance Report-0809",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/2024 Alibaba Group Environmental, Social and Governance Report-0809.pdf",
+    "pdfqa_id": "12",
+    "answer_type": null,
+    "model": "qwen3"
+  },
+  {
+    "question": "According to the company's Disclosure from FY2023, which topics have been assessed to be material?",
+    "expected_answer": "According to the company's statement for fiscal 2023, the following topics are considered important: \n\nGovernance Issue \n\n·Product quality and safety \n·Compliance operations \n· Supply chain sustainability management \n· Corporate governance \n· Risk management \n· Anti-corruption \n· Consumer rights and privacy protection \n· Safety production \n· Economic benefits  \n· Medical accessibility \n· Drive industry development \n· Intellectual property protection \n· Business innovation and digital management \n· Responsible marketing \n· Information security management \n· Community participation contribution\n\nSocial Issue\n\n· Employee rights and \nbenefits \n· Diversity and equality \n· Occupational health and \nsafety \n· Employee development \nand training\n\nEnvironmental Issue\n\n·Resource utilization and \nutilization efficiency \n·Addressing climate \nchange \n·Hazardous waste \ndisposal and \nmanagement \n·Ecological environment \nand biodiversity \nconservation \n·Pollutant emission \nmanagement",
+    "document_name": "2023sr_en",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/2023sr_en.pdf",
+    "pdfqa_id": "13",
+    "answer_type": null,
+    "model": "qwen3"
+  },
+  {
+    "question": "What drove carbon intensity change as of the FY2023 for the company?",
+    "expected_answer": "No drivers specified in the report.",
+    "document_name": "2023sr_en",
+    "pdf_url": "https://huggingface.co/datasets/pdfqa/pdfQA-Benchmark/resolve/main/real-pdfQA/01.2_Input_Files_PDF/ClimateFinanceBench/2023sr_en.pdf",
+    "pdfqa_id": "14",
+    "answer_type": null,
+    "model": "qwen3"
+  }
+]
