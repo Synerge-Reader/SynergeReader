@@ -1,55 +1,49 @@
+name: synergereader
+
 networks:
   default:
     external: true
     name: agent_network
+
 services:
-  ollama:
-    image: ollama/ollama:latest
-    environment:
-      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE}
-    ports:
-      - "127.0.0.1:11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    restart: unless-stopped
-  db:
+  synergereader-db:
     image: pgvector/pgvector:pg17
     environment:
       POSTGRES_DB: synergereader
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-    ports:
-      - "127.0.0.1:5432:5432"
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    expose:
+      - "5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - db_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d synergereader"]
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 5s
       timeout: 5s
       retries: 10
     restart: unless-stopped
+
   backend:
     build:
       context: ./synerge-reader-backend
       dockerfile: Dockerfile
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     volumes:
       - ./synerge-reader-backend:/app
       - chroma_data:/app/chroma_db
     environment:
       - PYTHONUNBUFFERED=1
-      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
       - DB_CONNECTION_STRING=${DB_CONNECTION_STRING}
       - EMAIL_KEY=${EMAIL_KEY}
     depends_on:
-      ollama:
-        condition: service_started
-      db:
+      synergereader-db:
         condition: service_healthy
     restart: unless-stopped
+
   frontend:
     build:
       context: ./synerge-reader-frontend
@@ -58,13 +52,14 @@ services:
         - REACT_APP_BACKEND_URL=${REACT_APP_BACKEND_URL}
         - REACT_APP_GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     volumes:
       - ./synerge-reader-frontend:/app
       - /app/node_modules
     depends_on:
       - backend
     restart: unless-stopped
+
   nginx:
     image: nginx:alpine
     container_name: nginx-proxy
@@ -78,7 +73,8 @@ services:
       - frontend
       - backend
     restart: unless-stopped
+
 volumes:
   chroma_data:
-  ollama_data:
-  pgdata:
+  db_data:
+  
