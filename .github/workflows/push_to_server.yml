@@ -20,8 +20,19 @@ jobs:
       # 3️⃣ Backup current deployment before overwriting
       - name: Backup Current Deployment
         run: |
+          set -e
           if [ -d "/mnt/2025-legalread/repo" ]; then
-            cp -r /mnt/2025-legalread/repo /mnt/2025-legalread/repo-backup
+            rm -rf /mnt/2025-legalread/repo-backup
+            mkdir -p /mnt/2025-legalread/repo-backup
+            rsync -a \
+              --exclude='.git' \
+              --exclude='eval' \
+              --exclude='node_modules' \
+              --exclude='__pycache__' \
+              --exclude='.venv' \
+              --exclude='venv' \
+              /mnt/2025-legalread/repo/ \
+              /mnt/2025-legalread/repo-backup/
             echo "Backup completed successfully"
           else
             echo "No existing deployment to back up — skipping"
