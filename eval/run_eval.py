@@ -27,7 +27,7 @@ from metrics import exact_match, f1_score
 
 BASE_URL = os.environ.get("SYNERGEREADER_URL", "http://localhost:5000").rstrip("/")
 ASK_ENDPOINT = f"{BASE_URL}/ask"
-TIMEOUT = 60
+TIMEOUT = 300
 
 DATASET_PATH = Path(__file__).parent / "dataset.json"
 RESULTS_DIR = Path(__file__).parent / "results"
