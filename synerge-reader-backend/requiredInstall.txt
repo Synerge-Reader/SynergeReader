@@ -28,4 +28,5 @@ PyJWT==2.10.1
 psycopg2-binary==2.9.9
 pgvector==0.4.2
 resend
-
+pdfplumber
+python-docx

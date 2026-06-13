@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from document_parser import extract_text_from_upload, ExtractionError, sanitize_filename
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from schemas import AskRequest, AskResponse, CorrectionRequest, RatingRequest,GoogleLoginRequest,LoginRequest,RegisterRequest
@@ -455,15 +456,17 @@ async def upload_documents(
 
     results = []
     for f in upload_list:
+        safe_filename = sanitize_filename(f.filename)
         try:
             content = await f.read()
             try:
-                text = content.decode("utf-8")
-            except UnicodeDecodeError:
-                text = content.decode("latin-1", errors="ignore")
+                result = extract_text_from_upload(safe_filename, content)
+                text = result.text
+            except ExtractionError as e:
+                raise HTTPException(status_code=e.http_status, detail=e.user_message)
 
             if not text.strip():
-                results.append({"error": "Empty file", "filename": f.filename})
+                results.append({"error": "Empty file", "filename": safe_filename})
                 continue
 
             chunks = chunk_text(text)
@@ -482,7 +485,7 @@ async def upload_documents(
                     RETURNING id
                     """,
                     (
-                        f.filename,
+                        safe_filename,
                         datetime.datetime.now().isoformat(),
                         text,
                         author,
@@ -512,13 +515,15 @@ async def upload_documents(
             results.append(
                 {
                     "message": "Uploaded",
-                    "filename": f.filename,
+                    "filename": safe_filename,
                     "document_id": doc_id,
                     "chunks_count": len(chunks),
                 }
             )
+        except HTTPException:
+            raise
         except Exception as e:
-            results.append({"error": str(e), "filename": f.filename})
+            results.append({"error": str(e), "filename": safe_filename})
 
     return results
 
