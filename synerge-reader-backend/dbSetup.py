@@ -114,8 +114,8 @@ def init_db():
             AND attname = 'embedding';
             """)
             row = cursor.fetchone()
-            if row and row[0] != 384:
-                print(f"Dropping document_chunks because dimension {row[0]} != 384")
+            if row and row[0] != 768:
+                print(f"Dropping document_chunks because dimension {row[0]} != 768")
                 cursor.execute("DROP TABLE IF EXISTS document_chunks CASCADE;")
     except Exception as e:
         print(f"Error checking document_chunks schema: {e}")
@@ -127,7 +127,7 @@ def init_db():
         document_id INTEGER NOT NULL,
         chunk_text TEXT NOT NULL,
         chunk_index INTEGER,
-        embedding vector(384),
+        embedding vector(768),
         FOREIGN KEY (document_id) REFERENCES documents (id) ON DELETE CASCADE
     )
     """)
@@ -159,7 +159,7 @@ def init_db():
         context_text TEXT,
         corrected_by TEXT,
         usage_count INTEGER DEFAULT 0,
-        embedding vector(384),
+        embedding vector(768),
         FOREIGN KEY (chat_history_id) REFERENCES chat_history (id)
     )
     """)
@@ -168,7 +168,7 @@ def init_db():
     for col, definition in [
         ("corrected_by", "TEXT"),
         ("usage_count", "INTEGER DEFAULT 0"),
-        ("embedding", "vector(384)"),
+        ("embedding", "vector(768)"),
     ]:
         try:
             cursor.execute(f"""
