@@ -15,11 +15,11 @@ const BACKEND = process.env.REACT_APP_BACKEND_URL || "http://localhost:5000";
 // ─────────────────────────────────────────────────────────────────────────────
 const TASK_MODES = [
   { id: "research",   label: "Research & Q&A",    model: "llama3.1:8b",  color: "#0891b2" },
-  { id: "argument",   label: "Argument Generator", model: "llama3.1:8b", color: "#7c3aed" },
-  { id: "precedents", label: "Related Precedents", model: "llama3.1:8b", color: "#7c3aed" },
-  { id: "risk",       label: "Risk Analysis",      model: "llama3.1:8b", color: "#dc2626" },
+  { id: "argument",   label: "Argument Generator", model: "gemma4:31b", color: "#7c3aed" },
+  { id: "precedents", label: "Related Precedents", model: "gemma4:31b", color: "#7c3aed" },
+  { id: "risk",       label: "Risk Analysis",      model: "gemma4:31b", color: "#dc2626" },
   { id: "clause",     label: "Clause Extractor",   model: "llama3.1:8b",  color: "#0891b2" },
-  { id: "summarize",  label: "Summarize",          model: "llama3.1:8b", color: "#7c3aed" },
+  { id: "summarize",  label: "Summarize",          model: "gemma4:31b", color: "#7c3aed" },
 ];
 
 const MODEL_LABEL = {
