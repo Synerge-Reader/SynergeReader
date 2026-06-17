@@ -147,7 +147,7 @@ def init_db():
     )
     """)
 
-    # Knowledge base
+    # Knowledge base — with semantic matching, source attribution, usage tracking
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS knowledge_base (
         id SERIAL PRIMARY KEY,
@@ -157,9 +157,26 @@ def init_db():
         created_at TEXT,
         chat_history_id INTEGER,
         context_text TEXT,
+        corrected_by TEXT,
+        usage_count INTEGER DEFAULT 0,
+        embedding vector(384),
         FOREIGN KEY (chat_history_id) REFERENCES chat_history (id)
     )
     """)
+
+    # Add new columns to existing knowledge_base table if they don't exist
+    for col, definition in [
+        ("corrected_by", "TEXT"),
+        ("usage_count", "INTEGER DEFAULT 0"),
+        ("embedding", "vector(384)"),
+    ]:
+        try:
+            cursor.execute(f"""
+                ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS {col} {definition}
+            """)
+        except Exception as e:
+            print(f"Column {col} may already exist: {e}")
+            conn.rollback()
     
 
 

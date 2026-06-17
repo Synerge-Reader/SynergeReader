@@ -87,7 +87,7 @@ def sanitize_filename(filename: "str | None") -> str:
     if not filename:
         return "untitled"
     name = Path(filename).name
-    name = "".join(c for c in name if c.isprintable() and c not in r'/\<>:"|?*')
+    name = "".join(c for c in name if c.isprintable() and c not in r'/\\<>:"|?*')
     return name[:255] or "untitled"
 
 
