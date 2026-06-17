@@ -182,7 +182,7 @@ def chunk_text(text: str, max_chunk_size: int = 500) -> list:
 
 
 def embed_chunks(
-    chunks: List[str], model: str = "nomic-embed-text"
+    chunks: List[str], model: str = "nomic-embed-text:v1.5"
 ) -> List[List[float]]:
     if not chunks:
         return []
