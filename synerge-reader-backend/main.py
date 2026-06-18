@@ -745,7 +745,7 @@ async def upload_documents(
                 raise HTTPException(status_code=e.http_status, detail=e.user_message)
 
             if not text.strip():
-                results.append({"error": "Empty file", "filename": f.filename})
+                results.append({"error": "Empty file", "filename": safe_filename})
                 continue
 
             chunks = chunk_text(text)
@@ -794,7 +794,7 @@ async def upload_documents(
             results.append(
                 {
                     "message": "Uploaded",
-                    "filename": f.filename,
+                    "filename": safe_filename,
                     "document_id": doc_id,
                     "chunks_count": len(chunks),
                 }
@@ -805,14 +805,16 @@ async def upload_documents(
                 from threading import Thread
                 Thread(
                     target=generate_kb_from_document,
-                    args=(doc_id, f.filename, text),
+                    args=(doc_id, safe_filename, text),
                     daemon=True
                 ).start()
             except Exception:
                 pass
 
+        except HTTPException:
+            raise
         except Exception as e:
-            results.append({"error": str(e), "filename": f.filename})
+            results.append({"error": str(e), "filename": safe_filename})
 
     return results
 
@@ -1697,7 +1699,7 @@ async def convert_docx_to_pdf(file: UploadFile = File(...)):
         raise HTTPException(400, "Only .docx files are supported")
     tmp_dir = tempfile.mkdtemp()
     try:
-        docx_path = os.path.join(tmp_dir, file.filename)
+        docx_path = os.path.join(tmp_dir, sanitize_filename(file.filename))
         content   = await file.read()
         with open(docx_path, "wb") as f:
             f.write(content)
