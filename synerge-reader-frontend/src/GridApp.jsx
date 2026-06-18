@@ -629,7 +629,7 @@ export default function GridApp() {
         date:      (r.dateFiled || r.date_filed || "").slice(0, 4),
         url:       r.absolute_url ? `https://www.courtlistener.com${r.absolute_url}` : null,
         snippet:   r.snippet || "",
-        score:     Math.round(50 + Math.random() * 45), // CourtListener doesn't give % relevance
+        score: null,
       }));
       setPrecedents(results);
     } catch {
@@ -1420,10 +1420,10 @@ export default function GridApp() {
                     )}
                     <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
                       <div style={{ flex: 1, height: "4px", background: "#e5e7eb", borderRadius: "2px", overflow: "hidden" }}>
-                        <div style={{ height: "100%", width: `${p.score}%`, background: col, borderRadius: "2px", transition: "width .6s" }} />
+                        <div style={{ height: "100%", width: `${p.score !== null ? p.score + "%" : "N/A"}`, background: col, borderRadius: "2px", transition: "width .6s" }} />
                       </div>
                       <span style={{ fontSize: "11px", fontWeight: 700, color: col, fontFamily: "'Courier New',monospace" }}>
-                        {p.score}%
+                        {p.score !== null ? p.score + "%" : "N/A"}
                       </span>
                     </div>
                   </div>

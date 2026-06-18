@@ -226,9 +226,9 @@ def embed_chunks(
             )
             resp.raise_for_status()
             data = resp.json()
-            return data.get("embedding", data.get("embeddings", [[0.0] * 384])[0])
+            return data.get("embedding", data.get("embeddings", [[0.0] * 768])[0])
         except Exception:
-            return [0.0] * 384
+            return [0.0] * 768
 
     if len(chunks) == 1:
         return [embed_one(chunks[0])]

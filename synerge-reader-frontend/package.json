@@ -19,7 +19,8 @@
     "react-markdown": "^10.1.0",
     "react-scripts": "5.0.1",
     "remark-gfm": "^4.0.1",
-    "web-vitals": "^2.1.4"
+    "web-vitals": "^2.1.4",
+    "docx-preview": "^0.3.7"
   },
   "scripts": {
     "start": "react-scripts start",
