@@ -21,6 +21,10 @@ from dotenv import load_dotenv
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 import resend 
+import subprocess
+import tempfile
+import shutil
+from fastapi.responses import Response
 
 load_dotenv()
 
@@ -178,7 +182,7 @@ def chunk_text(text: str, max_chunk_size: int = 500) -> list:
 
 
 def embed_chunks(
-    chunks: List[str], model: str = "DC1LEX/Qwen3-Embedding-0.6B-f16:latest"
+    chunks: List[str], model: str = "nomic-embed-text:v1.5"
 ) -> List[List[float]]:
     if not chunks:
         return []
@@ -222,9 +226,9 @@ def embed_chunks(
             )
             resp.raise_for_status()
             data = resp.json()
-            return data.get("embedding", data.get("embeddings", [[0.0] * 384])[0])
+            return data.get("embedding", data.get("embeddings", [[0.0] * 768])[0])
         except Exception:
-            return [0.0] * 384
+            return [0.0] * 768
 
     if len(chunks) == 1:
         return [embed_one(chunks[0])]
@@ -390,43 +394,318 @@ def get_relevant_history(
 
 
 def get_relevant_knowledge_base(question: str, limit: int = 3) -> List[dict]:
-    """Retrieve relevant knowledge base entries based on question similarity"""
+    """Retrieve relevant knowledge base entries using semantic similarity (pgvector)."""
+    try:
+        # Embed the incoming question
+        q_emb = embed_chunks([question])
+        if not q_emb or not q_emb[0]:
+            return []
+        q_vec = q_emb[0]
+
+        conn = connect_to_postgres()
+        c = conn.cursor()
+
+        # Try semantic search first
+        try:
+            c.execute(
+                """
+                SELECT id, question, corrected_answer, context_text, corrected_by, usage_count,
+                       1 - (embedding <=> %s::vector) AS similarity
+                FROM knowledge_base
+                WHERE embedding IS NOT NULL
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+                """,
+                (q_vec, q_vec, limit),
+            )
+            rows = c.fetchall()
+            conn.close()
+
+            results = []
+            for row in rows:
+                id_, kb_q, kb_ans, ctx, corrected_by, usage_count, sim = row
+                if sim >= 0.5:   # Only return if reasonably similar
+                    results.append({
+                        "id": id_,
+                        "question": kb_q,
+                        "answer": kb_ans,
+                        "context": ctx or "",
+                        "corrected_by": corrected_by or "Unknown",
+                        "usage_count": usage_count or 0,
+                        "relevance_score": float(sim),
+                    })
+            return results
+
+        except Exception as e:
+            print(f"Semantic KB search failed, falling back to keyword: {e}")
+            conn.rollback()
+            # Fallback: keyword overlap
+            c.execute("SELECT id, question, corrected_answer, context_text, corrected_by, usage_count FROM knowledge_base")
+            rows = c.fetchall()
+            conn.close()
+            question_words = set(question.lower().split())
+            scored = []
+            for id_, kb_q, kb_ans, ctx, corrected_by, usage_count in rows:
+                overlap = len(question_words & set(kb_q.lower().split()))
+                if overlap > 0:
+                    scored.append({
+                        "id": id_, "question": kb_q, "answer": kb_ans,
+                        "context": ctx or "", "corrected_by": corrected_by or "Unknown",
+                        "usage_count": usage_count or 0, "relevance_score": float(overlap),
+                    })
+            scored.sort(key=lambda x: x["relevance_score"], reverse=True)
+            return scored[:limit]
+
+    except Exception as e:
+        print(f"Error retrieving knowledge base: {e}")
+        return []
+
+
+def increment_kb_usage(entry_ids: List[int]):
+    """Increment usage_count for KB entries that fired."""
+    if not entry_ids:
+        return
     try:
         conn = connect_to_postgres()
         c = conn.cursor()
         c.execute(
-            "SELECT id, question, corrected_answer, context_text FROM knowledge_base"
+            "UPDATE knowledge_base SET usage_count = COALESCE(usage_count,0) + 1 WHERE id = ANY(%s)",
+            (entry_ids,)
         )
-        rows = c.fetchall()
+        conn.commit()
         conn.close()
-
-        if not rows:
-            return []
-
-        # Simple keyword-based scoring
-        scored = []
-        question_words = set(question.lower().split())
-
-        for id, kb_question, kb_answer, context in rows:
-            kb_words = set(kb_question.lower().split())
-            # Calculate overlap score
-            overlap = len(question_words.intersection(kb_words))
-            if overlap > 0:
-                scored.append(
-                    {
-                        "id": id,
-                        "question": kb_question,
-                        "answer": kb_answer,
-                        "context": context or "",
-                        "relevance_score": overlap,
-                    }
-                )
-
-        scored.sort(key=lambda x: x["relevance_score"], reverse=True)
-        return scored[:limit]
     except Exception as e:
-        print(f"Error retrieving knowledge base: {e}")
-        return []
+        print(f"Error incrementing KB usage: {e}")
+
+
+def auto_save_to_kb(question: str, answer: str, source: str = "auto"):
+    """
+    Silently save a Q&A pair to the knowledge base after every query.
+    Skips if: answer is too short, looks like an error, or a duplicate already exists.
+    """
+    try:
+        # Skip low quality answers
+        if len(answer.strip()) < 80:
+            return
+        error_phrases = ["i don't know", "i cannot", "not enough context",
+                         "insufficient", "unable to answer", "__error__"]
+        if any(p in answer.lower() for p in error_phrases):
+            return
+
+        # Embed the question
+        q_emb = embed_chunks([question])
+        if not q_emb or not q_emb[0]:
+            return
+        q_vec = q_emb[0]
+
+        conn = connect_to_postgres()
+        c = conn.cursor()
+
+        # Check for near-duplicate (similarity > 0.92 means essentially the same question)
+        try:
+            c.execute(
+                """
+                SELECT id FROM knowledge_base
+                WHERE embedding IS NOT NULL
+                  AND 1 - (embedding <=> %s::vector) > 0.92
+                LIMIT 1
+                """,
+                (q_vec,)
+            )
+            if c.fetchone():
+                conn.close()
+                return  # Already have a very similar entry
+        except Exception:
+            pass  # pgvector issue — still proceed with insert
+
+        c.execute(
+            """
+            INSERT INTO knowledge_base
+              (question, original_answer, corrected_answer, created_at,
+               context_text, corrected_by, usage_count, embedding)
+            VALUES (%s, %s, %s, %s, %s, %s, 1, %s)
+            """,
+            (question, answer, answer,
+             datetime.datetime.now().isoformat(),
+             "", source, q_vec)
+        )
+        conn.commit()
+        conn.close()
+        print(f"[KB] Auto-saved Q&A: {question[:60]}...")
+    except Exception as e:
+        print(f"[KB] Auto-save failed (non-critical): {e}")
+
+
+def generate_kb_from_document(doc_id: int, filename: str, text: str):
+    """
+    After a document is uploaded, use the LLM to generate Q&A pairs
+    from the document text and seed them into the Knowledge Base.
+    Called in a background daemon thread — never blocks the upload response.
+    Uses Q:/A: plain-text format instead of JSON for reliable parsing.
+    """
+    try:
+        if len(text.strip()) < 200:
+            return
+
+        try:
+            base_url = get_active_ollama_base_url()
+        except Exception:
+            print(f"[KB] Ollama not reachable — skipping KB generation for {filename}")
+            return
+
+        # Find first available text-generation model
+        generation_models = [
+            "saul-instruct:latest", "llama3.1:latest", "llama3.1:8b",
+            "llama3:latest", "mistral:latest", "qwen2.5:latest",
+            "qwen2.5:7b", "phi3:latest", "gemma2:latest", "gemma:latest",
+        ]
+        active_model = None
+        for model in generation_models:
+            try:
+                test = requests.post(
+                    f"{base_url}/api/generate",
+                    json={"model": model, "prompt": "Say OK", "stream": False},
+                    timeout=(3, 20),
+                )
+                if test.status_code == 200 and test.json().get("response"):
+                    active_model = model
+                    print(f"[KB] Using model '{model}' for KB generation")
+                    break
+            except Exception:
+                continue
+
+        if not active_model:
+            print(f"[KB] No text-generation model available for {filename}")
+            return
+
+        # Split document into 2 segments for broader coverage
+        mid = min(len(text) // 2, 4000)
+        excerpts = [
+            text[:4000].strip(),
+            text[mid:mid + 4000].strip(),
+        ]
+
+        all_pairs = []
+
+        for i, excerpt in enumerate(excerpts):
+            if len(excerpt) < 150:
+                continue
+
+            prompt = f"""Read the document excerpt below and write 5 question-answer pairs.
+
+Format — use EXACTLY this pattern for each pair, nothing else:
+Q: <your question here>
+A: <your answer here (2-3 sentences)>
+
+Q: <next question>
+A: <next answer>
+
+Rules:
+- Questions must be specific and answerable from the text
+- Answers must come directly from the text, 2-3 sentences each
+- Do not add any intro text, numbering, bullets, or JSON
+
+Document (part {i+1}):
+{excerpt}
+
+Start with Q:"""
+
+            try:
+                resp = requests.post(
+                    f"{base_url}/api/generate",
+                    json={
+                        "model": active_model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "temperature": 0.2,
+                    },
+                    timeout=(5, 120),
+                )
+                resp.raise_for_status()
+                raw = resp.json().get("response", "").strip()
+                print(f"[KB] Raw output part {i+1} (first 300 chars): {raw[:300]}")
+
+                # Parse Q:/A: pairs
+                # Split on lines starting with Q:
+                current_q = None
+                current_a_lines = []
+                for line in raw.splitlines():
+                    line = line.strip()
+                    if line.lower().startswith("q:"):
+                        # Save previous pair if any
+                        if current_q and current_a_lines:
+                            all_pairs.append({
+                                "question": current_q,
+                                "answer": " ".join(current_a_lines).strip()
+                            })
+                        current_q = line[2:].strip()
+                        current_a_lines = []
+                    elif line.lower().startswith("a:") and current_q:
+                        current_a_lines = [line[2:].strip()]
+                    elif current_a_lines and line:
+                        # Continuation of the answer
+                        current_a_lines.append(line)
+
+                # Don't forget last pair
+                if current_q and current_a_lines:
+                    all_pairs.append({
+                        "question": current_q,
+                        "answer": " ".join(current_a_lines).strip()
+                    })
+
+                print(f"[KB] Parsed {len(all_pairs)} pairs so far after part {i+1}")
+
+            except Exception as e:
+                print(f"[KB] LLM call failed for excerpt {i+1}: {e}")
+                continue
+
+        if not all_pairs:
+            print(f"[KB] No Q&A pairs extracted from {filename}")
+            return
+
+        conn = connect_to_postgres()
+        c = conn.cursor()
+        saved = 0
+        seen = set()
+
+        for pair in all_pairs:
+            q = pair.get("question", "").strip()
+            a = pair.get("answer", "").strip()
+
+            if not q or not a or len(a) < 20:
+                print(f"[KB] Skip (too short/empty): q={q[:40]}")
+                continue
+            if q.lower() in seen:
+                print(f"[KB] Skip (duplicate in batch): {q[:50]}")
+                continue
+            seen.add(q.lower())
+
+            try:
+                q_emb = embed_chunks([q])
+                q_vec = q_emb[0] if q_emb else None
+            except Exception:
+                q_vec = None
+
+            c.execute(
+                """
+                INSERT INTO knowledge_base
+                  (question, original_answer, corrected_answer, created_at,
+                   context_text, corrected_by, usage_count, embedding)
+                VALUES (%s, %s, %s, %s, %s, %s, 0, %s)
+                """,
+                (q, a, a,
+                 datetime.datetime.now().isoformat(),
+                 filename, f"Auto-generated from: {filename}", q_vec)
+            )
+            saved += 1
+            print(f"[KB] ✓ Inserted pair {saved}: {q[:60]}")
+
+        conn.commit()
+        conn.close()
+        print(f"[KB] ✓ Final: saved {saved}/{len(all_pairs)} KB entries from: {filename}")
+
+    except Exception as e:
+        print(f"[KB] Document KB generation failed (non-critical): {e}")
 
 
 async def hash_password(password: str) -> str:
@@ -456,9 +735,9 @@ async def upload_documents(
 
     results = []
     for f in upload_list:
-        safe_filename = sanitize_filename(f.filename)
         try:
             content = await f.read()
+            safe_filename = sanitize_filename(f.filename)
             try:
                 result = extract_text_from_upload(safe_filename, content)
                 text = result.text
@@ -485,7 +764,7 @@ async def upload_documents(
                     RETURNING id
                     """,
                     (
-                        safe_filename,
+                        f.filename,
                         datetime.datetime.now().isoformat(),
                         text,
                         author,
@@ -520,6 +799,18 @@ async def upload_documents(
                     "chunks_count": len(chunks),
                 }
             )
+
+            # Auto-generate KB entries from this document in the background
+            try:
+                from threading import Thread
+                Thread(
+                    target=generate_kb_from_document,
+                    args=(doc_id, safe_filename, text),
+                    daemon=True
+                ).start()
+            except Exception:
+                pass
+
         except HTTPException:
             raise
         except Exception as e:
@@ -644,6 +935,18 @@ Keep the answer concise, structured, and directly responsive to the question."""
         stream_error = None
         try:
             prompt_text, context_chunks, best_similarity, context_source = build_context()
+
+            # ── Knowledge Base injection ──────────────────────────────────
+            kb_entries = get_relevant_knowledge_base(request.question, limit=3)
+            kb_ids_fired = [e["id"] for e in kb_entries]
+            if kb_entries:
+                kb_block = "\n\n<knowledge_base_corrections>\n"
+                for e in kb_entries:
+                    kb_block += f"Q: {e['question']}\nA: {e['answer']}\n---\n"
+                kb_block += "</knowledge_base_corrections>"
+                prompt_text = prompt_text + kb_block
+            # ─────────────────────────────────────────────────────────────
+
             prompt = build_prompt(prompt_text)
             fallback_messages = [
                 {"role": "system", "content": system_prompt},
@@ -732,6 +1035,10 @@ Keep the answer concise, structured, and directly responsive to the question."""
                 else:
                     yield "__ERROR__The local LLM server is not reachable. Start Ollama or update OLLAMA_BASE_URL / OLLAMA_PORT in .env.__"
 
+        # Increment KB usage counts for entries that fired this query
+        if kb_ids_fired:
+            increment_kb_usage(kb_ids_fired)
+
         if stream_error or not answer_parts:
             return
 
@@ -767,6 +1074,18 @@ Keep the answer concise, structured, and directly responsive to the question."""
             conn.close()
 
             yield f"\n\n__ENTRY_ID__{entry_id}__"
+
+            # Auto-save this Q&A to the Knowledge Base in the background
+            try:
+                from threading import Thread
+                Thread(
+                    target=auto_save_to_kb,
+                    args=(request.question, full_answer, "auto-query"),
+                    daemon=True
+                ).start()
+            except Exception:
+                pass
+
         except Exception:
             yield "__ERROR__Database error__"
 
@@ -1098,7 +1417,17 @@ async def submit_correction(request: CorrectionRequest):
         c.execute("UPDATE chat_history SET answer = %s, comment = %s WHERE id = %s", (request.corrected_answer, request.comment, request.chat_id))
 
         # Insert into knowledge base
-        c.execute("INSERT INTO knowledge_base (question, original_answer, corrected_answer, created_at, chat_history_id) VALUES (%s, %s, %s, %s, %s)", (question, original_answer, request.corrected_answer, datetime.datetime.now().isoformat(), request.chat_id))
+        # Embed the question for semantic matching
+        try:
+            q_emb = embed_chunks([question])
+            q_vec = q_emb[0] if q_emb else None
+        except Exception:
+            q_vec = None
+
+        c.execute(
+            "INSERT INTO knowledge_base (question, original_answer, corrected_answer, created_at, chat_history_id, corrected_by, usage_count, embedding) VALUES (%s, %s, %s, %s, %s, %s, 0, %s)",
+            (question, original_answer, request.corrected_answer, datetime.datetime.now().isoformat(), request.chat_id, getattr(request, 'corrected_by', 'User'), q_vec)
+        )
 
         conn.commit()
         conn.close()
@@ -1115,17 +1444,21 @@ async def knowledge_base():
     try:
         conn = connect_to_postgres()
         c = conn.cursor()
-        c.execute("""SELECT id, question, corrected_answer, created_at, chat_history_id 
-                     FROM knowledge_base ORDER BY id DESC""")
+        c.execute("""SELECT id, question, original_answer, corrected_answer, created_at,
+                            chat_history_id, corrected_by, COALESCE(usage_count,0)
+                     FROM knowledge_base ORDER BY COALESCE(usage_count,0) DESC, id DESC""")
         rows = c.fetchall()
         conn.close()
         return [
             {
                 "id": r[0],
                 "question": r[1],
-                "answer": r[2],
-                "created_at": r[3],
-                "chat_history_id": r[4],
+                "original_answer": r[2] or "",
+                "answer": r[3],
+                "created_at": r[4],
+                "chat_history_id": r[5],
+                "corrected_by": r[6] or "User",
+                "usage_count": r[7],
             }
             for r in rows
         ]
@@ -1135,16 +1468,75 @@ async def knowledge_base():
 
 @app.post("/knowledge_base")
 async def add_knowledge(request: KnowledgeInsertRequest):
-    """Add knowledge items directly to knowledge base (for testing/admin purposes)"""
+    """Add knowledge items directly to knowledge base (admin/manual entry)"""
     try:
         conn = connect_to_postgres()
         c = conn.cursor()
         for item in request.items:
-            # Insert with corrected_answer as the primary answer field
-            c.execute("INSERT INTO knowledge_base (question, original_answer, corrected_answer, created_at, context_text) VALUES (%s, %s, %s, %s, %s)", (item.question, "", item.answer, datetime.datetime.now().isoformat(), item.source or ""))
+            try:
+                q_emb = embed_chunks([item.question])
+                q_vec = q_emb[0] if q_emb else None
+            except Exception:
+                q_vec = None
+            c.execute(
+                "INSERT INTO knowledge_base (question, original_answer, corrected_answer, created_at, context_text, corrected_by, usage_count, embedding) VALUES (%s, %s, %s, %s, %s, %s, 0, %s)",
+                (item.question, "", item.answer, datetime.datetime.now().isoformat(), item.source or "", "Manual Entry", q_vec)
+            )
         conn.commit()
         conn.close()
         return {"message": f"{len(request.items)} knowledge items added"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.delete("/knowledge_base/{entry_id}")
+async def delete_knowledge(entry_id: int):
+    """Delete a knowledge base entry by ID"""
+    try:
+        conn = connect_to_postgres()
+        c = conn.cursor()
+        c.execute("DELETE FROM knowledge_base WHERE id = %s RETURNING id", (entry_id,))
+        deleted = c.fetchone()
+        conn.commit()
+        conn.close()
+        if not deleted:
+            raise HTTPException(404, "Entry not found")
+        return {"message": f"Entry {entry_id} deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+class KBUpdateRequest(BaseModel):
+    question: str
+    answer: str
+
+
+@app.put("/knowledge_base/{entry_id}")
+async def update_knowledge(entry_id: int, request: KBUpdateRequest):
+    """Edit a knowledge base entry"""
+    try:
+        # Re-embed if question changed
+        try:
+            q_emb = embed_chunks([request.question])
+            q_vec = q_emb[0] if q_emb else None
+        except Exception:
+            q_vec = None
+        conn = connect_to_postgres()
+        c = conn.cursor()
+        c.execute(
+            "UPDATE knowledge_base SET question=%s, corrected_answer=%s, embedding=%s WHERE id=%s RETURNING id",
+            (request.question, request.answer, q_vec, entry_id)
+        )
+        updated = c.fetchone()
+        conn.commit()
+        conn.close()
+        if not updated:
+            raise HTTPException(404, "Entry not found")
+        return {"message": f"Entry {entry_id} updated"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -1297,6 +1689,47 @@ async def test_endpoint():
 
 
 # ------------------- Startup -------------------
+
+
+
+@app.post("/convert-docx")
+async def convert_docx_to_pdf(file: UploadFile = File(...)):
+    """Convert a DOCX file to PDF using LibreOffice headless."""
+    if not file.filename.lower().endswith(".docx"):
+        raise HTTPException(400, "Only .docx files are supported")
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        docx_path = os.path.join(tmp_dir, sanitize_filename(file.filename))
+        content   = await file.read()
+        with open(docx_path, "wb") as f:
+            f.write(content)
+        result = subprocess.run(
+            ["libreoffice", "--headless", "--convert-to", "pdf",
+             "--outdir", tmp_dir, docx_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            raise HTTPException(500, f"Conversion failed: {result.stderr}")
+        pdf_name = os.path.splitext(file.filename)[0] + ".pdf"
+        pdf_path = os.path.join(tmp_dir, pdf_name)
+        if not os.path.exists(pdf_path):
+            raise HTTPException(500, "PDF output not found")
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"inline; filename={pdf_name}",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 init_db()
 if __name__ == "__main__":
