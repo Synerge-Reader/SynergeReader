@@ -4,6 +4,79 @@ import sys
 from dotenv import load_dotenv
 from pgvector.psycopg2 import register_vector
 
+EMBEDDING_VECTOR_DIMENSION = 768
+
+
+class DocumentChunkSchemaError(RuntimeError):
+    """Raised when document_chunks cannot be validated safely."""
+
+
+def validate_document_chunks_embedding_schema(
+    cursor,
+    expected_dimension: int = EMBEDDING_VECTOR_DIMENSION,
+) -> None:
+    try:
+        cursor.execute("SELECT to_regclass('document_chunks')::oid")
+        row = cursor.fetchone()
+        table_oid = row[0] if row else None
+
+        if table_oid is None:
+            return  # fresh database — let CREATE TABLE proceed normally
+
+        cursor.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_attribute
+                WHERE attrelid = %s
+                  AND attname = 'embedding'
+                  AND NOT attisdropped
+            )
+            """,
+            (table_oid,),
+        )
+        embedding_exists = cursor.fetchone()[0]
+
+        if not embedding_exists:
+            raise DocumentChunkSchemaError(
+                "document_chunks exists but is missing its 'embedding' column. "
+                "Refusing to recreate or drop the table automatically; run an "
+                "explicit migration or reindex operation."
+            )
+
+        cursor.execute(
+            """
+            SELECT atttypmod
+            FROM pg_attribute
+            WHERE attrelid = %s
+              AND attname = 'embedding'
+              AND NOT attisdropped
+            """,
+            (table_oid,),
+        )
+        row = cursor.fetchone()
+        actual_dimension = row[0] if row else None
+
+        if type(actual_dimension) is not int or actual_dimension <= 0:
+            raise DocumentChunkSchemaError(
+                "document_chunks embedding dimension metadata is missing or "
+                "malformed. Refusing to modify or recreate the table automatically."
+            )
+
+        if actual_dimension != expected_dimension:
+            raise DocumentChunkSchemaError(
+                f"document_chunks embedding dimension is {actual_dimension}, "
+                f"expected {expected_dimension}. Refusing to modify or recreate "
+                "the table automatically; run an explicit migration to reindex "
+                "the embedding column."
+            )
+    except DocumentChunkSchemaError:
+        raise
+    except Exception as exc:
+        raise DocumentChunkSchemaError(
+            "Failed to validate document_chunks schema safely."
+        ) from exc
+
 
 def connect_to_postgres():
     load_dotenv()
@@ -92,45 +165,23 @@ def init_db():
     )
     """)
 
-    # Document chunks - ensure correct schema
-    try:
-        cursor.execute("""
-        SELECT EXISTS (
-            SELECT 1 FROM information_schema.columns 
-            WHERE table_name = 'document_chunks' AND column_name = 'embedding'
+    # Document chunks - validate schema without destructive mutation
+    validate_document_chunks_embedding_schema(cursor)
+
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS document_chunks (
+            id SERIAL PRIMARY KEY,
+            document_id INTEGER NOT NULL,
+            chunk_text TEXT NOT NULL,
+            chunk_index INTEGER,
+            embedding vector({EMBEDDING_VECTOR_DIMENSION}),
+            FOREIGN KEY (document_id)
+                REFERENCES documents (id)
+                ON DELETE CASCADE
         )
-        """)
-        embedding_exists = cursor.fetchone()[0]
-        
-        # If table exists but embedding column doesn't, drop and recreate
-        if not embedding_exists:
-            cursor.execute("DROP TABLE IF EXISTS document_chunks CASCADE;")
-        # If embedding exists with wrong dimension, drop and recreate
-        elif embedding_exists:
-            cursor.execute("""
-            SELECT atttypmod
-            FROM pg_attribute
-            WHERE attrelid = 'document_chunks'::regclass
-            AND attname = 'embedding';
-            """)
-            row = cursor.fetchone()
-            if row and row[0] != 768:
-                print(f"Dropping document_chunks because dimension {row[0]} != 768")
-                cursor.execute("DROP TABLE IF EXISTS document_chunks CASCADE;")
-    except Exception as e:
-        print(f"Error checking document_chunks schema: {e}")
-        cursor.execute("DROP TABLE IF EXISTS document_chunks CASCADE;")
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS document_chunks (
-        id SERIAL PRIMARY KEY,
-        document_id INTEGER NOT NULL,
-        chunk_text TEXT NOT NULL,
-        chunk_index INTEGER,
-        embedding vector(768),
-        FOREIGN KEY (document_id) REFERENCES documents (id) ON DELETE CASCADE
+        """
     )
-    """)
 
     # Chat history
     cursor.execute("""
@@ -148,7 +199,7 @@ def init_db():
     """)
 
     # Knowledge base — with semantic matching, source attribution, usage tracking
-    cursor.execute("""
+    cursor.execute(f"""
     CREATE TABLE IF NOT EXISTS knowledge_base (
         id SERIAL PRIMARY KEY,
         question TEXT NOT NULL,
@@ -159,7 +210,7 @@ def init_db():
         context_text TEXT,
         corrected_by TEXT,
         usage_count INTEGER DEFAULT 0,
-        embedding vector(768),
+        embedding vector({EMBEDDING_VECTOR_DIMENSION}),
         FOREIGN KEY (chat_history_id) REFERENCES chat_history (id)
     )
     """)
@@ -168,7 +219,7 @@ def init_db():
     for col, definition in [
         ("corrected_by", "TEXT"),
         ("usage_count", "INTEGER DEFAULT 0"),
-        ("embedding", "vector(768)"),
+        ("embedding", f"vector({EMBEDDING_VECTOR_DIMENSION})"),
     ]:
         try:
             cursor.execute(f"""
