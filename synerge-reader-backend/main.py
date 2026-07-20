@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from document_parser import extract_text_from_upload, ExtractionError, sanitize_filename
+from document_chunker import chunk_document
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from schemas import AskRequest, AskResponse, CorrectionRequest, RatingRequest,GoogleLoginRequest,LoginRequest,RegisterRequest
@@ -158,27 +159,6 @@ def stream_openrouter_chat(messages: list[dict], model: str = OPENROUTER_MODEL):
                         yield token
                 except Exception:
                     continue
-
-
-def chunk_text(text: str, max_chunk_size: int = 500) -> list:
-    if not text.strip():
-        return []
-
-    words = text.split()
-    chunks = []
-    current = []
-
-    for word in words:
-        current_size = sum(len(w) for w in current) + len(current) - 1
-        if current_size + len(word) + 1 <= max_chunk_size:
-            current.append(word)
-        else:
-            if current:
-                chunks.append(" ".join(current))
-            current = [word]
-    if current:
-        chunks.append(" ".join(current))
-    return chunks
 
 
 def embed_chunks(
@@ -748,8 +728,15 @@ async def upload_documents(
                 results.append({"error": "Empty file", "filename": safe_filename})
                 continue
 
-            chunks = chunk_text(text)
-            embeddings = embed_chunks(chunks)
+            chunks = chunk_document(result)
+            chunk_texts = [c.text for c in chunks]
+            embeddings = embed_chunks(chunk_texts)
+
+            if len(embeddings) != len(chunks):
+                raise RuntimeError(
+                    f"Embedding count mismatch: expected {len(chunks)}, "
+                    f"received {len(embeddings)}"
+                )
 
             conn = connect_to_postgres()
             if conn is None:
@@ -777,14 +764,14 @@ async def upload_documents(
 
                 doc_id = c.fetchone()[0]
 
-                for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+                for chunk, embedding in zip(chunks, embeddings):
                     c.execute(
                         """
                         INSERT INTO document_chunks
                         (document_id, chunk_text, chunk_index, embedding)
                         VALUES (%s, %s, %s, %s)
                         """,
-                        (doc_id, chunk, i, emb),
+                        (doc_id, chunk.text, chunk.chunk_index, embedding),
                     )
 
                 conn.commit()
