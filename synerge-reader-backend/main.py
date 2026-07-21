@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from document_parser import extract_text_from_upload, ExtractionError, sanitize_filename
-from document_chunker import chunk_document
+from document_chunker import chunk_document, build_chunk_locator
+from document_retrieval import build_relevant_chunks_query, retrieved_chunk_from_row
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from schemas import AskRequest, AskResponse, CorrectionRequest, RatingRequest,GoogleLoginRequest,LoginRequest,RegisterRequest
@@ -12,6 +13,7 @@ import re
 from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor
 from dbSetup import init_db,connect_to_postgres,test_postgres_connection
+from psycopg2.extras import Json
 import requests
 import json
 import time
@@ -229,41 +231,16 @@ def get_relevant_chunks(
             return []
         c = conn.cursor()
         question_embedding = embed_chunks([question])[0]
-        if document_names:
-            c.execute(
-                """
-                SELECT
-                    dc.chunk_text,
-                    1 - (dc.embedding <=> %s::vector) AS similarity
-                FROM document_chunks dc
-                JOIN documents d ON d.id = dc.document_id
-                WHERE dc.embedding IS NOT NULL
-                  AND d.filename = ANY(%s)
-                ORDER BY dc.embedding <=> %s::vector
-                LIMIT %s
-                """,
-                (question_embedding, document_names, question_embedding, top_k),
-            )
-        else:
-            c.execute(
-                """
-                SELECT
-                    dc.chunk_text,
-                    1 - (dc.embedding <=> %s::vector) AS similarity
-                FROM document_chunks dc
-                WHERE dc.embedding IS NOT NULL
-                ORDER BY dc.embedding <=> %s::vector
-                LIMIT %s
-                """,
-                (question_embedding, question_embedding, top_k),
-            )
+
+        query, params = build_relevant_chunks_query(
+            question_embedding=question_embedding,
+            top_k=top_k,
+            document_names=document_names,
+        )
+        c.execute(query, params)
         rows = c.fetchall()
 
-        scored = []
-        for text, similarity in rows:
-            scored.append({"text": text, "similarity": float(similarity)})
-
-        return scored
+        return [retrieved_chunk_from_row(row) for row in rows]
     except Exception as e:
         print(f"Error in get_relevant_chunks: {e}")
         return []
@@ -765,13 +742,23 @@ async def upload_documents(
                 doc_id = c.fetchone()[0]
 
                 for chunk, embedding in zip(chunks, embeddings):
+                    locator_payload = build_chunk_locator(chunk, result.document_type)
                     c.execute(
                         """
                         INSERT INTO document_chunks
-                        (document_id, chunk_text, chunk_index, embedding)
-                        VALUES (%s, %s, %s, %s)
+                        (document_id, chunk_text, chunk_index, embedding,
+                         page_start, page_end, locator_json)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
                         """,
-                        (doc_id, chunk.text, chunk.chunk_index, embedding),
+                        (
+                            doc_id,
+                            chunk.text,
+                            chunk.chunk_index,
+                            embedding,
+                            chunk.page_start,
+                            chunk.page_end,
+                            Json(locator_payload),
+                        ),
                     )
 
                 conn.commit()

@@ -78,6 +78,22 @@ def validate_document_chunks_embedding_schema(
         ) from exc
 
 
+def ensure_document_chunks_locator_columns(cursor) -> None:
+    """Add nullable locator columns when absent.
+
+    This migration never drops tables or columns and never rewrites
+    or deletes existing rows.
+    """
+    for col, definition in [
+        ("page_start", "INTEGER"),
+        ("page_end", "INTEGER"),
+        ("locator_json", "JSONB"),
+    ]:
+        cursor.execute(
+            f"ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS {col} {definition}"
+        )
+
+
 def connect_to_postgres():
     load_dotenv()
     connection = None
@@ -176,12 +192,17 @@ def init_db():
             chunk_text TEXT NOT NULL,
             chunk_index INTEGER,
             embedding vector({EMBEDDING_VECTOR_DIMENSION}),
+            page_start INTEGER,
+            page_end INTEGER,
+            locator_json JSONB,
             FOREIGN KEY (document_id)
                 REFERENCES documents (id)
                 ON DELETE CASCADE
         )
         """
     )
+
+    ensure_document_chunks_locator_columns(cursor)
 
     # Chat history
     cursor.execute("""

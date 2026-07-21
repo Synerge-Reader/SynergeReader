@@ -5,7 +5,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from document_chunker import DocumentChunk, chunk_document
+from document_chunker import DocumentChunk, build_chunk_locator, chunk_document
 from document_parser import ParsedDocument, ParsedPage
 
 
@@ -245,3 +245,47 @@ def test_chunk_document_returns_document_chunk_instances():
     )
     chunks = chunk_document(document)
     assert all(isinstance(c, DocumentChunk) for c in chunks)
+
+
+# --- build_chunk_locator ---
+
+
+def test_build_chunk_locator_single_pdf_page():
+    chunk = DocumentChunk(text="...", chunk_index=0, page_numbers=(4,))
+    locator = build_chunk_locator(chunk, document_type="pdf")
+    assert locator == {"locator_type": "pdf_pages", "page_numbers": [4]}
+
+
+def test_build_chunk_locator_preserves_page_gap():
+    chunk = DocumentChunk(text="...", chunk_index=0, page_numbers=(1, 3))
+    locator = build_chunk_locator(chunk, document_type="pdf")
+    assert locator == {"locator_type": "pdf_pages", "page_numbers": [1, 3]}
+    assert locator["page_numbers"] != [1, 2]
+    assert locator["page_numbers"] != [1, 2, 3]
+
+
+def test_build_chunk_locator_docx():
+    chunk = DocumentChunk(text="...", chunk_index=0, page_numbers=())
+    locator = build_chunk_locator(chunk, document_type="docx")
+    assert locator == {"locator_type": "docx"}
+
+
+def test_build_chunk_locator_text():
+    chunk = DocumentChunk(text="...", chunk_index=0, page_numbers=())
+    locator = build_chunk_locator(chunk, document_type="text")
+    assert locator == {"locator_type": "text"}
+
+
+def test_build_chunk_locator_defensive_empty_pages_with_pdf_type():
+    # Shouldn't occur given Commit 1's page-numbering invariants, but
+    # must not crash if it ever does.
+    chunk = DocumentChunk(text="...", chunk_index=0, page_numbers=())
+    locator = build_chunk_locator(chunk, document_type="pdf")
+    assert locator == {"locator_type": "pdf_pages", "page_numbers": []}
+
+
+def test_build_chunk_locator_is_json_serializable():
+    import json
+    chunk = DocumentChunk(text="...", chunk_index=0, page_numbers=(1, 3))
+    locator = build_chunk_locator(chunk, document_type="pdf")
+    json.dumps(locator)  # must not raise

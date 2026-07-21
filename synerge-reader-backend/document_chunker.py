@@ -74,3 +74,12 @@ def chunk_document(
 
     flush()
     return chunks
+
+
+def build_chunk_locator(chunk: DocumentChunk, document_type: str) -> dict:
+    if document_type == "pdf":
+        return {
+            "locator_type": "pdf_pages",
+            "page_numbers": list(chunk.page_numbers),
+        }
+    return {"locator_type": document_type}
