@@ -4,24 +4,40 @@ import sys
 from dotenv import load_dotenv
 from pgvector.psycopg2 import register_vector
 
-EMBEDDING_VECTOR_DIMENSION = 768
+from embedding_config import EMBEDDING_VECTOR_DIMENSION
 
 
-class DocumentChunkSchemaError(RuntimeError):
-    """Raised when document_chunks cannot be validated safely."""
+class VectorColumnSchemaError(RuntimeError):
+    """Base class for any vector-column schema validation failure."""
 
 
-def validate_document_chunks_embedding_schema(
-    cursor,
-    expected_dimension: int = EMBEDDING_VECTOR_DIMENSION,
+class DocumentChunkSchemaError(VectorColumnSchemaError):
+    pass
+
+
+class KnowledgeBaseSchemaError(VectorColumnSchemaError):
+    pass
+
+
+def validate_vector_column_schema(
+    cursor, *, table_name: str, column_name: str, expected_dimension: int
 ) -> None:
+    """
+    Generalized version of the existing document-chunks-only validator.
+    table_name/column_name are always bound as query parameters, not
+    interpolated into SQL text — this works because to_regclass() and the
+    pg_attribute lookup both accept these as ordinary data values.
+    Never call this with a table_name/column_name that originates from
+    user input; in this codebase they are always fixed internal literals
+    ("public.document_chunks", "public.knowledge_base", "embedding").
+    """
     try:
-        cursor.execute("SELECT to_regclass('document_chunks')::oid")
+        cursor.execute("SELECT to_regclass(%s)::oid", (table_name,))
         row = cursor.fetchone()
         table_oid = row[0] if row else None
 
         if table_oid is None:
-            return  # fresh database — let CREATE TABLE proceed normally
+            return  # table doesn't exist yet — let CREATE TABLE proceed normally, nothing to validate
 
         cursor.execute(
             """
@@ -29,17 +45,17 @@ def validate_document_chunks_embedding_schema(
                 SELECT 1
                 FROM pg_attribute
                 WHERE attrelid = %s
-                  AND attname = 'embedding'
+                  AND attname = %s
                   AND NOT attisdropped
             )
             """,
-            (table_oid,),
+            (table_oid, column_name),
         )
-        embedding_exists = cursor.fetchone()[0]
+        column_exists = cursor.fetchone()[0]
 
-        if not embedding_exists:
-            raise DocumentChunkSchemaError(
-                "document_chunks exists but is missing its 'embedding' column. "
+        if not column_exists:
+            raise VectorColumnSchemaError(
+                f"{table_name} exists but is missing its '{column_name}' column. "
                 "Refusing to recreate or drop the table automatically; run an "
                 "explicit migration or reindex operation."
             )
@@ -49,33 +65,62 @@ def validate_document_chunks_embedding_schema(
             SELECT atttypmod
             FROM pg_attribute
             WHERE attrelid = %s
-              AND attname = 'embedding'
+              AND attname = %s
               AND NOT attisdropped
             """,
-            (table_oid,),
+            (table_oid, column_name),
         )
         row = cursor.fetchone()
         actual_dimension = row[0] if row else None
 
         if type(actual_dimension) is not int or actual_dimension <= 0:
-            raise DocumentChunkSchemaError(
-                "document_chunks embedding dimension metadata is missing or "
+            raise VectorColumnSchemaError(
+                f"{table_name}.{column_name} dimension metadata is missing or "
                 "malformed. Refusing to modify or recreate the table automatically."
             )
 
         if actual_dimension != expected_dimension:
-            raise DocumentChunkSchemaError(
-                f"document_chunks embedding dimension is {actual_dimension}, "
+            raise VectorColumnSchemaError(
+                f"{table_name}.{column_name} dimension is {actual_dimension}, "
                 f"expected {expected_dimension}. Refusing to modify or recreate "
                 "the table automatically; run an explicit migration to reindex "
-                "the embedding column."
+                "the column."
             )
-    except DocumentChunkSchemaError:
+    except VectorColumnSchemaError:
         raise
     except Exception as exc:
-        raise DocumentChunkSchemaError(
-            "Failed to validate document_chunks schema safely."
+        raise VectorColumnSchemaError(
+            f"Failed to validate {table_name}.{column_name} schema safely."
         ) from exc
+
+
+def validate_document_chunks_embedding_schema(
+    cursor, expected_dimension: int = EMBEDDING_VECTOR_DIMENSION
+) -> None:
+    """Thin wrapper preserving the existing public API and existing test imports."""
+    try:
+        validate_vector_column_schema(
+            cursor,
+            table_name="public.document_chunks",
+            column_name="embedding",
+            expected_dimension=expected_dimension,
+        )
+    except VectorColumnSchemaError as exc:
+        raise DocumentChunkSchemaError(str(exc)) from exc
+
+
+def validate_knowledge_base_embedding_schema(
+    cursor, expected_dimension: int = EMBEDDING_VECTOR_DIMENSION
+) -> None:
+    try:
+        validate_vector_column_schema(
+            cursor,
+            table_name="public.knowledge_base",
+            column_name="embedding",
+            expected_dimension=expected_dimension,
+        )
+    except VectorColumnSchemaError as exc:
+        raise KnowledgeBaseSchemaError(str(exc)) from exc
 
 
 def ensure_document_chunks_locator_columns(cursor) -> None:
@@ -236,20 +281,24 @@ def init_db():
     )
     """)
 
-    # Add new columns to existing knowledge_base table if they don't exist
+    # Add new columns to existing knowledge_base table if they don't exist.
+    # Every statement here is ADD COLUMN IF NOT EXISTS, which is inherently
+    # idempotent/safe to retry — no try/except/rollback here. A genuine
+    # failure propagates to init_db()'s caller instead of being silently
+    # swallowed (the old rollback() here used to roll back the entire
+    # transaction, including the document_chunks/chat_history tables
+    # already created earlier in this same call).
     for col, definition in [
         ("corrected_by", "TEXT"),
         ("usage_count", "INTEGER DEFAULT 0"),
         ("embedding", f"vector({EMBEDDING_VECTOR_DIMENSION})"),
     ]:
-        try:
-            cursor.execute(f"""
-                ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS {col} {definition}
-            """)
-        except Exception as e:
-            print(f"Column {col} may already exist: {e}")
-            conn.rollback()
-    
+        cursor.execute(f"""
+            ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS {col} {definition}
+        """)
+
+    validate_knowledge_base_embedding_schema(cursor)
+
 
 
   

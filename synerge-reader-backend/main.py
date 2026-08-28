@@ -11,8 +11,8 @@ import string
 import datetime
 import re
 from typing import List, Optional
-from concurrent.futures import ThreadPoolExecutor
 from dbSetup import init_db,connect_to_postgres,test_postgres_connection
+from embedding_service import embed_documents, embed_query, EmbeddingServiceError
 from psycopg2.extras import Json
 import requests
 import json
@@ -54,7 +54,6 @@ OLLAMA_FALLBACK_HOSTS = [
 ]
 OLLAMA_CONNECT_TIMEOUT = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "1.5"))
 OLLAMA_READ_TIMEOUT = float(os.getenv("OLLAMA_READ_TIMEOUT", "60"))
-OLLAMA_EMBED_CONCURRENCY = int(os.getenv("OLLAMA_EMBED_CONCURRENCY", "4"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_BASE_URL = os.getenv(
@@ -163,63 +162,6 @@ def stream_openrouter_chat(messages: list[dict], model: str = OPENROUTER_MODEL):
                     continue
 
 
-def embed_chunks(
-    chunks: List[str], model: str = "nomic-embed-text:v1.5"
-) -> List[List[float]]:
-    if not chunks:
-        return []
-
-    def fetch_embeddings(endpoint: str, payload: dict):
-        resp = post_ollama(endpoint, payload, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        if "embeddings" in data:
-            return data["embeddings"]
-        if "embedding" in data:
-            return [data["embedding"]]
-        return []
-
-    try:
-        embeddings = fetch_embeddings(
-            "/api/embed",
-            {"model": model, "input": chunks, "keep_alive": OLLAMA_KEEP_ALIVE},
-        )
-        if len(embeddings) == len(chunks):
-            return embeddings
-    except Exception:
-        pass
-
-    def embed_one(chunk: str) -> List[float]:
-        try:
-            embeddings = fetch_embeddings(
-                "/api/embed",
-                {"model": model, "input": chunk, "keep_alive": OLLAMA_KEEP_ALIVE},
-            )
-            if embeddings:
-                return embeddings[0]
-        except Exception:
-            pass
-
-        try:
-            resp = post_ollama(
-                "/api/embeddings",
-                {"model": model, "prompt": chunk, "keep_alive": OLLAMA_KEEP_ALIVE},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("embedding", data.get("embeddings", [[0.0] * 768])[0])
-        except Exception:
-            return [0.0] * 768
-
-    if len(chunks) == 1:
-        return [embed_one(chunks[0])]
-
-    max_workers = max(1, min(OLLAMA_EMBED_CONCURRENCY, len(chunks)))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        return list(executor.map(embed_one, chunks))
-
-
 def get_relevant_chunks(
     question: str, top_k: int = 3, document_names: Optional[List[str]] = None
 ) -> List[dict]:
@@ -230,7 +172,7 @@ def get_relevant_chunks(
         if conn is None:
             return []
         c = conn.cursor()
-        question_embedding = embed_chunks([question])[0]
+        question_embedding = embed_query(question, post_fn=post_ollama, keep_alive=OLLAMA_KEEP_ALIVE)
 
         query, params = build_relevant_chunks_query(
             question_embedding=question_embedding,
@@ -241,6 +183,8 @@ def get_relevant_chunks(
         rows = c.fetchall()
 
         return [retrieved_chunk_from_row(row) for row in rows]
+    except EmbeddingServiceError:
+        raise
     except Exception as e:
         print(f"Error in get_relevant_chunks: {e}")
         return []
@@ -354,10 +298,7 @@ def get_relevant_knowledge_base(question: str, limit: int = 3) -> List[dict]:
     """Retrieve relevant knowledge base entries using semantic similarity (pgvector)."""
     try:
         # Embed the incoming question
-        q_emb = embed_chunks([question])
-        if not q_emb or not q_emb[0]:
-            return []
-        q_vec = q_emb[0]
+        q_vec = embed_query(question, post_fn=post_ollama, keep_alive=OLLAMA_KEEP_ALIVE)
 
         conn = connect_to_postgres()
         c = conn.cursor()
@@ -413,6 +354,8 @@ def get_relevant_knowledge_base(question: str, limit: int = 3) -> List[dict]:
             scored.sort(key=lambda x: x["relevance_score"], reverse=True)
             return scored[:limit]
 
+    except EmbeddingServiceError:
+        raise
     except Exception as e:
         print(f"Error retrieving knowledge base: {e}")
         return []
@@ -450,8 +393,10 @@ def auto_save_to_kb(question: str, answer: str, source: str = "auto"):
             return
 
         # Embed the question
-        q_emb = embed_chunks([question])
-        if not q_emb or not q_emb[0]:
+        try:
+            q_emb = embed_documents([question], post_fn=post_ollama, keep_alive=OLLAMA_KEEP_ALIVE)
+        except EmbeddingServiceError as exc:
+            print(f"[KB] Auto-save skipped, embedding failed: {exc}")
             return
         q_vec = q_emb[0]
 
@@ -638,10 +583,11 @@ Start with Q:"""
             seen.add(q.lower())
 
             try:
-                q_emb = embed_chunks([q])
-                q_vec = q_emb[0] if q_emb else None
-            except Exception:
-                q_vec = None
+                q_emb = embed_documents([q], post_fn=post_ollama, keep_alive=OLLAMA_KEEP_ALIVE)
+                q_vec = q_emb[0]
+            except EmbeddingServiceError as exc:
+                print(f"[KB] Skip (embedding failed): {q[:50]} ({exc})")
+                continue
 
             c.execute(
                 """
@@ -707,7 +653,7 @@ async def upload_documents(
 
             chunks = chunk_document(result)
             chunk_texts = [c.text for c in chunks]
-            embeddings = embed_chunks(chunk_texts)
+            embeddings = embed_documents(chunk_texts, post_fn=post_ollama, keep_alive=OLLAMA_KEEP_ALIVE)
 
             if len(embeddings) != len(chunks):
                 raise RuntimeError(
@@ -944,6 +890,10 @@ Keep the answer concise, structured, and directly responsive to the question."""
                 "stream": True,
                 "keep_alive": OLLAMA_KEEP_ALIVE,
             }
+        except EmbeddingServiceError as exc:
+            print(f"Embedding retrieval failed during /ask: {exc}")  # server-side detail only
+            yield "__ERROR__The embedding service is unavailable. Retrieval was not performed.__"
+            return
         except Exception as e:
             yield f"__ERROR__Failed to build document context: {e}__"
             return
@@ -1374,6 +1324,7 @@ async def google_login(request: GoogleLoginRequest):
 
 @app.post("/submit_correction")
 async def submit_correction(request: CorrectionRequest):
+    conn = None
     try:
         conn = connect_to_postgres()
         c = conn.cursor()
@@ -1382,7 +1333,6 @@ async def submit_correction(request: CorrectionRequest):
         c.execute("SELECT question, answer FROM chat_history WHERE id = %s", (request.chat_id,))
         row = c.fetchone()
         if not row:
-            conn.close()
             raise HTTPException(404, "Chat ID not found")
 
         question, original_answer = row
@@ -1393,10 +1343,15 @@ async def submit_correction(request: CorrectionRequest):
         # Insert into knowledge base
         # Embed the question for semantic matching
         try:
-            q_emb = embed_chunks([question])
-            q_vec = q_emb[0] if q_emb else None
-        except Exception:
-            q_vec = None
+            q_emb = embed_documents([question], post_fn=post_ollama, keep_alive=OLLAMA_KEEP_ALIVE)
+            q_vec = q_emb[0]
+        except EmbeddingServiceError as exc:
+            print(f"[KB] Correction embedding failed for chat_id={request.chat_id}: {exc}")
+            conn.rollback()
+            raise HTTPException(
+                503,
+                "This correction was not saved to the knowledge base because the embedding service is unavailable.",
+            )
 
         c.execute(
             "INSERT INTO knowledge_base (question, original_answer, corrected_answer, created_at, chat_history_id, corrected_by, usage_count, embedding) VALUES (%s, %s, %s, %s, %s, %s, 0, %s)",
@@ -1404,13 +1359,17 @@ async def submit_correction(request: CorrectionRequest):
         )
 
         conn.commit()
-        conn.close()
         return {
             "message": "Correction submitted and saved to KB",
             "chat_id": request.chat_id,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 @app.get("/knowledge_base")
@@ -1443,24 +1402,34 @@ async def knowledge_base():
 @app.post("/knowledge_base")
 async def add_knowledge(request: KnowledgeInsertRequest):
     """Add knowledge items directly to knowledge base (admin/manual entry)"""
+    conn = None
     try:
         conn = connect_to_postgres()
         c = conn.cursor()
         for item in request.items:
             try:
-                q_emb = embed_chunks([item.question])
-                q_vec = q_emb[0] if q_emb else None
-            except Exception:
-                q_vec = None
+                q_emb = embed_documents([item.question], post_fn=post_ollama, keep_alive=OLLAMA_KEEP_ALIVE)
+                q_vec = q_emb[0]
+            except EmbeddingServiceError as exc:
+                print(f"[KB] Manual add embedding failed: {exc}")
+                conn.rollback()
+                raise HTTPException(
+                    503,
+                    "This knowledge item was not saved because the embedding service is unavailable.",
+                )
             c.execute(
                 "INSERT INTO knowledge_base (question, original_answer, corrected_answer, created_at, context_text, corrected_by, usage_count, embedding) VALUES (%s, %s, %s, %s, %s, %s, 0, %s)",
                 (item.question, "", item.answer, datetime.datetime.now().isoformat(), item.source or "", "Manual Entry", q_vec)
             )
         conn.commit()
-        conn.close()
         return {"message": f"{len(request.items)} knowledge items added"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 @app.delete("/knowledge_base/{entry_id}")
@@ -1490,22 +1459,29 @@ class KBUpdateRequest(BaseModel):
 @app.put("/knowledge_base/{entry_id}")
 async def update_knowledge(entry_id: int, request: KBUpdateRequest):
     """Edit a knowledge base entry"""
+    conn = None
     try:
-        # Re-embed if question changed
-        try:
-            q_emb = embed_chunks([request.question])
-            q_vec = q_emb[0] if q_emb else None
-        except Exception:
-            q_vec = None
         conn = connect_to_postgres()
         c = conn.cursor()
+
+        # Re-embed the question
+        try:
+            q_emb = embed_documents([request.question], post_fn=post_ollama, keep_alive=OLLAMA_KEEP_ALIVE)
+            q_vec = q_emb[0]
+        except EmbeddingServiceError as exc:
+            print(f"[KB] Manual update embedding failed for entry {entry_id}: {exc}")
+            conn.rollback()
+            raise HTTPException(
+                503,
+                "This knowledge item was not updated because the embedding service is unavailable.",
+            )
+
         c.execute(
             "UPDATE knowledge_base SET question=%s, corrected_answer=%s, embedding=%s WHERE id=%s RETURNING id",
             (request.question, request.answer, q_vec, entry_id)
         )
         updated = c.fetchone()
         conn.commit()
-        conn.close()
         if not updated:
             raise HTTPException(404, "Entry not found")
         return {"message": f"Entry {entry_id} updated"}
@@ -1513,6 +1489,9 @@ async def update_knowledge(entry_id: int, request: KBUpdateRequest):
         raise
     except Exception as e:
         raise HTTPException(500, str(e))
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 @app.get("/admin/check")

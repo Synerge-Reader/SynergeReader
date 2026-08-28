@@ -10,7 +10,11 @@ import dbSetup
 from dbSetup import (
     EMBEDDING_VECTOR_DIMENSION,
     DocumentChunkSchemaError,
+    KnowledgeBaseSchemaError,
+    VectorColumnSchemaError,
     validate_document_chunks_embedding_schema,
+    validate_knowledge_base_embedding_schema,
+    validate_vector_column_schema,
 )
 
 DESTRUCTIVE_SQL_PATTERN = re.compile(
@@ -113,11 +117,12 @@ def test_missing_embedding_column_raises_with_explanation():
 
 
 def test_dimension_mismatch_raises_naming_both_values():
-    cursor = FakeCursor(fetch_results=[(12345,), (True,), (1024,)])
+    wrong_dimension = EMBEDDING_VECTOR_DIMENSION + 1
+    cursor = FakeCursor(fetch_results=[(12345,), (True,), (wrong_dimension,)])
     with pytest.raises(DocumentChunkSchemaError) as exc_info:
         validate_document_chunks_embedding_schema(cursor)
     message = str(exc_info.value)
-    assert "1024" in message
+    assert str(wrong_dimension) in message
     assert str(EMBEDDING_VECTOR_DIMENSION) in message
     assert_no_destructive_sql(cursor.executed)
 
@@ -153,7 +158,11 @@ def test_inspection_failure_wraps_original_exception_as_cause():
     cursor = FakeCursor(raise_on_execute=original)
     with pytest.raises(DocumentChunkSchemaError) as exc_info:
         validate_document_chunks_embedding_schema(cursor)
-    assert exc_info.value.__cause__ is original
+    # Two-layer wrapping: validate_vector_column_schema wraps the original
+    # failure as VectorColumnSchemaError, then validate_document_chunks_
+    # embedding_schema wraps that as DocumentChunkSchemaError — the original
+    # exception is preserved two levels down the __cause__ chain.
+    assert exc_info.value.__cause__.__cause__ is original
     assert_no_destructive_sql(cursor.executed)
 
 
@@ -199,10 +208,61 @@ def test_table_oid_passed_as_bound_parameter_not_interpolated():
     cursor = _valid_schema_cursor()
     validate_document_chunks_embedding_schema(cursor)
 
-    parameterized_calls = [params for _sql, params in cursor.executed if params]
-    assert parameterized_calls, "expected at least one parameterized query using table_oid"
-    for params in parameterized_calls:
-        assert params == (12345,)
+    # First call resolves the oid via a bound table_name parameter, not
+    # interpolated SQL text.
+    first_sql, first_params = cursor.executed[0]
+    assert first_params == ("public.document_chunks",)
+    assert "document_chunks" not in first_sql
 
-    for sql, _params in cursor.executed:
+    # Every subsequent call binds the already-resolved table_oid + column_name
+    # — never re-interpolates the table/column name into SQL text.
+    for sql, params in cursor.executed[1:]:
+        assert params == (12345, "embedding")
         assert "'document_chunks'::regclass" not in sql
+        assert "document_chunks" not in sql
+
+
+# --- generalized validate_vector_column_schema() + per-table exception types ---
+
+
+def test_validate_vector_column_schema_fresh_table_returns_normally():
+    cursor = FakeCursor(fetch_results=[(None,)])
+    validate_vector_column_schema(
+        cursor,
+        table_name="public.some_table",
+        column_name="embedding",
+        expected_dimension=EMBEDDING_VECTOR_DIMENSION,
+    )
+    assert len(cursor.executed) == 1
+    assert_no_destructive_sql(cursor.executed)
+
+
+def test_document_chunks_failure_raises_specific_subclass_not_generic_base():
+    cursor = FakeCursor(fetch_results=[(12345,), (False,)])
+    with pytest.raises(DocumentChunkSchemaError) as exc_info:
+        validate_document_chunks_embedding_schema(cursor)
+    assert type(exc_info.value) is DocumentChunkSchemaError
+    assert isinstance(exc_info.value, VectorColumnSchemaError)
+    assert not isinstance(exc_info.value, KnowledgeBaseSchemaError)
+    assert_no_destructive_sql(cursor.executed)
+
+
+def test_knowledge_base_failure_raises_knowledge_base_schema_error_not_document_chunk():
+    cursor = FakeCursor(fetch_results=[(6789,), (False,)])
+    with pytest.raises(KnowledgeBaseSchemaError) as exc_info:
+        validate_knowledge_base_embedding_schema(cursor)
+    assert type(exc_info.value) is KnowledgeBaseSchemaError
+    assert isinstance(exc_info.value, VectorColumnSchemaError)
+    assert not isinstance(exc_info.value, DocumentChunkSchemaError)
+    assert_no_destructive_sql(cursor.executed)
+
+
+def test_knowledge_base_dimension_mismatch_raises_with_both_values():
+    wrong_dimension = EMBEDDING_VECTOR_DIMENSION + 1
+    cursor = FakeCursor(fetch_results=[(6789,), (True,), (wrong_dimension,)])
+    with pytest.raises(KnowledgeBaseSchemaError) as exc_info:
+        validate_knowledge_base_embedding_schema(cursor)
+    message = str(exc_info.value)
+    assert str(wrong_dimension) in message
+    assert str(EMBEDDING_VECTOR_DIMENSION) in message
+    assert_no_destructive_sql(cursor.executed)
