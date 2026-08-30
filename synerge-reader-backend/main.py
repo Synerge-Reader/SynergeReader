@@ -56,13 +56,6 @@ OLLAMA_FALLBACK_HOSTS = [
 OLLAMA_CONNECT_TIMEOUT = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "1.5"))
 OLLAMA_READ_TIMEOUT = float(os.getenv("OLLAMA_READ_TIMEOUT", "60"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-OPENROUTER_BASE_URL = os.getenv(
-    "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
-).rstrip("/")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/auto").strip()
-OPENROUTER_HTTP_REFERER = os.getenv("OPENROUTER_HTTP_REFERER", "http://localhost")
-OPENROUTER_TITLE = os.getenv("OPENROUTER_TITLE", "SynergeReader")
 _ACTIVE_OLLAMA_BASE_URL = None
 _OLLAMA_HEALTH_CHECKED_AT = 0
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -140,49 +133,6 @@ _EMBEDDING_PROVIDER = OllamaEmbeddingProvider(
     http_post=_post_embedding_request,
     keep_alive=OLLAMA_KEEP_ALIVE,
 )
-
-
-def stream_openrouter_chat(messages: list[dict], model: str = OPENROUTER_MODEL):
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY is not configured")
-
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": OPENROUTER_HTTP_REFERER,
-        "X-Title": OPENROUTER_TITLE,
-    }
-    payload = {
-        "model": model or OPENROUTER_MODEL,
-        "messages": messages,
-        "stream": True,
-        "temperature": 0.7,
-        "max_tokens": 1000,
-    }
-
-    with requests.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
-        headers=headers,
-        json=payload,
-        stream=True,
-        timeout=(10, 90),
-    ) as r:
-        r.raise_for_status()
-        for raw_line in r.iter_lines(decode_unicode=True):
-            if not raw_line:
-                continue
-            if raw_line.startswith("data: "):
-                data = raw_line[6:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                    delta = chunk["choices"][0].get("delta", {})
-                    token = delta.get("content", "")
-                    if token:
-                        yield token
-                except Exception:
-                    continue
 
 
 def get_relevant_chunks(
@@ -786,13 +736,6 @@ async def upload_documents(
 
 @app.post("/ask")
 async def ask_question(request: AskRequest):
-    system_prompt = (
-        "You are SynergeReader, a document assistant. "
-        "Answer only from the provided context when possible. "
-        "If the context is insufficient, say what is missing instead of guessing. "
-        "Do not include internal tags, JSON, or the words CONTEXT/QUESTION in the answer."
-    )
-
     answer_parts = []
     entry_id = None
     selected_items = list(request.selections or [])
@@ -912,10 +855,6 @@ Keep the answer concise, structured, and directly responsive to the question."""
             # ─────────────────────────────────────────────────────────────
 
             prompt = build_prompt(prompt_text)
-            fallback_messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ]
             context_data = {
                 "context_chunks": [chunk_data["text"] for chunk_data in context_chunks],
                 "similarity_score": best_similarity,
@@ -978,29 +917,12 @@ Keep the answer concise, structured, and directly responsive to the question."""
                         pass
                 print(f"DEBUG: Streaming complete. Total tokens: {token_count}")
         except Exception as e:
-            stream_error = str(e)
-            if OPENROUTER_API_KEY:
-                try:
-                    answer_parts.clear()
-                    for token in stream_openrouter_chat(
-                        fallback_messages, model=OPENROUTER_MODEL
-                    ):
-                        answer_parts.append(token)
-                        yield token
-                    stream_error = None
-                except Exception as fallback_error:
-                    print(f"DEBUG: OpenRouter fallback failed: {fallback_error}")
-                    response = getattr(fallback_error, "response", None)
-                    if response is not None:
-                        yield f"__ERROR__LLM request failed with HTTP {response.status_code}. Check model access in OpenRouter.__"
-                    else:
-                        yield "__ERROR__The local LLM server is not reachable and OpenRouter fallback is unavailable.__"
+            stream_error = True
+            response = getattr(e, "response", None)
+            if response is not None:
+                yield f"__ERROR__LLM request failed with HTTP {response.status_code}. Check that model '{request.model}' is installed in Ollama.__"
             else:
-                response = getattr(e, "response", None)
-                if response is not None:
-                    yield f"__ERROR__LLM request failed with HTTP {response.status_code}. Check that model '{request.model}' is installed in Ollama.__"
-                else:
-                    yield "__ERROR__The local LLM server is not reachable. Start Ollama or update OLLAMA_BASE_URL / OLLAMA_PORT in .env.__"
+                yield "__ERROR__The local LLM server is not reachable. Start Ollama or update OLLAMA_BASE_URL / OLLAMA_PORT in .env.__"
 
         # Increment KB usage counts for entries that fired this query
         if kb_ids_fired:

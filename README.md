@@ -13,7 +13,7 @@ A browser-based document reader with AI-powered question answering capabilities.
 - **Question Analysis**: Intelligent question analysis and intent recognition
 - **Vector Similarity Search**: Find relevant document chunks using embeddings
 - **History Retrieval**: Smart retrieval of relevant past Q&A pairs
-- **LLM Integration**: OpenRouter API with enhanced prompt building
+- **LLM Integration**: Local Ollama answer generation with no external generation fallback
 - **Chat History**: Persistent storage of all Q&A interactions
 - **Modern UI**: Clean, responsive interface with real-time feedback
 
@@ -26,9 +26,9 @@ Frontend (React) ←→ FastAPI Backend ←→ PostgreSQL + pgvector
 ### Backend Components
 - **FastAPI**: Modern async web framework
 - **PostgreSQL + pgvector**: Vector database for document embeddings
-- **Sentence Transformers**: Text embedding generation
+- **Ollama Embeddings**: Local embedding generation through the configured embedding profile
 - **PostgreSQL**: Chat history storage
-- **OpenRouter API**: LLM integration
+- **Ollama Generation**: Local streaming answer generation
 
 ### Frontend Components
 - **React**: Modern UI framework
@@ -96,7 +96,7 @@ npm start
 1. **Upload**: File validation and size checking
 2. **Parsing**: Extract text using appropriate parser (pdf.js/mammoth.js)
 3. **Chunking**: Split text into overlapping chunks (1000 chars, 200 overlap)
-4. **Embedding**: Generate embeddings using sentence-transformers
+4. **Embedding**: Generate embeddings through the configured Ollama embedding profile
 5. **Storage**: Store chunks and embeddings in PostgreSQL pgvector
 
 ### Question Answering Pipeline
@@ -104,20 +104,22 @@ npm start
 2. **Vector Search**: Find similar document chunks using embeddings
 3. **History Retrieval**: Find relevant past Q&A pairs
 4. **Prompt Building**: Construct comprehensive prompt with context
-5. **LLM Call**: Generate answer using OpenRouter API
+5. **LLM Call**: Generate the answer using local Ollama generation
 6. **Storage**: Save Q&A to PostgreSQL history
 
 ## Configuration
 
 ### Environment Variables
-- `OPENROUTER_API_KEY`: Your OpenRouter API key
+- `OLLAMA_BASE_URL`: Optional explicit Ollama service URL
+- `OLLAMA_HOST` and `OLLAMA_PORT`: Ollama connection host and port when no base URL is set
+- `OLLAMA_FALLBACK_HOSTS`: Comma-separated fallback hosts for local Ollama discovery
 - `CHUNK_SIZE`: Document chunk size (default: 1000)
 - `CHUNK_OVERLAP`: Chunk overlap size (default: 200)
 - `MAX_FILE_SIZE`: Maximum file size in bytes (default: 20MB)
 
 ### Model Configuration
-- **Embedding Model**: `all-MiniLM-L6-v2` (sentence-transformers)
-- **LLM Model**: `meta-llama/llama-3.3-70b-instruct:free` (OpenRouter)
+- **Embedding Model**: Controlled by the configured Ollama embedding profile; the proposed mxbai/1024 default remains pending DGX validation
+- **LLM Model**: Ollama generation through the configured service, selected per request, with no application-level external generation fallback
 - **Vector Space**: Cosine distance in pgvector
 
 ## Development
@@ -146,7 +148,7 @@ synerge-reader/
 - **Document Processing**: Chunking, embedding, vector storage
 - **Question Analysis**: Intent recognition and key term extraction
 - **Vector Search**: Similarity-based document retrieval
-- **LLM Integration**: Enhanced prompt building and API calls
+- **LLM Integration**: Enhanced prompt building and local Ollama streaming generation
 - **History Management**: PostgreSQL CRUD operations
 
 #### Frontend Components
@@ -158,7 +160,7 @@ synerge-reader/
 ## Performance Considerations
 
 - **Chunking Strategy**: Overlapping chunks preserve context across boundaries
-- **Embedding Caching**: Sentence transformers model loaded once
+- **Embedding Profile Reuse**: Backend embedding calls share the configured Ollama provider and profile
 - **Vector Search**: Efficient similarity search with pgvector
 - **Response Streaming**: Future enhancement for real-time answers
 
@@ -190,13 +192,13 @@ synerge-reader/
    - Ensure file size is under 20MB
    - Check file format (PDF, DOCX, TXT only)
 
-3. **LLM API Errors**
-   - Verify OpenRouter API key is valid
-   - Check API rate limits
+3. **Local LLM Errors**
+   - Verify that the Ollama service is reachable using the configured connection settings
+   - Check that the requested generation model is installed in Ollama
 
 4. **Vector Search Issues**
    - Ensure PostgreSQL is running and the vector extension is enabled
-   - Check embedding model download
+   - Check that the configured Ollama embedding model is available
 
 ### Logs
 - Backend logs: `docker-compose logs backend`
@@ -218,7 +220,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 - [FastAPI](https://fastapi.tiangolo.com/) for the backend framework
 - [pgvector](https://github.com/pgvector/pgvector) for vector database
-- [Sentence Transformers](https://www.sbert.net/) for embeddings
-- [OpenRouter](https://openrouter.ai/) for LLM access
+- [Ollama](https://ollama.com/) for local embedding and generation services
 - [React](https://reactjs.org/) for the frontend framework
 "# SynergeReader" 
