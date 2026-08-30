@@ -11,8 +11,9 @@ import string
 import datetime
 import re
 from typing import List, Optional
-from concurrent.futures import ThreadPoolExecutor
 from dbSetup import init_db,connect_to_postgres,test_postgres_connection
+from ollama_embedding_provider import EmbeddingProviderError, OllamaEmbeddingProvider
+from rag_model_profiles import resolve_embedding_profile
 from psycopg2.extras import Json
 import requests
 import json
@@ -54,7 +55,6 @@ OLLAMA_FALLBACK_HOSTS = [
 ]
 OLLAMA_CONNECT_TIMEOUT = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "1.5"))
 OLLAMA_READ_TIMEOUT = float(os.getenv("OLLAMA_READ_TIMEOUT", "60"))
-OLLAMA_EMBED_CONCURRENCY = int(os.getenv("OLLAMA_EMBED_CONCURRENCY", "4"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_BASE_URL = os.getenv(
@@ -120,6 +120,28 @@ def post_ollama(endpoint: str, payload: dict, *, stream: bool = False, timeout: 
     )
 
 
+# Resolved once at the application composition boundary. resolve_embedding_profile()
+# is the only sanctioned way to obtain a profile here -- main.py never constructs
+# EmbeddingProfile directly.
+_EMBEDDING_PROFILE = resolve_embedding_profile()
+
+
+def _post_embedding_request(endpoint: str, payload: dict):
+    """Adapt post_ollama's (endpoint, payload, *, timeout=...) signature to the
+    two-positional-argument callable OllamaEmbeddingProvider requires, while
+    preserving the embedding request's existing 30-second timeout."""
+    return post_ollama(endpoint, payload, timeout=30)
+
+
+# Construction performs no network call -- it only stores the profile and the
+# callable above. Reused for every embedding call in this module.
+_EMBEDDING_PROVIDER = OllamaEmbeddingProvider(
+    profile=_EMBEDDING_PROFILE,
+    http_post=_post_embedding_request,
+    keep_alive=OLLAMA_KEEP_ALIVE,
+)
+
+
 def stream_openrouter_chat(messages: list[dict], model: str = OPENROUTER_MODEL):
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY is not configured")
@@ -163,63 +185,6 @@ def stream_openrouter_chat(messages: list[dict], model: str = OPENROUTER_MODEL):
                     continue
 
 
-def embed_chunks(
-    chunks: List[str], model: str = "nomic-embed-text:v1.5"
-) -> List[List[float]]:
-    if not chunks:
-        return []
-
-    def fetch_embeddings(endpoint: str, payload: dict):
-        resp = post_ollama(endpoint, payload, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        if "embeddings" in data:
-            return data["embeddings"]
-        if "embedding" in data:
-            return [data["embedding"]]
-        return []
-
-    try:
-        embeddings = fetch_embeddings(
-            "/api/embed",
-            {"model": model, "input": chunks, "keep_alive": OLLAMA_KEEP_ALIVE},
-        )
-        if len(embeddings) == len(chunks):
-            return embeddings
-    except Exception:
-        pass
-
-    def embed_one(chunk: str) -> List[float]:
-        try:
-            embeddings = fetch_embeddings(
-                "/api/embed",
-                {"model": model, "input": chunk, "keep_alive": OLLAMA_KEEP_ALIVE},
-            )
-            if embeddings:
-                return embeddings[0]
-        except Exception:
-            pass
-
-        try:
-            resp = post_ollama(
-                "/api/embeddings",
-                {"model": model, "prompt": chunk, "keep_alive": OLLAMA_KEEP_ALIVE},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("embedding", data.get("embeddings", [[0.0] * 768])[0])
-        except Exception:
-            return [0.0] * 768
-
-    if len(chunks) == 1:
-        return [embed_one(chunks[0])]
-
-    max_workers = max(1, min(OLLAMA_EMBED_CONCURRENCY, len(chunks)))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        return list(executor.map(embed_one, chunks))
-
-
 def get_relevant_chunks(
     question: str, top_k: int = 3, document_names: Optional[List[str]] = None
 ) -> List[dict]:
@@ -230,7 +195,7 @@ def get_relevant_chunks(
         if conn is None:
             return []
         c = conn.cursor()
-        question_embedding = embed_chunks([question])[0]
+        question_embedding = _EMBEDDING_PROVIDER.embed_query(question)
 
         query, params = build_relevant_chunks_query(
             question_embedding=question_embedding,
@@ -241,6 +206,8 @@ def get_relevant_chunks(
         rows = c.fetchall()
 
         return [retrieved_chunk_from_row(row) for row in rows]
+    except EmbeddingProviderError:
+        raise
     except Exception as e:
         print(f"Error in get_relevant_chunks: {e}")
         return []
@@ -354,10 +321,7 @@ def get_relevant_knowledge_base(question: str, limit: int = 3) -> List[dict]:
     """Retrieve relevant knowledge base entries using semantic similarity (pgvector)."""
     try:
         # Embed the incoming question
-        q_emb = embed_chunks([question])
-        if not q_emb or not q_emb[0]:
-            return []
-        q_vec = q_emb[0]
+        q_vec = _EMBEDDING_PROVIDER.embed_query(question)
 
         conn = connect_to_postgres()
         c = conn.cursor()
@@ -393,6 +357,8 @@ def get_relevant_knowledge_base(question: str, limit: int = 3) -> List[dict]:
                     })
             return results
 
+        except EmbeddingProviderError:
+            raise
         except Exception as e:
             print(f"Semantic KB search failed, falling back to keyword: {e}")
             conn.rollback()
@@ -413,6 +379,8 @@ def get_relevant_knowledge_base(question: str, limit: int = 3) -> List[dict]:
             scored.sort(key=lambda x: x["relevance_score"], reverse=True)
             return scored[:limit]
 
+    except EmbeddingProviderError:
+        raise
     except Exception as e:
         print(f"Error retrieving knowledge base: {e}")
         return []
@@ -450,10 +418,11 @@ def auto_save_to_kb(question: str, answer: str, source: str = "auto"):
             return
 
         # Embed the question
-        q_emb = embed_chunks([question])
-        if not q_emb or not q_emb[0]:
+        try:
+            q_vec = _EMBEDDING_PROVIDER.embed_documents([question])[0]
+        except EmbeddingProviderError as e:
+            print(f"[KB] auto_save_to_kb embedding failed ({type(e).__name__}); skipping save.")
             return
-        q_vec = q_emb[0]
 
         conn = connect_to_postgres()
         c = conn.cursor()
@@ -621,45 +590,59 @@ Start with Q:"""
             return
 
         conn = connect_to_postgres()
-        c = conn.cursor()
-        saved = 0
-        seen = set()
-
-        for pair in all_pairs:
-            q = pair.get("question", "").strip()
-            a = pair.get("answer", "").strip()
-
-            if not q or not a or len(a) < 20:
-                print(f"[KB] Skip (too short/empty): q={q[:40]}")
-                continue
-            if q.lower() in seen:
-                print(f"[KB] Skip (duplicate in batch): {q[:50]}")
-                continue
-            seen.add(q.lower())
-
-            try:
-                q_emb = embed_chunks([q])
-                q_vec = q_emb[0] if q_emb else None
-            except Exception:
-                q_vec = None
-
-            c.execute(
-                """
-                INSERT INTO knowledge_base
-                  (question, original_answer, corrected_answer, created_at,
-                   context_text, corrected_by, usage_count, embedding)
-                VALUES (%s, %s, %s, %s, %s, %s, 0, %s)
-                """,
-                (q, a, a,
-                 datetime.datetime.now().isoformat(),
-                 filename, f"Auto-generated from: {filename}", q_vec)
+        if conn is None:
+            print(
+                f"[KB] generate_kb_from_document could not connect to the "
+                f"database for {filename}; skipping KB generation."
             )
-            saved += 1
-            print(f"[KB] ✓ Inserted pair {saved}: {q[:60]}")
+            return
 
-        conn.commit()
-        conn.close()
-        print(f"[KB] ✓ Final: saved {saved}/{len(all_pairs)} KB entries from: {filename}")
+        try:
+            c = conn.cursor()
+            saved = 0
+            seen = set()
+
+            for pair in all_pairs:
+                q = pair.get("question", "").strip()
+                a = pair.get("answer", "").strip()
+
+                if not q or not a or len(a) < 20:
+                    print(f"[KB] Skip (too short/empty): q={q[:40]}")
+                    continue
+                if q.lower() in seen:
+                    print(f"[KB] Skip (duplicate in batch): {q[:50]}")
+                    continue
+                seen.add(q.lower())
+
+                try:
+                    q_vec = _EMBEDDING_PROVIDER.embed_documents([q])[0]
+                except EmbeddingProviderError as e:
+                    print(
+                        f"[KB] generate_kb_from_document embedding failed for "
+                        f"{filename} ({type(e).__name__}); discarding {saved} "
+                        f"uncommitted row(s) and aborting KB generation."
+                    )
+                    conn.rollback()
+                    return
+
+                c.execute(
+                    """
+                    INSERT INTO knowledge_base
+                      (question, original_answer, corrected_answer, created_at,
+                       context_text, corrected_by, usage_count, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s, 0, %s)
+                    """,
+                    (q, a, a,
+                     datetime.datetime.now().isoformat(),
+                     filename, f"Auto-generated from: {filename}", q_vec)
+                )
+                saved += 1
+                print(f"[KB] ✓ Inserted pair {saved}: {q[:60]}")
+
+            conn.commit()
+            print(f"[KB] ✓ Final: saved {saved}/{len(all_pairs)} KB entries from: {filename}")
+        finally:
+            conn.close()
 
     except Exception as e:
         print(f"[KB] Document KB generation failed (non-critical): {e}")
@@ -707,7 +690,7 @@ async def upload_documents(
 
             chunks = chunk_document(result)
             chunk_texts = [c.text for c in chunks]
-            embeddings = embed_chunks(chunk_texts)
+            embeddings = _EMBEDDING_PROVIDER.embed_documents(chunk_texts)
 
             if len(embeddings) != len(chunks):
                 raise RuntimeError(
@@ -787,6 +770,13 @@ async def upload_documents(
 
         except HTTPException:
             raise
+        except EmbeddingProviderError:
+            results.append(
+                {
+                    "error": "Embedding service is temporarily unavailable. Please try again shortly.",
+                    "filename": safe_filename,
+                }
+            )
         except Exception as e:
             results.append({"error": str(e), "filename": safe_filename})
 
@@ -944,6 +934,9 @@ Keep the answer concise, structured, and directly responsive to the question."""
                 "stream": True,
                 "keep_alive": OLLAMA_KEEP_ALIVE,
             }
+        except EmbeddingProviderError:
+            yield "__ERROR__The embedding service is temporarily unavailable. Please try again shortly.__"
+            return
         except Exception as e:
             yield f"__ERROR__Failed to build document context: {e}__"
             return
@@ -1393,10 +1386,12 @@ async def submit_correction(request: CorrectionRequest):
         # Insert into knowledge base
         # Embed the question for semantic matching
         try:
-            q_emb = embed_chunks([question])
-            q_vec = q_emb[0] if q_emb else None
-        except Exception:
-            q_vec = None
+            q_vec = _EMBEDDING_PROVIDER.embed_documents([question])[0]
+        except EmbeddingProviderError:
+            conn.close()
+            raise HTTPException(
+                503, "Embedding service is temporarily unavailable. Please try again shortly."
+            )
 
         c.execute(
             "INSERT INTO knowledge_base (question, original_answer, corrected_answer, created_at, chat_history_id, corrected_by, usage_count, embedding) VALUES (%s, %s, %s, %s, %s, %s, 0, %s)",
@@ -1409,6 +1404,8 @@ async def submit_correction(request: CorrectionRequest):
             "message": "Correction submitted and saved to KB",
             "chat_id": request.chat_id,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -1448,10 +1445,12 @@ async def add_knowledge(request: KnowledgeInsertRequest):
         c = conn.cursor()
         for item in request.items:
             try:
-                q_emb = embed_chunks([item.question])
-                q_vec = q_emb[0] if q_emb else None
-            except Exception:
-                q_vec = None
+                q_vec = _EMBEDDING_PROVIDER.embed_documents([item.question])[0]
+            except EmbeddingProviderError:
+                conn.close()
+                raise HTTPException(
+                    503, "Embedding service is temporarily unavailable. Please try again shortly."
+                )
             c.execute(
                 "INSERT INTO knowledge_base (question, original_answer, corrected_answer, created_at, context_text, corrected_by, usage_count, embedding) VALUES (%s, %s, %s, %s, %s, %s, 0, %s)",
                 (item.question, "", item.answer, datetime.datetime.now().isoformat(), item.source or "", "Manual Entry", q_vec)
@@ -1459,6 +1458,8 @@ async def add_knowledge(request: KnowledgeInsertRequest):
         conn.commit()
         conn.close()
         return {"message": f"{len(request.items)} knowledge items added"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -1493,10 +1494,11 @@ async def update_knowledge(entry_id: int, request: KBUpdateRequest):
     try:
         # Re-embed if question changed
         try:
-            q_emb = embed_chunks([request.question])
-            q_vec = q_emb[0] if q_emb else None
-        except Exception:
-            q_vec = None
+            q_vec = _EMBEDDING_PROVIDER.embed_documents([request.question])[0]
+        except EmbeddingProviderError:
+            raise HTTPException(
+                503, "Embedding service is temporarily unavailable. Please try again shortly."
+            )
         conn = connect_to_postgres()
         c = conn.cursor()
         c.execute(
