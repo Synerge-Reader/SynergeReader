@@ -74,6 +74,26 @@ def init_db():
     )
     """)
 
+    # Add columns that were introduced after the original table creation.
+    # email_verified defaults to 1 (verified) so every account that already
+    # existed before this feature stays usable — only new registrations get
+    # created with it explicitly set to 0, gating them until they click the
+    # verification link.
+    for col, definition in [
+        ("email", "TEXT"),
+        ("is_active", "INTEGER DEFAULT 1"),
+        ("email_verified", "INTEGER DEFAULT 1"),
+        ("email_verification_token", "TEXT"),
+        ("email_verification_expires", "TEXT"),
+        ("password_reset_token", "TEXT"),
+        ("password_reset_expires", "TEXT"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {definition}")
+        except Exception as e:
+            print(f"Column {col} may already exist: {e}")
+            conn.rollback()
+
 
 
 
@@ -91,6 +111,14 @@ def init_db():
         doi_url TEXT
     )
     """)
+
+    try:
+        cursor.execute(
+            "ALTER TABLE documents ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id)"
+        )
+    except Exception as e:
+        print(f"Column user_id may already exist: {e}")
+        conn.rollback()
 
     # Document chunks - ensure correct schema
     try:
@@ -169,6 +197,7 @@ def init_db():
         ("corrected_by", "TEXT"),
         ("usage_count", "INTEGER DEFAULT 0"),
         ("embedding", "vector(768)"),
+        ("source_type", "TEXT DEFAULT 'document'"),
     ]:
         try:
             cursor.execute(f"""
@@ -177,12 +206,35 @@ def init_db():
         except Exception as e:
             print(f"Column {col} may already exist: {e}")
             conn.rollback()
-    
 
+    # Admin audit log — who changed what, for the admin dashboard's audit feed
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS admin_audit_log (
+        id SERIAL PRIMARY KEY,
+        ts TEXT NOT NULL,
+        actor_id UUID,
+        actor_username TEXT,
+        action TEXT NOT NULL,
+        target_id UUID,
+        target_username TEXT,
+        detail TEXT
+    )
+    """)
 
-  
-
-
+    # Document insights — LLM-extracted facts, keywords, entities and a document
+    # type classification, one row per document, feeding the admin dashboard's
+    # Insights tab. UNIQUE on document_id so re-analysis is an upsert.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS document_insights (
+        id SERIAL PRIMARY KEY,
+        document_id INTEGER NOT NULL UNIQUE REFERENCES documents(id) ON DELETE CASCADE,
+        doc_type TEXT,
+        keywords JSONB DEFAULT '[]',
+        facts JSONB DEFAULT '[]',
+        entities JSONB DEFAULT '[]',
+        created_at TEXT
+    )
+    """)
 
     conn.commit()
     conn.close()

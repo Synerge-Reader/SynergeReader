@@ -17,3 +17,10 @@ class RegisterRequest(BaseModel):
 class ForgotPasswordRequest(BaseModel):
     email : str
 
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+class ResendVerificationRequest(BaseModel):
+    email: str
+
