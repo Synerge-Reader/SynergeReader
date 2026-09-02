@@ -175,6 +175,35 @@ def init_db():
     )
     """)
 
+    # If knowledge_base already exists with an embedding column of the wrong
+    # dimension (e.g. a leftover from an older embedding model), fix just that
+    # column rather than the document_chunks approach of dropping the whole
+    # table — knowledge_base holds real, hand-verified Q&A content and manual
+    # entries that aren't regenerable the way document chunks are. Existing
+    # rows lose their embedding (so won't surface via similarity search until
+    # re-saved) but keep their question/answer/usage data intact.
+    try:
+        cursor.execute("""
+        SELECT atttypmod
+        FROM pg_attribute
+        WHERE attrelid = 'knowledge_base'::regclass
+        AND attname = 'embedding'
+        AND NOT attisdropped
+        """)
+        row = cursor.fetchone()
+        # row is None when the column doesn't exist yet — the ADD COLUMN
+        # IF NOT EXISTS loop below already creates it with the right
+        # dimension in that case, so there's nothing to fix here.
+        if row and row[0] != 768:
+            print(f"Fixing knowledge_base.embedding: dimension {row[0]} != 768")
+            cursor.execute("ALTER TABLE knowledge_base DROP COLUMN embedding")
+            cursor.execute("ALTER TABLE knowledge_base ADD COLUMN embedding vector(768)")
+    except Exception as e:
+        # Most likely the table doesn't exist yet at all — the CREATE TABLE
+        # below handles that case with the right dimension from the start.
+        print(f"knowledge_base.embedding dimension check skipped: {e}")
+        conn.rollback()
+
     # Knowledge base — with semantic matching, source attribution, usage tracking
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS knowledge_base (
