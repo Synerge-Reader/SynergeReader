@@ -89,7 +89,7 @@ export default function LandingPage({ onEnter }) {
             <p className={cx("lede", "r", "d2")} style={{ marginTop: 18 }}>
               SynergeReader reads contracts, statutes, and case files the way an associate would — then lets
               you ask, argue, and extract in plain conversation. Every model runs on your own infrastructure,
-              so nothing privileged ever reaches a third-party API.
+              so your documents are never sent to a third-party AI model.
             </p>
             <div className={cx("heroBtns", "r", "d3")}>
               <button className={cx("btn", "btnPrimary")} onClick={handleEnter}>

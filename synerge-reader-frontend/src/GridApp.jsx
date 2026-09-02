@@ -2172,10 +2172,10 @@ export default function GridApp() {
 
   // Delete KB entry
   const deleteKbEntry = useCallback((id) => {
-    fetch(`${BACKEND}/knowledge_base/${id}`, { method: "DELETE" })
+    fetch(`${BACKEND}/knowledge_base/${id}?token=${encodeURIComponent(authToken || "")}`, { method: "DELETE" })
       .then(() => fetchKbEntries())
       .catch(() => {});
-  }, [fetchKbEntries]);
+  }, [authToken, fetchKbEntries]);
 
   // Pull an external web page into the KB — the server fetches it, extracts
   // readable text, and generates Q&A pairs from it just like a document upload.

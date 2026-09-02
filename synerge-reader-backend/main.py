@@ -26,7 +26,7 @@ import tempfile
 import shutil
 import socket
 import ipaddress
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from lxml import html as lxml_html
 from email_validator import validate_email, EmailNotValidError
 from fastapi.responses import Response
@@ -1405,7 +1405,12 @@ async def register(request: RegisterRequest):
         # manual testing without a real inbox.
         print(f"DEBUG: no EMAIL_KEY configured — verification link for {normalized_email}: {verify_link}")
 
-    return {"message": "Registered — check your email to verify your account before logging in.", "token": token}
+    # Deliberately not returning `token` here — a session token issued before
+    # the account is verified would work against every other endpoint that
+    # only checks token validity (none of them currently also check
+    # email_verified). The frontend never used this value anyway; it sends
+    # the user to "check your email" instead of logging them in.
+    return {"message": "Registered — check your email to verify your account before logging in."}
 
 
 @app.get("/verify-email")
@@ -1726,18 +1731,21 @@ async def knowledge_base():
 @app.post("/knowledge_base")
 async def add_knowledge(request: KnowledgeInsertRequest):
     """Add knowledge items directly — used for a single manual entry from the
-    KB page, and for batch imports of Q&A pairs from an external file."""
+    KB page, and for batch imports of Q&A pairs from an external file.
+    Admin-only: this is the shared, org-wide knowledge base every user's
+    answers draw on, and the UI already only shows these actions to admins —
+    this just makes the backend actually enforce that instead of trusting
+    the frontend to hide the buttons."""
+    conn = connect_to_postgres()
     try:
+        c = conn.cursor()
+        _require_admin(c, request.token)
+        c.execute("SELECT username FROM users WHERE token = %s", (request.token,))
+        row = c.fetchone()
+        conn.close()
+        author = row[0] if row else None
+
         source_type = request.source_type if request.source_type in ("manual", "external_import") else "manual"
-        author = None
-        if request.token:
-            conn = connect_to_postgres()
-            c = conn.cursor()
-            c.execute("SELECT username FROM users WHERE token = %s", (request.token,))
-            row = c.fetchone()
-            conn.close()
-            if row:
-                author = row[0]
         label = "Manual Entry" if source_type == "manual" else "Imported batch"
         if author:
             label += f" by {author}"
@@ -1770,7 +1778,11 @@ async def add_knowledge(request: KnowledgeInsertRequest):
         conn.commit()
         conn.close()
         return {"message": f"{saved} knowledge item(s) added", "added": saved}
+    except HTTPException:
+        conn.close()
+        raise
     except Exception as e:
+        conn.close()
         raise HTTPException(500, str(e))
 
 
@@ -1794,6 +1806,34 @@ def _validate_external_url(url: str) -> None:
             raise HTTPException(400, "This URL points to a private or internal address and can't be imported")
 
 
+def _safe_fetch_url(url: str, max_redirects: int = 3):
+    """Fetch a URL the SSRF-safe way. requests.get(url, allow_redirects=True)
+    (the default) only validates the URL you hand it — not where a 3xx
+    response actually takes it next. A URL that resolves publicly can still
+    redirect to a private/internal address or a cloud metadata endpoint, and
+    requests would follow it with no further check. So redirects are
+    followed manually here, re-running the same hostname/IP validation
+    before every single hop."""
+    current_url = url
+    for _ in range(max_redirects + 1):
+        _validate_external_url(current_url)
+        resp = requests.get(
+            current_url,
+            timeout=(5, 15),
+            headers={"User-Agent": "SynergeReader-KB-Importer/1.0"},
+            stream=True,
+            allow_redirects=False,
+        )
+        if resp.is_redirect or resp.is_permanent_redirect:
+            location = resp.headers.get("Location")
+            if not location:
+                raise HTTPException(400, "That URL redirected without a destination")
+            current_url = urljoin(current_url, location)
+            continue
+        return resp
+    raise HTTPException(400, "Too many redirects")
+
+
 def _extract_readable_text(html: str) -> str:
     try:
         doc = lxml_html.fromstring(html)
@@ -1810,16 +1850,20 @@ async def import_knowledge_from_url(request: KnowledgeUrlImportRequest):
     """Pull an external web page into the Knowledge Base: fetch it, extract
     readable text, and generate Q&A pairs from it the same way a freshly
     uploaded document is seeded — so external sources become first-class,
-    searchable KB entries instead of just a link."""
-    _validate_external_url(request.url)
+    searchable KB entries instead of just a link. Admin-only — see the note
+    on POST /knowledge_base above."""
+    conn = connect_to_postgres()
+    try:
+        c = conn.cursor()
+        _require_admin(c, request.token)
+        c.execute("SELECT username FROM users WHERE token = %s", (request.token,))
+        row = c.fetchone()
+        author = row[0] if row else None
+    finally:
+        conn.close()
 
     try:
-        resp = requests.get(
-            request.url,
-            timeout=(5, 15),
-            headers={"User-Agent": "SynergeReader-KB-Importer/1.0"},
-            stream=True,
-        )
+        resp = _safe_fetch_url(request.url)
         resp.raise_for_status()
         content_type = resp.headers.get("Content-Type", "")
         if "text/html" not in content_type and "application/xhtml" not in content_type:
@@ -1833,16 +1877,6 @@ async def import_knowledge_from_url(request: KnowledgeUrlImportRequest):
     text = _extract_readable_text(raw.decode("utf-8", errors="ignore"))
     if len(text) < 200:
         raise HTTPException(400, "Could not extract enough readable text from that page")
-
-    author = None
-    if request.token:
-        conn = connect_to_postgres()
-        c = conn.cursor()
-        c.execute("SELECT username FROM users WHERE token = %s", (request.token,))
-        row = c.fetchone()
-        conn.close()
-        if row:
-            author = row[0]
 
     domain = urlparse(request.url).hostname or request.url
     label = f"Imported from {domain}" + (f" by {author}" if author else "")
@@ -1859,11 +1893,13 @@ async def import_knowledge_from_url(request: KnowledgeUrlImportRequest):
 
 
 @app.delete("/knowledge_base/{entry_id}")
-async def delete_knowledge(entry_id: int):
-    """Delete a knowledge base entry by ID"""
+async def delete_knowledge(entry_id: int, token: Optional[str] = None):
+    """Delete a knowledge base entry by ID. Admin-only — see the note on
+    POST /knowledge_base above."""
+    conn = connect_to_postgres()
     try:
-        conn = connect_to_postgres()
         c = conn.cursor()
+        _require_admin(c, token)
         c.execute("DELETE FROM knowledge_base WHERE id = %s RETURNING id", (entry_id,))
         deleted = c.fetchone()
         conn.commit()
@@ -1872,28 +1908,33 @@ async def delete_knowledge(entry_id: int):
             raise HTTPException(404, "Entry not found")
         return {"message": f"Entry {entry_id} deleted"}
     except HTTPException:
+        conn.close()
         raise
     except Exception as e:
+        conn.close()
         raise HTTPException(500, str(e))
 
 
 class KBUpdateRequest(BaseModel):
     question: str
     answer: str
+    token: Optional[str] = None
 
 
 @app.put("/knowledge_base/{entry_id}")
 async def update_knowledge(entry_id: int, request: KBUpdateRequest):
-    """Edit a knowledge base entry"""
+    """Edit a knowledge base entry. Admin-only — see the note on
+    POST /knowledge_base above."""
+    conn = connect_to_postgres()
     try:
+        c = conn.cursor()
+        _require_admin(c, request.token)
         # Re-embed if question changed
         try:
             q_emb = embed_chunks([request.question])
             q_vec = q_emb[0] if q_emb else None
         except Exception:
             q_vec = None
-        conn = connect_to_postgres()
-        c = conn.cursor()
         c.execute(
             "UPDATE knowledge_base SET question=%s, corrected_answer=%s, embedding=%s WHERE id=%s RETURNING id",
             (request.question, request.answer, q_vec, entry_id)
@@ -1905,8 +1946,10 @@ async def update_knowledge(entry_id: int, request: KBUpdateRequest):
             raise HTTPException(404, "Entry not found")
         return {"message": f"Entry {entry_id} updated"}
     except HTTPException:
+        conn.close()
         raise
     except Exception as e:
+        conn.close()
         raise HTTPException(500, str(e))
 
 
@@ -2255,8 +2298,8 @@ SUGGESTED_QUESTIONS_PREFIX = "Generate exactly 4 specific questions a lawyer wou
 @app.get("/admin/overview")
 async def admin_overview(token: Optional[str] = None):
     """Summary stats for the admin dashboard's overview cards."""
+    conn = connect_to_postgres()
     try:
-        conn = connect_to_postgres()
         c = conn.cursor()
         _require_admin(c, token)
 
@@ -2285,8 +2328,10 @@ async def admin_overview(token: Optional[str] = None):
             "average_rating": round(avg_rating, 2) if avg_rating else 0,
         }
     except HTTPException:
+        conn.close()
         raise
     except Exception as e:
+        conn.close()
         raise HTTPException(500, str(e))
 
 
@@ -2301,8 +2346,8 @@ async def admin_chat_history(
     since_days: Optional[int] = None, # e.g. 1, 7, 30 — chats from the last N days
 ):
     """Full chat history across every user, for the admin dashboard's history table."""
+    conn = connect_to_postgres()
     try:
-        conn = connect_to_postgres()
         c = conn.cursor()
         _require_admin(c, token)
 
@@ -2363,8 +2408,10 @@ async def admin_chat_history(
             "total_count": total_count,
         }
     except HTTPException:
+        conn.close()
         raise
     except Exception as e:
+        conn.close()
         raise HTTPException(500, str(e))
 
 
@@ -2391,8 +2438,8 @@ async def admin_analytics(token: Optional[str] = None, days: int = 14):
     """Chart data for the admin dashboard: daily volume across chats/documents/KB
     growth, rating distribution, task-mode usage, an hour-by-weekday activity
     heatmap, the most active users, and week-over-week volume for the trend delta."""
+    conn = connect_to_postgres()
     try:
-        conn = connect_to_postgres()
         c = conn.cursor()
         _require_admin(c, token)
 
@@ -2494,8 +2541,10 @@ async def admin_analytics(token: Optional[str] = None, days: int = 14):
             "peak_insight": peak_insight,
         }
     except HTTPException:
+        conn.close()
         raise
     except Exception as e:
+        conn.close()
         raise HTTPException(500, str(e))
 
 
@@ -2508,8 +2557,8 @@ class UpdateUserRequest(BaseModel):
 @app.get("/admin/users")
 async def admin_list_users(token: Optional[str] = None):
     """Every user account, with activity counts, for the admin user-management tab."""
+    conn = connect_to_postgres()
     try:
-        conn = connect_to_postgres()
         c = conn.cursor()
         _require_admin(c, token)
 
@@ -2540,16 +2589,18 @@ async def admin_list_users(token: Optional[str] = None):
             for r in rows
         ]
     except HTTPException:
+        conn.close()
         raise
     except Exception as e:
+        conn.close()
         raise HTTPException(500, str(e))
 
 
 @app.patch("/admin/users/{user_id}")
 async def admin_update_user(user_id: str, request: UpdateUserRequest):
     """Promote/demote admin status or suspend/reactivate a user account."""
+    conn = connect_to_postgres()
     try:
-        conn = connect_to_postgres()
         c = conn.cursor()
         _require_admin(c, request.token)
 
@@ -2580,8 +2631,10 @@ async def admin_update_user(user_id: str, request: UpdateUserRequest):
         conn.close()
         return {"message": "Updated"}
     except HTTPException:
+        conn.close()
         raise
     except Exception as e:
+        conn.close()
         raise HTTPException(500, str(e))
 
 
@@ -2590,8 +2643,8 @@ async def admin_delete_user(user_id: str, token: Optional[str] = None):
     """Delete a user account. Their past chats/documents are kept for the audit
     trail — only the ownership link is cleared, matching how anonymous rows
     already display as 'Anonymous'."""
+    conn = connect_to_postgres()
     try:
-        conn = connect_to_postgres()
         c = conn.cursor()
         _require_admin(c, token)
 
@@ -2620,8 +2673,10 @@ async def admin_delete_user(user_id: str, token: Optional[str] = None):
         conn.close()
         return {"message": "Deleted"}
     except HTTPException:
+        conn.close()
         raise
     except Exception as e:
+        conn.close()
         raise HTTPException(500, str(e))
 
 
@@ -2635,8 +2690,8 @@ async def admin_audit_log(
     of items plus the total count and a breakdown by action type, so callers
     that just want the last few (the Overview timeline) and callers that want
     a full searchable log (the Audit Log tab) share one endpoint."""
+    conn = connect_to_postgres()
     try:
-        conn = connect_to_postgres()
         c = conn.cursor()
         _require_admin(c, token)
 
@@ -2694,8 +2749,10 @@ async def admin_audit_log(
             "actions_per_day": actions_per_day,
         }
     except HTTPException:
+        conn.close()
         raise
     except Exception as e:
+        conn.close()
         raise HTTPException(500, str(e))
 
 
@@ -2705,8 +2762,8 @@ async def admin_documents(token: Optional[str] = None, limit: int = 40, offset: 
     chunks it produced, and whether it's been through Document Insights yet.
     No admin-wide document view existed before this; each user could only see
     their own uploads in the sidebar."""
+    conn = connect_to_postgres()
     try:
-        conn = connect_to_postgres()
         c = conn.cursor()
         _require_admin(c, token)
 
@@ -2793,8 +2850,10 @@ async def admin_documents(token: Optional[str] = None, limit: int = 40, offset: 
             ],
         }
     except HTTPException:
+        conn.close()
         raise
     except Exception as e:
+        conn.close()
         raise HTTPException(500, str(e))
 
 
@@ -2803,8 +2862,8 @@ async def admin_document_insights(token: Optional[str] = None, limit: int = 40):
     """Aggregated + per-document facts/keywords/entities for the admin
     dashboard's Insights tab: what's actually in the document set, not just
     how many documents there are."""
+    conn = connect_to_postgres()
     try:
-        conn = connect_to_postgres()
         c = conn.cursor()
         _require_admin(c, token)
 
@@ -2879,8 +2938,10 @@ async def admin_document_insights(token: Optional[str] = None, limit: int = 40):
             "documents": documents,
         }
     except HTTPException:
+        conn.close()
         raise
     except Exception as e:
+        conn.close()
         raise HTTPException(500, str(e))
 
 
@@ -2890,8 +2951,8 @@ async def admin_analyze_pending_documents(token: Optional[str] = None, max_docs:
     existed (or any that failed the first time). Kicks off background
     extraction threads and returns immediately — the admin refreshes the
     Insights tab a little later to see results land."""
+    conn = connect_to_postgres()
     try:
-        conn = connect_to_postgres()
         c = conn.cursor()
         _require_admin(c, token)
 
@@ -2915,8 +2976,10 @@ async def admin_analyze_pending_documents(token: Optional[str] = None, max_docs:
 
         return {"queued": len(pending)}
     except HTTPException:
+        conn.close()
         raise
     except Exception as e:
+        conn.close()
         raise HTTPException(500, str(e))
 
 
@@ -2924,15 +2987,16 @@ async def admin_analyze_pending_documents(token: Optional[str] = None, max_docs:
 async def admin_system_status(token: Optional[str] = None):
     """Operational health for the admin dashboard: is the LLM backend reachable,
     which models are installed, and is Postgres up."""
+    conn = connect_to_postgres()
     try:
-        conn = connect_to_postgres()
         c = conn.cursor()
         _require_admin(c, token)
         conn.close()
     except HTTPException:
+        conn.close()
         raise
     except Exception:
-        pass
+        conn.close()
 
     db_ok = False
     try:
