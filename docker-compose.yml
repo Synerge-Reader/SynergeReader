@@ -37,6 +37,8 @@ services:
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
       - DB_CONNECTION_STRING=${DB_CONNECTION_STRING}
       - EMAIL_KEY=${EMAIL_KEY}
+      - ADMIN_EMAILS=${ADMIN_EMAILS}
+      - FRONTEND_URL=${FRONTEND_URL}
     depends_on:
       synergereader-db:
         condition: service_healthy
