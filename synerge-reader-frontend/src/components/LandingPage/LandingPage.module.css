@@ -1,0 +1,310 @@
+/* ============================================================
+   SynergeReader — landing page.
+   Every token here is pulled directly from the running app
+   (GridApp.jsx): the sidebar's near-black #13151a, the blue
+   gradient used on the logo mark and assistant avatar, the
+   purple used for admin/oversight surfaces, the same card
+   border/shadow/radius language, and the app's own system
+   font stack — so this reads as the front door of the same
+   product, not a different site bolted on top of it.
+   Scoped under .root; nothing here touches bare html/body/
+   section/footer/a/button tags globally.
+   ============================================================ */
+.root{
+  --bg:          #ffffff;
+  --bg-soft:     #f8fafc;
+  --bg-soft2:    #f1f5f9;
+  --ink:         #13151a;   /* the app's actual sidebar color */
+  --ink-raised:  #1d2029;   /* sidebar hover/active tint */
+  --ink-border:  #1e212a;   /* sidebar border */
+  --ink-muted:   #a8adbd;   /* sidebar muted text */
+  --text:        #111827;
+  --text-muted:  #6b7280;
+  --text-faint:  #9ca3af;
+  --border:      #e2e8f0;
+  --border-soft: #eef0f3;
+  --blue:        #2563eb;
+  --blue-2:      #3b82f6;
+  --blue-deep:   #1d4ed8;
+  --purple:      #7c3aed;
+  --purple-2:    #a78bfa;
+  --cyan:        #0891b2;
+  --red:         #dc2626;
+  --amber:       #d97706;
+  --card-shadow: 0 1px 2px rgba(16,24,40,.04), 0 1px 3px rgba(16,24,40,.05);
+  --font: -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+
+  font-family:var(--font);
+  background:var(--bg);
+  color:var(--text);
+  line-height:1.6;
+  overflow-x:hidden;
+  font-size:16px;
+  scroll-behavior:smooth;
+}
+@media (prefers-reduced-motion:reduce){.root{scroll-behavior:auto}}
+.root *,.root *::before,.root *::after{box-sizing:border-box}
+.root a{color:inherit;text-decoration:none}
+.root img,.root svg{display:block;max-width:100%}
+.root button{font-family:inherit}
+.root :focus-visible{outline:2px solid var(--blue-2);outline-offset:3px}
+
+/* ---------- shared type ---------- */
+.eyebrow{
+  display:flex;align-items:center;gap:8px;
+  font-size:11.5px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--blue);margin-bottom:16px;
+}
+.eyebrow::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--blue);box-shadow:0 0 0 3px rgba(37,99,235,.16)}
+.onInk{color:var(--blue-2)}
+.onInk::before{background:var(--blue-2);box-shadow:0 0 0 3px rgba(59,130,246,.22)}
+.root h1,.root h2,.root h3{font-family:var(--font);text-wrap:balance;letter-spacing:-.02em;margin:0}
+.lede{font-size:15.5px;color:var(--text-muted);font-weight:400;line-height:1.7;max-width:52ch}
+.ledeOnInk{color:var(--ink-muted)}
+.tnum{font-variant-numeric:tabular-nums}
+.label{font-size:10px;color:var(--text-faint);text-transform:uppercase;letter-spacing:.06em;font-weight:700}
+
+/* ---------- top nav — mirrors the app's own header/sidebar brand mark ---------- */
+.nav{
+  position:fixed;top:0;left:0;right:0;z-index:500;
+  height:60px;display:flex;align-items:center;justify-content:space-between;
+  padding:0 clamp(20px,4vw,48px);
+  background:rgba(255,255,255,.86);backdrop-filter:blur(10px) saturate(1.1);
+  border-bottom:1px solid var(--border-soft);
+}
+.brand{display:flex;align-items:center;gap:10px;background:none;border:none;cursor:pointer;padding:0}
+.brandMark{
+  width:28px;height:28px;border-radius:8px;flex-shrink:0;
+  background:linear-gradient(135deg,var(--blue-2),var(--blue-deep));
+  display:flex;align-items:center;justify-content:center;color:#fff;
+  box-shadow:0 2px 8px rgba(59,130,246,.35);
+}
+.brandMark svg{width:15px;height:15px}
+.brandName{font-size:15.5px;font-weight:700;color:var(--text);letter-spacing:-.01em}
+.navLinks{display:flex;gap:28px;list-style:none;margin:0;padding:0}
+.navLinks a{font-size:13px;color:var(--text-muted);transition:color .15s}
+.navLinks a:hover{color:var(--text)}
+.navCta{
+  font-size:13px;font-weight:700;padding:9px 18px;border-radius:8px;
+  background:var(--blue);color:#fff;border:none;cursor:pointer;white-space:nowrap;
+  box-shadow:0 2px 8px rgba(37,99,235,.28);transition:background .15s,transform .08s;
+}
+.navCta:hover{background:var(--blue-deep)}
+.navCta:active{transform:translateY(1px)}
+
+/* ---------- buttons ---------- */
+.btn{
+  display:inline-flex;align-items:center;gap:9px;
+  font-size:14px;font-weight:700;letter-spacing:-.005em;
+  padding:12px 22px;border-radius:9px;
+  transition:background .15s,border-color .15s,transform .08s,color .15s;
+  border:1px solid transparent;cursor:pointer;
+}
+.btn:active{transform:translateY(1px)}
+.btnPrimary{background:var(--blue);color:#fff;box-shadow:0 3px 10px rgba(37,99,235,.3)}
+.btnPrimary:hover{background:var(--blue-deep)}
+.btnGhost{border-color:var(--border);color:var(--text);background:#fff}
+.btnGhost:hover{border-color:#cbd5e1;background:var(--bg-soft)}
+.btnGhostInk{border-color:var(--ink-border);color:#fff;background:transparent}
+.btnGhostInk:hover{border-color:rgba(255,255,255,.35);background:rgba(255,255,255,.06)}
+.btnWhite{background:#fff;color:var(--blue-deep)}
+.btnWhite:hover{background:#f3f4f6}
+.arrow{opacity:.8}
+
+/* ---------- hero ---------- */
+.hero{padding:148px clamp(20px,4vw,48px) 0;background:linear-gradient(180deg,#fff 0%,var(--bg-soft) 100%)}
+.heroInner{max-width:1180px;margin:0 auto;display:grid;grid-template-columns:1.05fr .95fr;gap:56px;align-items:center;padding-bottom:72px}
+.heroH1{font-size:clamp(34px,4.6vw,58px);font-weight:800;line-height:1.08;color:var(--text)}
+.heroH1 .accent{color:var(--blue)}
+.heroBtns{display:flex;gap:12px;flex-wrap:wrap;margin-top:30px}
+
+/* hero mock — a small, honest slice of the real chat UI, not an abstract graphic */
+.mockCard{
+  background:#fff;border:1px solid var(--border-soft);border-radius:14px;
+  box-shadow:0 8px 30px rgba(16,24,40,.08),0 1px 3px rgba(16,24,40,.06);
+  overflow:hidden;
+}
+.mockTop{
+  display:flex;align-items:center;gap:8px;padding:11px 14px;
+  border-bottom:1px solid var(--border-soft);background:var(--bg-soft);
+}
+.mockDots{display:flex;gap:5px}
+.mockDots span{width:8px;height:8px;border-radius:50%;background:#e2e8f0}
+.mockTitle{flex:1;text-align:center;font-size:11px;color:var(--text-faint);font-weight:600}
+.mockBody{padding:18px}
+.taskChip{
+  display:inline-flex;align-items:center;gap:7px;font-size:11px;font-weight:700;
+  color:var(--text-muted);background:var(--bg-soft);border:1px solid var(--border-soft);
+  border-radius:999px;padding:5px 12px;margin-bottom:14px;
+}
+.taskDot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.mockUser{
+  max-width:80%;margin-left:auto;background:#f4f4f5;border-radius:18px;
+  padding:9px 14px;font-size:13px;line-height:1.5;color:#0d0d0d;margin-bottom:14px;
+}
+.mockAiRow{display:flex;gap:10px}
+.mockAvatar{
+  width:24px;height:24px;border-radius:7px;flex-shrink:0;
+  background:linear-gradient(135deg,var(--blue-2),var(--blue-deep));
+  display:flex;align-items:center;justify-content:center;color:#fff;
+}
+.mockAvatar svg{width:13px;height:13px}
+.mockAiText{font-size:13px;line-height:1.6;color:#1e293b}
+.mockCite{
+  display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:700;
+  color:var(--blue-deep);background:#eff6ff;border:1px solid #dbeafe;
+  border-radius:999px;padding:2px 8px;margin-top:8px;
+}
+
+/* highlight strip (3 cards) */
+.highlights{border-top:1px solid var(--border-soft)}
+.highlightsInner{max-width:1180px;margin:0 auto;display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--border-soft)}
+.highlight{background:#fff;padding:30px clamp(20px,3vw,36px)}
+.highlightIcon{
+  width:32px;height:32px;border-radius:9px;display:flex;align-items:center;justify-content:center;
+  color:#fff;margin-bottom:16px;
+}
+.highlightIcon svg{width:16px;height:16px}
+.highlightTitle{font-size:16px;font-weight:700;color:var(--text);margin-bottom:8px;line-height:1.3}
+.highlightText{font-size:13.5px;color:var(--text-muted);line-height:1.7}
+
+/* section scaffolding */
+.sec{padding:88px clamp(20px,4vw,48px)}
+.secInner{max-width:1180px;margin:0 auto}
+.secHead{
+  display:grid;grid-template-columns:1fr 1fr;gap:56px;align-items:end;
+  margin-bottom:52px;padding-bottom:32px;border-bottom:1px solid var(--border-soft);
+}
+.secHeadOnInk{border-color:var(--ink-border)}
+.secTitle{font-size:clamp(26px,3vw,38px);font-weight:800;color:var(--text)}
+.secTitleOnInk{color:#fff}
+.secTitle .accent{color:var(--blue)}
+.secTitleOnInk .accent{color:var(--blue-2)}
+
+/* problem cards */
+.problemBg{background:var(--bg-soft)}
+.pGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.pCard{background:#fff;border:1px solid var(--border-soft);border-radius:14px;padding:26px;box-shadow:var(--card-shadow)}
+.pCardMark{
+  width:26px;height:26px;border-radius:8px;background:#fee2e2;color:var(--red);
+  display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:800;margin-bottom:16px;
+}
+.pCardTitle{font-size:15.5px;font-weight:700;color:var(--text);margin-bottom:9px;line-height:1.3}
+.pCardText{font-size:13.5px;color:var(--text-muted);line-height:1.72}
+
+/* how it works */
+.howSteps{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.step{background:#fff;border:1px solid var(--border-soft);border-radius:14px;padding:26px;box-shadow:var(--card-shadow)}
+.stepNum{
+  width:26px;height:26px;border-radius:8px;background:#dbeafe;color:var(--blue-deep);
+  display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:800;margin-bottom:16px;
+}
+.stepTitle{font-size:16.5px;font-weight:700;color:var(--text);margin-bottom:9px}
+.stepText{font-size:13.5px;color:var(--text-muted);line-height:1.72}
+
+/* interface preview — the one dark section, because the sidebar really is
+   dark in the real app. This mirrors the actual split exactly: dark
+   sidebar with task-mode dots, white document + chat area. */
+.previewBg{background:var(--ink)}
+.frame{background:var(--ink-raised);border:1px solid var(--ink-border);border-radius:12px;overflow:hidden}
+.frameBar{
+  background:rgba(255,255,255,.03);border-bottom:1px solid var(--ink-border);
+  padding:11px 16px;display:flex;align-items:center;gap:12px;
+}
+.frameDots{display:flex;gap:6px}
+.frameDots span{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.14)}
+.frameUrl{flex:1;text-align:center;font-size:11px;color:var(--ink-muted)}
+.frameBody{display:grid;grid-template-columns:200px 1fr 300px;min-height:320px;background:#fff}
+.fpSide{background:var(--ink);padding:16px;display:flex;flex-direction:column;gap:3px}
+.fpLabel{font-size:9.5px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.28);margin:12px 0 6px}
+.fpLabel:first-child{margin-top:0}
+.fpTab{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--ink-muted);padding:7px 9px;border-radius:6px;border-left:2px solid transparent}
+.fpTabActive{background:var(--ink-raised);color:#fff;font-weight:600}
+.fpDot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.fpDoc{border-right:1px solid var(--border-soft);padding:20px;background:#fff}
+.fpPage{
+  background:var(--bg-soft);border:1px solid var(--border-soft);border-radius:8px;
+  padding:16px;height:100%;font-size:11px;line-height:1.9;color:#64748b;
+}
+.hl{background:#dbeafe;color:var(--blue-deep);border-radius:3px;padding:0 3px;font-weight:600}
+.fpChat{padding:16px;display:flex;flex-direction:column;gap:12px;justify-content:flex-end;background:#fff}
+.chatUser{max-width:88%;align-self:flex-end;background:#f4f4f5;border-radius:16px;padding:9px 13px;font-size:11.5px;line-height:1.55;color:#0d0d0d}
+.chatAiRow{display:flex;gap:9px}
+.chatAvatar{
+  width:22px;height:22px;border-radius:7px;flex-shrink:0;
+  background:linear-gradient(135deg,var(--blue-2),var(--blue-deep));
+  display:flex;align-items:center;justify-content:center;color:#fff;
+}
+.chatAvatar svg{width:12px;height:12px}
+.chatAiText{font-size:11.5px;line-height:1.6;color:#1e293b}
+.chatAiText strong{color:var(--blue-deep)}
+
+/* features */
+.featGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.feat{background:#fff;border:1px solid var(--border-soft);border-radius:14px;padding:26px;box-shadow:var(--card-shadow);transition:box-shadow .15s,transform .15s}
+.feat:hover{box-shadow:0 4px 16px rgba(16,24,40,.08);transform:translateY(-1px)}
+.featIcon{width:32px;height:32px;border-radius:9px;display:flex;align-items:center;justify-content:center;color:#fff;margin-bottom:16px}
+.featIcon svg{width:16px;height:16px}
+.featTitle{font-size:15.5px;font-weight:700;color:var(--text);margin-bottom:8px;line-height:1.3}
+.featText{font-size:13px;color:var(--text-muted);line-height:1.7}
+
+/* tech strip */
+.tech{padding:26px clamp(20px,4vw,48px);border-top:1px solid var(--border-soft);border-bottom:1px solid var(--border-soft);display:flex;align-items:center;gap:0;flex-wrap:wrap;background:var(--bg-soft)}
+.techLabel{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--text-faint);white-space:nowrap;margin-right:28px;padding-right:28px;border-right:1px solid var(--border)}
+.techChips{display:flex;gap:8px;flex-wrap:wrap;flex:1}
+.techChip{font-size:12px;font-weight:600;padding:6px 13px;border:1px solid var(--border);border-radius:8px;color:var(--text-muted);background:#fff}
+
+/* origin / callouts — labels reuse the app's own stat-tile typographic
+   pattern (10px uppercase tracked caption over a bold number) */
+.originLayout{display:grid;grid-template-columns:1fr 1fr;gap:64px;align-items:start}
+.callouts{display:flex;gap:36px;margin-bottom:30px;flex-wrap:wrap}
+.callout{border-left:2px solid var(--blue);padding-left:14px}
+.calloutNum{font-size:28px;font-weight:800;color:var(--text);line-height:1;margin-bottom:6px}
+.calloutLabel{font-size:10px;color:var(--text-faint);text-transform:uppercase;letter-spacing:.05em;font-weight:700;line-height:1.5}
+.originCard{background:#fff;border:1px solid var(--border-soft);border-radius:14px;padding:28px;box-shadow:var(--card-shadow)}
+.originRow{display:flex;justify-content:space-between;gap:16px;padding:10px 0;border-bottom:1px solid var(--border-soft);font-size:13px}
+.originRow:last-child{border-bottom:none}
+.k{color:var(--text-muted)}
+.v{font-size:12.5px;font-weight:600;color:var(--text);text-align:right}
+
+/* CTA — a gradient panel using the app's own avatar/logo gradient device,
+   not an invented hero wash */
+.cta{padding:88px clamp(20px,4vw,48px)}
+.ctaInner{
+  max-width:1180px;margin:0 auto;border-radius:20px;padding:56px clamp(24px,4vw,64px);
+  background:linear-gradient(120deg,var(--blue) 0%,var(--purple) 100%);
+  display:grid;grid-template-columns:1.2fr auto;gap:48px;align-items:center;
+  box-shadow:0 16px 40px rgba(37,99,235,.22);
+}
+.ctaH{font-size:clamp(26px,3.6vw,40px);font-weight:800;color:#fff;line-height:1.15;margin-bottom:12px}
+.ctaSub{font-size:14.5px;color:rgba(255,255,255,.82);line-height:1.7;max-width:44ch}
+
+/* footer */
+.foot{background:var(--ink);padding:28px clamp(20px,4vw,48px);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:14px}
+.footBrand{display:flex;align-items:center;gap:8px;background:none;border:none;cursor:pointer;padding:0}
+.footBrand span{font-size:13.5px;font-weight:700;color:#fff;opacity:.85}
+.footCopy{font-size:11.5px;color:rgba(255,255,255,.32)}
+
+/* reveal-on-scroll — progressive enhancement: visible by default, only
+   hidden-then-revealed once the literal (non-module, :global) "js" class
+   proves the reveal script is actually running (see LandingPage.jsx). */
+:global(.js) .r{opacity:0;transform:translateY(12px);transition:opacity .5s ease,transform .5s ease}
+:global(.js) .r.in{opacity:1;transform:translateY(0)}
+:global(.js) .r.d1{transition-delay:.05s}
+:global(.js) .r.d2{transition-delay:.1s}
+:global(.js) .r.d3{transition-delay:.15s}
+@media (prefers-reduced-motion:reduce){:global(.js) .r{opacity:1;transform:none;transition:none}}
+
+/* responsive */
+@media (max-width:920px){
+  .navLinks{display:none}
+  .heroInner{grid-template-columns:1fr;gap:36px}
+  .highlightsInner,.pGrid,.howSteps,.featGrid{grid-template-columns:1fr}
+  .secHead{grid-template-columns:1fr;gap:20px}
+  .frameBody{grid-template-columns:1fr;min-height:auto}
+  .fpSide,.fpDoc{display:none}
+  .originLayout{grid-template-columns:1fr;gap:32px}
+  .ctaInner{grid-template-columns:1fr;gap:24px}
+  .tech{flex-direction:column;align-items:flex-start;gap:14px}
+  .techLabel{border-right:none;padding-right:0;margin-right:0}
+}
