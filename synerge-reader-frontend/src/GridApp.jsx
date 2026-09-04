@@ -4462,11 +4462,6 @@ export default function GridApp() {
                                   ))}
                                 </div>
                               )}
-                              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                                <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: adminSystemStatus.openrouter_fallback_configured ? "#0ca30c" : "#c3c2b7", flexShrink: 0 }} />
-                                <span style={{ fontSize: "12px", color: "#374151", fontWeight: 600 }}>OpenRouter fallback</span>
-                                <span style={{ fontSize: "11px", color: "#9ca3af", marginLeft: "auto" }}>{adminSystemStatus.openrouter_fallback_configured ? "Configured" : "Not configured"}</span>
-                              </div>
                             </div>
                           ) : <div style={{ fontSize: "11.5px", color: "#94a3b8" }}>Checking…</div>}
                         </ChartCard>

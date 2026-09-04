@@ -6,14 +6,14 @@ A browser-based document reader with AI-powered question answering capabilities.
 
 ### ✅ **Week 1-4 Complete Implementation**
 
-- **Document Upload & Processing**: Support for PDF, DOCX, and TXT files (max 20MB)
+- **Document Upload & Processing**: Support for PDF, DOCX, and TXT files (max 20MB in the current GridApp UI; the backend parser itself accepts up to 50MB)
 - **Local Text Parsing**: Client-side parsing using pdf.js and mammoth.js
 - **Text Selection**: Interactive text selection with automatic question modal
 - **Vector Database**: PostgreSQL pgvector integration for document chunking and embedding
 - **Question Analysis**: Intelligent question analysis and intent recognition
 - **Vector Similarity Search**: Find relevant document chunks using embeddings
 - **History Retrieval**: Smart retrieval of relevant past Q&A pairs
-- **LLM Integration**: OpenRouter API with enhanced prompt building
+- **LLM Integration**: Local Ollama answer generation with no external generation fallback
 - **Chat History**: Persistent storage of all Q&A interactions
 - **Modern UI**: Clean, responsive interface with real-time feedback
 
@@ -26,9 +26,9 @@ Frontend (React) ←→ FastAPI Backend ←→ PostgreSQL + pgvector
 ### Backend Components
 - **FastAPI**: Modern async web framework
 - **PostgreSQL + pgvector**: Vector database for document embeddings
-- **Sentence Transformers**: Text embedding generation
+- **Ollama Embeddings**: Local embedding generation through the configured embedding profile
 - **PostgreSQL**: Chat history storage
-- **OpenRouter API**: LLM integration
+- **Ollama Generation**: Local streaming answer generation
 
 ### Frontend Components
 - **React**: Modern UI framework
@@ -94,30 +94,40 @@ npm start
 
 ### Document Processing Pipeline
 1. **Upload**: File validation and size checking
-2. **Parsing**: Extract text using appropriate parser (pdf.js/mammoth.js)
-3. **Chunking**: Split text into overlapping chunks (1000 chars, 200 overlap)
-4. **Embedding**: Generate embeddings using sentence-transformers
-5. **Storage**: Store chunks and embeddings in PostgreSQL pgvector
+2. **Parsing**: The backend's `/upload` parser preserves PDF page boundaries, but only when it is given the original PDF bytes. The current GridApp upload path parses PDF/DOCX/TXT client-side (pdf.js/mammoth.js) and sends the backend flattened plain text instead of the original file, so page provenance is **not** yet preserved through that live UI path — see "RAG Pipeline Integration" below. This is deferred to E1a.
+3. **Chunking**: Split each document into page-aware chunks (`document_chunker.py`); each chunk records its own page range when page numbers are available
+4. **Embedding**: Generate embeddings through the resolved Ollama embedding profile
+5. **Storage**: Store the document and its chunks — including each chunk's page locator — in one PostgreSQL pgvector transaction
 
 ### Question Answering Pipeline
 1. **Analysis**: Analyze question intent and extract key terms
-2. **Vector Search**: Find similar document chunks using embeddings
+2. **Vector Search**: Find similar document chunks using embeddings (not every `/ask` context mode calls this — see "RAG Pipeline Integration" below)
 3. **History Retrieval**: Find relevant past Q&A pairs
 4. **Prompt Building**: Construct comprehensive prompt with context
-5. **LLM Call**: Generate answer using OpenRouter API
+5. **LLM Call**: Generate the answer using local Ollama generation
 6. **Storage**: Save Q&A to PostgreSQL history
+
+### RAG Pipeline Integration (Backend)
+- **Page-aware chunking**: document uploads are split into page-aware chunks, and a document's row plus all of its chunk rows (each with `page_start`, `page_end`, and `locator_json`) are written in one database transaction.
+- **Retrieval and locators**: page-aware chunk locator metadata is persisted in the database and reconstructed by the backend's internal retrieval helper. The current `/ask` stream and frontend do not yet expose or render that locator metadata as user-visible citations, and not every `/ask` context-building mode calls vector retrieval (e.g. an active document or an explicit text selection is used directly).
+- **Embedding profile**: `main.py` wires every `EMBEDDING_*` variable through `resolve_embedding_profile(os.environ)` at startup. Leaving every `EMBEDDING_*` variable unset selects the documented mxbai/1024 default; using a different model (e.g. the current schema-compatible Nomic/768 example) requires the complete explicit override described in `.env.example`. An invalid, missing, malformed, wrong-count, wrong-dimension, non-finite, or all-zero embedding response fails closed rather than being persisted as a NULL or fabricated vector.
+- **Schema compatibility**: the database schema is currently provisioned for 768-dimensional vectors, so the resolved embedding profile's dimension must match it or the backend refuses to start. Whether a deployment's `EMBEDDING_*` values actually reach the backend container through Compose is a separate, not-yet-verified deployment question (see `docker-compose.yml`); this has not been verified for the Compose 1.29.2 `.env` propagation path used here.
+- **Generation profile (foundation only)**: `rag_model_profiles.py` defines `GenerationProfile`/`resolve_generation_profile()` and the `GENERATION_*` variables, but nothing in `main.py` calls them yet — they are not wired into `/ask`. The generation model actually used today is the one selected in the request and sent directly to local Ollama; there is no external generation fallback.
 
 ## Configuration
 
 ### Environment Variables
-- `OPENROUTER_API_KEY`: Your OpenRouter API key
-- `CHUNK_SIZE`: Document chunk size (default: 1000)
-- `CHUNK_OVERLAP`: Chunk overlap size (default: 200)
-- `MAX_FILE_SIZE`: Maximum file size in bytes (default: 20MB)
+- `OLLAMA_BASE_URL`: Optional explicit Ollama service URL
+- `OLLAMA_HOST` and `OLLAMA_PORT`: Ollama connection host and port when no base URL is set
+- `OLLAMA_FALLBACK_HOSTS`: Comma-separated fallback hosts for local Ollama discovery
+- `EMBEDDING_*`: optional strict embedding profile override, wired through `resolve_embedding_profile(os.environ)` in `main.py` — see `.env.example` for the full set and the all-or-nothing rules that govern them
+- `GENERATION_*`: profile definitions exist in `rag_model_profiles.py` (`resolve_generation_profile()`), but this is foundation-only — nothing in `main.py` reads these yet, so setting them today has no effect on `/ask`
+- **Chunk size**: not environment-driven. `document_chunker.py` currently uses a code default of 500 characters per chunk with no overlap.
+- **File size limits**: not environment-driven, and enforced at two different layers with two different values — the current GridApp upload UI rejects files over 20MB client-side, while the backend's own parser (`document_parser.py`) accepts up to 50MB.
 
 ### Model Configuration
-- **Embedding Model**: `all-MiniLM-L6-v2` (sentence-transformers)
-- **LLM Model**: `meta-llama/llama-3.3-70b-instruct:free` (OpenRouter)
+- **Embedding Model**: controlled by the resolved embedding profile; the documented default is mxbai/1024, and Nomic/768 is the current schema-compatible explicit-override example (see `.env.example`) — neither has been empirically validated against retrieval quality yet
+- **LLM Model**: Ollama generation through the configured service, selected per request, with no application-level external generation fallback
 - **Vector Space**: Cosine distance in pgvector
 
 ## Development
@@ -146,7 +156,7 @@ synerge-reader/
 - **Document Processing**: Chunking, embedding, vector storage
 - **Question Analysis**: Intent recognition and key term extraction
 - **Vector Search**: Similarity-based document retrieval
-- **LLM Integration**: Enhanced prompt building and API calls
+- **LLM Integration**: Enhanced prompt building and local Ollama streaming generation
 - **History Management**: PostgreSQL CRUD operations
 
 #### Frontend Components
@@ -157,10 +167,10 @@ synerge-reader/
 
 ## Performance Considerations
 
-- **Chunking Strategy**: Overlapping chunks preserve context across boundaries
-- **Embedding Caching**: Sentence transformers model loaded once
+- **Chunking Strategy**: `document_chunker.py` splits each document into non-overlapping, page-aware chunks targeting 500 characters and split on word boundaries
+- **Embedding Profile Reuse**: Backend embedding calls share the configured Ollama provider and profile
 - **Vector Search**: Efficient similarity search with pgvector
-- **Response Streaming**: Future enhancement for real-time answers
+- **Response Streaming**: Local Ollama answers are already streamed to the client via `StreamingResponse`, not a future enhancement
 
 ## Security
 
@@ -171,7 +181,9 @@ synerge-reader/
 
 ## Future Enhancements
 
-- **Streaming Responses**: Real-time answer generation
+- **Client-Visible Citations**: Return the already-persisted page locators through `/ask` and render them in the UI
+- **Page-Provenant Frontend Upload**: Send original PDF bytes (or page boundaries) from GridApp instead of flattened client-parsed text, so `/upload`'s existing page-aware parsing applies to the live UI path (E1a)
+- **Generation Profile Wiring**: Wire `resolve_generation_profile()`/`GENERATION_*` into `/ask` instead of the current per-request model selection
 - **Multi-Document Support**: Cross-document question answering
 - **Advanced Parsing**: Better PDF/DOCX formatting preservation
 - **User Authentication**: Multi-user support
@@ -190,13 +202,13 @@ synerge-reader/
    - Ensure file size is under 20MB
    - Check file format (PDF, DOCX, TXT only)
 
-3. **LLM API Errors**
-   - Verify OpenRouter API key is valid
-   - Check API rate limits
+3. **Local LLM Errors**
+   - Verify that the Ollama service is reachable using the configured connection settings
+   - Check that the requested generation model is installed in Ollama
 
 4. **Vector Search Issues**
    - Ensure PostgreSQL is running and the vector extension is enabled
-   - Check embedding model download
+   - Check that the configured Ollama embedding model is available
 
 ### Logs
 - Backend logs: `docker-compose logs backend`
@@ -218,7 +230,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 - [FastAPI](https://fastapi.tiangolo.com/) for the backend framework
 - [pgvector](https://github.com/pgvector/pgvector) for vector database
-- [Sentence Transformers](https://www.sbert.net/) for embeddings
-- [OpenRouter](https://openrouter.ai/) for LLM access
+- [Ollama](https://ollama.com/) for local embedding and generation services
 - [React](https://reactjs.org/) for the frontend framework
 "# SynergeReader" 
