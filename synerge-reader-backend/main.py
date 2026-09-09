@@ -1,5 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from document_parser import extract_text_from_upload, ExtractionError, sanitize_filename
+from document_chunker import chunk_document, build_chunk_locator
+from document_retrieval import build_relevant_chunks_query, retrieved_chunk_from_row
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from schemas import AskRequest, AskResponse, CorrectionRequest, RatingRequest,GoogleLoginRequest,LoginRequest,RegisterRequest,ResetPasswordRequest,ResendVerificationRequest
@@ -9,8 +11,10 @@ import string
 import datetime
 import re
 from typing import List, Optional
-from concurrent.futures import ThreadPoolExecutor
 from dbSetup import init_db,connect_to_postgres,test_postgres_connection
+from psycopg2.extras import Json
+from rag_model_profiles import resolve_embedding_profile
+from ollama_embedding_provider import EmbeddingProviderError, OllamaEmbeddingProvider
 import requests
 import json
 import time
@@ -20,7 +24,7 @@ import secrets
 from dotenv import load_dotenv
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
-import resend 
+import resend
 import subprocess
 import tempfile
 import shutil
@@ -56,15 +60,7 @@ OLLAMA_FALLBACK_HOSTS = [
 ]
 OLLAMA_CONNECT_TIMEOUT = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "1.5"))
 OLLAMA_READ_TIMEOUT = float(os.getenv("OLLAMA_READ_TIMEOUT", "60"))
-OLLAMA_EMBED_CONCURRENCY = int(os.getenv("OLLAMA_EMBED_CONCURRENCY", "4"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-OPENROUTER_BASE_URL = os.getenv(
-    "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
-).rstrip("/")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/auto").strip()
-OPENROUTER_HTTP_REFERER = os.getenv("OPENROUTER_HTTP_REFERER", "http://localhost")
-OPENROUTER_TITLE = os.getenv("OPENROUTER_TITLE", "SynergeReader")
 _ACTIVE_OLLAMA_BASE_URL = None
 _OLLAMA_HEALTH_CHECKED_AT = 0
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -130,125 +126,30 @@ def post_ollama(endpoint: str, payload: dict, *, stream: bool = False, timeout: 
     )
 
 
-def stream_openrouter_chat(messages: list[dict], model: str = OPENROUTER_MODEL):
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY is not configured")
-
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": OPENROUTER_HTTP_REFERER,
-        "X-Title": OPENROUTER_TITLE,
-    }
-    payload = {
-        "model": model or OPENROUTER_MODEL,
-        "messages": messages,
-        "stream": True,
-        "temperature": 0.7,
-        "max_tokens": 1000,
-    }
-
-    with requests.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
-        headers=headers,
-        json=payload,
-        stream=True,
-        timeout=(10, 90),
-    ) as r:
-        r.raise_for_status()
-        for raw_line in r.iter_lines(decode_unicode=True):
-            if not raw_line:
-                continue
-            if raw_line.startswith("data: "):
-                data = raw_line[6:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                    delta = chunk["choices"][0].get("delta", {})
-                    token = delta.get("content", "")
-                    if token:
-                        yield token
-                except Exception:
-                    continue
+# ------------------- Embedding composition boundary -------------------
+#
+# resolve_embedding_profile(os.environ) is the only permitted entry point
+# here (never known_embedding_profile(...) directly): it enforces the
+# all-or-nothing five-field EMBEDDING_* override, the unverified-profile
+# acknowledgement, registry dimension compatibility, and the documented
+# mxbai/1024 default when the override keys are absent. This runs once at
+# import time, so a partial or unacknowledged override fails startup rather
+# than surfacing later as a confusing runtime error.
+_EMBEDDING_PROFILE = resolve_embedding_profile(os.environ)
 
 
-def chunk_text(text: str, max_chunk_size: int = 500) -> list:
-    if not text.strip():
-        return []
-
-    words = text.split()
-    chunks = []
-    current = []
-
-    for word in words:
-        current_size = sum(len(w) for w in current) + len(current) - 1
-        if current_size + len(word) + 1 <= max_chunk_size:
-            current.append(word)
-        else:
-            if current:
-                chunks.append(" ".join(current))
-            current = [word]
-    if current:
-        chunks.append(" ".join(current))
-    return chunks
+def _post_embedding_request(endpoint: str, payload: dict):
+    """Adapter binding OllamaEmbeddingProvider's transport to post_ollama,
+    with the embedding request timeout pinned to 30s regardless of the
+    generation timeout used elsewhere."""
+    return post_ollama(endpoint, payload, timeout=30)
 
 
-def embed_chunks(
-    chunks: List[str], model: str = "nomic-embed-text:v1.5"
-) -> List[List[float]]:
-    if not chunks:
-        return []
-
-    def fetch_embeddings(endpoint: str, payload: dict):
-        resp = post_ollama(endpoint, payload, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        if "embeddings" in data:
-            return data["embeddings"]
-        if "embedding" in data:
-            return [data["embedding"]]
-        return []
-
-    try:
-        embeddings = fetch_embeddings(
-            "/api/embed",
-            {"model": model, "input": chunks, "keep_alive": OLLAMA_KEEP_ALIVE},
-        )
-        if len(embeddings) == len(chunks):
-            return embeddings
-    except Exception:
-        pass
-
-    def embed_one(chunk: str) -> List[float]:
-        try:
-            embeddings = fetch_embeddings(
-                "/api/embed",
-                {"model": model, "input": chunk, "keep_alive": OLLAMA_KEEP_ALIVE},
-            )
-            if embeddings:
-                return embeddings[0]
-        except Exception:
-            pass
-
-        try:
-            resp = post_ollama(
-                "/api/embeddings",
-                {"model": model, "prompt": chunk, "keep_alive": OLLAMA_KEEP_ALIVE},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("embedding", data.get("embeddings", [[0.0] * 768])[0])
-        except Exception:
-            return [0.0] * 768
-
-    if len(chunks) == 1:
-        return [embed_one(chunks[0])]
-
-    max_workers = max(1, min(OLLAMA_EMBED_CONCURRENCY, len(chunks)))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        return list(executor.map(embed_one, chunks))
+_EMBEDDING_PROVIDER = OllamaEmbeddingProvider(
+    profile=_EMBEDDING_PROFILE,
+    http_post=_post_embedding_request,
+    keep_alive=OLLAMA_KEEP_ALIVE,
+)
 
 
 def get_relevant_chunks(
@@ -257,46 +158,21 @@ def get_relevant_chunks(
     """Get relevant chunks ranked by embedding similarity."""
     conn = None
     try:
+        # Embed before touching the database: a query-embedding failure must
+        # propagate as EmbeddingProviderError (see the except clause below),
+        # never silently degrade into "no relevant chunks found".
+        question_embedding = _EMBEDDING_PROVIDER.embed_query(question)
+
         conn = connect_to_postgres()
         if conn is None:
             return []
         c = conn.cursor()
-        question_embedding = embed_chunks([question])[0]
-        if document_names:
-            c.execute(
-                """
-                SELECT
-                    dc.chunk_text,
-                    1 - (dc.embedding <=> %s::vector) AS similarity
-                FROM document_chunks dc
-                JOIN documents d ON d.id = dc.document_id
-                WHERE dc.embedding IS NOT NULL
-                  AND d.filename = ANY(%s)
-                ORDER BY dc.embedding <=> %s::vector
-                LIMIT %s
-                """,
-                (question_embedding, document_names, question_embedding, top_k),
-            )
-        else:
-            c.execute(
-                """
-                SELECT
-                    dc.chunk_text,
-                    1 - (dc.embedding <=> %s::vector) AS similarity
-                FROM document_chunks dc
-                WHERE dc.embedding IS NOT NULL
-                ORDER BY dc.embedding <=> %s::vector
-                LIMIT %s
-                """,
-                (question_embedding, question_embedding, top_k),
-            )
+        query, params = build_relevant_chunks_query(question_embedding, top_k, document_names)
+        c.execute(query, params)
         rows = c.fetchall()
-
-        scored = []
-        for text, similarity in rows:
-            scored.append({"text": text, "similarity": float(similarity)})
-
-        return scored
+        return [retrieved_chunk_from_row(row) for row in rows]
+    except EmbeddingProviderError:
+        raise
     except Exception as e:
         print(f"Error in get_relevant_chunks: {e}")
         return []
@@ -409,11 +285,11 @@ def get_relevant_history(
 def get_relevant_knowledge_base(question: str, limit: int = 3) -> List[dict]:
     """Retrieve relevant knowledge base entries using semantic similarity (pgvector)."""
     try:
-        # Embed the incoming question
-        q_emb = embed_chunks([question])
-        if not q_emb or not q_emb[0]:
-            return []
-        q_vec = q_emb[0]
+        # Embed the incoming question. A query-embedding failure must
+        # propagate as EmbeddingProviderError (see the except clauses below)
+        # rather than silently degrading into the keyword fallback below, as
+        # though semantic search had merely found nothing.
+        q_vec = _EMBEDDING_PROVIDER.embed_query(question)
 
         conn = connect_to_postgres()
         c = conn.cursor()
@@ -449,6 +325,8 @@ def get_relevant_knowledge_base(question: str, limit: int = 3) -> List[dict]:
                     })
             return results
 
+        except EmbeddingProviderError:
+            raise
         except Exception as e:
             print(f"Semantic KB search failed, falling back to keyword: {e}")
             conn.rollback()
@@ -469,6 +347,8 @@ def get_relevant_knowledge_base(question: str, limit: int = 3) -> List[dict]:
             scored.sort(key=lambda x: x["relevance_score"], reverse=True)
             return scored[:limit]
 
+    except EmbeddingProviderError:
+        raise
     except Exception as e:
         print(f"Error retrieving knowledge base: {e}")
         return []
@@ -505,11 +385,14 @@ def auto_save_to_kb(question: str, answer: str, source: str = "auto"):
         if any(p in answer.lower() for p in error_phrases):
             return
 
-        # Embed the question
-        q_emb = embed_chunks([question])
-        if not q_emb or not q_emb[0]:
+        # Embed the question. This runs before any database connection is
+        # opened, so an embedding failure never leaves a half-written row —
+        # it just logs and skips this save (non-critical background path).
+        try:
+            q_vec = _EMBEDDING_PROVIDER.embed_documents([question])[0]
+        except EmbeddingProviderError as exc:
+            print(f"[KB] Auto-save skipped — embedding unavailable: {type(exc).__name__}")
             return
-        q_vec = q_emb[0]
 
         conn = connect_to_postgres()
         c = conn.cursor()
@@ -649,39 +532,54 @@ Start with Q:"""
 
 
 def _save_kb_pairs(pairs: List[dict], source_label: str, source_type: str, corrected_by: str) -> int:
-    """Dedupe within the batch, embed, and insert. Returns the number saved."""
+    """Dedupe within the batch, embed, and insert. Returns the number saved.
+
+    Fails closed: if embedding a pair raises EmbeddingProviderError, the
+    entire uncommitted batch is rolled back and this returns 0 immediately —
+    never a NULL-embedding row, and never a partially committed batch. Both
+    callers (generate_kb_from_document, import_knowledge_from_url) already
+    treat a return value of 0 as "nothing was saved".
+    """
     if not pairs:
         return 0
     conn = connect_to_postgres()
-    c = conn.cursor()
-    saved = 0
-    seen = set()
-    for pair in pairs:
-        q = pair.get("question", "").strip()
-        a = pair.get("answer", "").strip()
-        if not q or not a or len(a) < 20:
-            continue
-        if q.lower() in seen:
-            continue
-        seen.add(q.lower())
-        try:
-            q_emb = embed_chunks([q])
-            q_vec = q_emb[0] if q_emb else None
-        except Exception:
-            q_vec = None
-        c.execute(
-            """
-            INSERT INTO knowledge_base
-              (question, original_answer, corrected_answer, created_at,
-               context_text, corrected_by, usage_count, embedding, source_type)
-            VALUES (%s, %s, %s, %s, %s, %s, 0, %s, %s)
-            """,
-            (q, a, a, datetime.datetime.now().isoformat(), source_label, corrected_by, q_vec, source_type),
-        )
-        saved += 1
-    conn.commit()
-    conn.close()
-    return saved
+    try:
+        c = conn.cursor()
+        saved = 0
+        seen = set()
+        for pair in pairs:
+            q = pair.get("question", "").strip()
+            a = pair.get("answer", "").strip()
+            if not q or not a or len(a) < 20:
+                continue
+            if q.lower() in seen:
+                continue
+            seen.add(q.lower())
+
+            try:
+                q_vec = _EMBEDDING_PROVIDER.embed_documents([q])[0]
+            except EmbeddingProviderError as exc:
+                print(
+                    f"[KB] Embedding failed while saving a {source_type} batch; "
+                    f"rolling back {saved} pending row(s): {type(exc).__name__}"
+                )
+                conn.rollback()
+                return 0
+
+            c.execute(
+                """
+                INSERT INTO knowledge_base
+                  (question, original_answer, corrected_answer, created_at,
+                   context_text, corrected_by, usage_count, embedding, source_type)
+                VALUES (%s, %s, %s, %s, %s, %s, 0, %s, %s)
+                """,
+                (q, a, a, datetime.datetime.now().isoformat(), source_label, corrected_by, q_vec, source_type),
+            )
+            saved += 1
+        conn.commit()
+        return saved
+    finally:
+        conn.close()
 
 
 def generate_kb_from_document(doc_id: int, filename: str, text: str):
@@ -843,9 +741,27 @@ async def upload_documents(
                 results.append({"error": "Empty file", "filename": safe_filename})
                 continue
 
-            chunks = chunk_text(text)
-            embeddings = embed_chunks(chunks)
+            chunks = chunk_document(result)
+            chunk_texts = [chunk.text for chunk in chunks]
 
+            try:
+                embeddings = _EMBEDDING_PROVIDER.embed_documents(chunk_texts)
+            except EmbeddingProviderError as exc:
+                print(f"[Upload] Embedding failed for {safe_filename}: {type(exc).__name__}")
+                results.append({"error": "Embedding service is temporarily unavailable", "filename": safe_filename})
+                continue
+
+            if len(embeddings) != len(chunks):
+                print(
+                    f"[Upload] Embedding count mismatch for {safe_filename}: "
+                    f"{len(embeddings)} embeddings for {len(chunks)} chunks"
+                )
+                results.append({"error": "Embedding service returned an unexpected result", "filename": safe_filename})
+                continue
+
+            # Embedding and count validation are already complete above —
+            # the ingestion write connection only opens once both have
+            # succeeded, so an embedding failure never touches the database.
             conn = connect_to_postgres()
             if conn is None:
                 raise HTTPException(500, "Failed to connect to PostgreSQL")
@@ -873,14 +789,23 @@ async def upload_documents(
 
                 doc_id = c.fetchone()[0]
 
-                for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+                for chunk, embedding in zip(chunks, embeddings):
+                    locator_json = build_chunk_locator(chunk, result.document_type)
                     c.execute(
                         """
                         INSERT INTO document_chunks
-                        (document_id, chunk_text, chunk_index, embedding)
-                        VALUES (%s, %s, %s, %s)
+                        (document_id, chunk_text, chunk_index, embedding, page_start, page_end, locator_json)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
                         """,
-                        (doc_id, chunk, i, emb),
+                        (
+                            doc_id,
+                            chunk.text,
+                            chunk.chunk_index,
+                            embedding,
+                            chunk.page_start,
+                            chunk.page_end,
+                            Json(locator_json),
+                        ),
                     )
 
                 conn.commit()
@@ -929,13 +854,6 @@ async def upload_documents(
 
 @app.post("/ask")
 async def ask_question(request: AskRequest):
-    system_prompt = (
-        "You are SynergeReader, a document assistant. "
-        "Answer only from the provided context when possible. "
-        "If the context is insufficient, say what is missing instead of guessing. "
-        "Do not include internal tags, JSON, or the words CONTEXT/QUESTION in the answer."
-    )
-
     answer_parts = []
     entry_id = None
     selected_items = list(request.selections or [])
@@ -1055,10 +973,6 @@ Keep the answer concise, structured, and directly responsive to the question."""
             # ─────────────────────────────────────────────────────────────
 
             prompt = build_prompt(prompt_text)
-            fallback_messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ]
             context_data = {
                 "context_chunks": [chunk_data["text"] for chunk_data in context_chunks],
                 "similarity_score": best_similarity,
@@ -1077,6 +991,9 @@ Keep the answer concise, structured, and directly responsive to the question."""
                 "stream": True,
                 "keep_alive": OLLAMA_KEEP_ALIVE,
             }
+        except EmbeddingProviderError:
+            yield "__ERROR__Search is temporarily unavailable. Please try again shortly.__"
+            return
         except Exception as e:
             yield f"__ERROR__Failed to build document context: {e}__"
             return
@@ -1118,29 +1035,12 @@ Keep the answer concise, structured, and directly responsive to the question."""
                         pass
                 print(f"DEBUG: Streaming complete. Total tokens: {token_count}")
         except Exception as e:
-            stream_error = str(e)
-            if OPENROUTER_API_KEY:
-                try:
-                    answer_parts.clear()
-                    for token in stream_openrouter_chat(
-                        fallback_messages, model=OPENROUTER_MODEL
-                    ):
-                        answer_parts.append(token)
-                        yield token
-                    stream_error = None
-                except Exception as fallback_error:
-                    print(f"DEBUG: OpenRouter fallback failed: {fallback_error}")
-                    response = getattr(fallback_error, "response", None)
-                    if response is not None:
-                        yield f"__ERROR__LLM request failed with HTTP {response.status_code}. Check model access in OpenRouter.__"
-                    else:
-                        yield "__ERROR__The local LLM server is not reachable and OpenRouter fallback is unavailable.__"
+            stream_error = True
+            response = getattr(e, "response", None)
+            if response is not None:
+                yield f"__ERROR__LLM request failed with HTTP {response.status_code}. Check that model '{request.model}' is installed in Ollama.__"
             else:
-                response = getattr(e, "response", None)
-                if response is not None:
-                    yield f"__ERROR__LLM request failed with HTTP {response.status_code}. Check that model '{request.model}' is installed in Ollama.__"
-                else:
-                    yield "__ERROR__The local LLM server is not reachable. Start Ollama or update OLLAMA_BASE_URL / OLLAMA_PORT in .env.__"
+                yield "__ERROR__The local LLM server is not reachable. Start Ollama or update OLLAMA_BASE_URL / OLLAMA_PORT in .env.__"
 
         # Increment KB usage counts for entries that fired this query
         if kb_ids_fired:
@@ -1676,12 +1576,16 @@ async def submit_correction(request: CorrectionRequest):
         c.execute("UPDATE chat_history SET answer = %s, comment = %s WHERE id = %s", (request.corrected_answer, request.comment, request.chat_id))
 
         # Insert into knowledge base
-        # Embed the question for semantic matching
+        # Embed the question for semantic matching. A failure here rolls
+        # back the chat_history update above too, rather than persisting a
+        # NULL-embedding KB row that can never be found by semantic search.
         try:
-            q_emb = embed_chunks([question])
-            q_vec = q_emb[0] if q_emb else None
-        except Exception:
-            q_vec = None
+            q_vec = _EMBEDDING_PROVIDER.embed_documents([question])[0]
+        except EmbeddingProviderError as exc:
+            conn.rollback()
+            conn.close()
+            print(f"[Correction] Embedding failed for chat_id={request.chat_id}: {type(exc).__name__}")
+            raise HTTPException(503, "Could not save correction: embedding service is temporarily unavailable")
 
         c.execute(
             "INSERT INTO knowledge_base (question, original_answer, corrected_answer, created_at, chat_history_id, corrected_by, usage_count, embedding) VALUES (%s, %s, %s, %s, %s, %s, 0, %s)",
@@ -1694,6 +1598,8 @@ async def submit_correction(request: CorrectionRequest):
             "message": "Correction submitted and saved to KB",
             "chat_id": request.chat_id,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -1760,10 +1666,13 @@ async def add_knowledge(request: KnowledgeInsertRequest):
             if not item.question.strip() or not item.answer.strip():
                 continue
             try:
-                q_emb = embed_chunks([item.question])
-                q_vec = q_emb[0] if q_emb else None
-            except Exception:
-                q_vec = None
+                q_vec = _EMBEDDING_PROVIDER.embed_documents([item.question])[0]
+            except EmbeddingProviderError as exc:
+                # Roll back the whole uncommitted batch rather than persist a
+                # NULL-embedding row or silently drop just this one item.
+                conn.rollback()
+                print(f"[KB] add_knowledge embedding failed; rolled back {saved} pending row(s): {type(exc).__name__}")
+                raise HTTPException(503, "Could not add knowledge items: embedding service is temporarily unavailable")
             c.execute(
                 """
                 INSERT INTO knowledge_base
@@ -1887,7 +1796,12 @@ async def import_knowledge_from_url(request: KnowledgeUrlImportRequest):
 
     saved = _save_kb_pairs(pairs, request.url, "external_url", label)
     if saved == 0:
-        raise HTTPException(422, "Generated pairs were all too short or duplicates — nothing was saved")
+        raise HTTPException(
+            422,
+            "Nothing was saved — the generated pairs may have all been too "
+            "short or duplicates, or the embedding service may be "
+            "temporarily unavailable",
+        )
 
     return {"message": f"{saved} knowledge entries added from {domain}", "added": saved, "source": request.url}
 
@@ -1931,10 +1845,11 @@ async def update_knowledge(entry_id: int, request: KBUpdateRequest):
         _require_admin(c, request.token)
         # Re-embed if question changed
         try:
-            q_emb = embed_chunks([request.question])
-            q_vec = q_emb[0] if q_emb else None
-        except Exception:
-            q_vec = None
+            q_vec = _EMBEDDING_PROVIDER.embed_documents([request.question])[0]
+        except EmbeddingProviderError as exc:
+            conn.rollback()
+            print(f"[KB] update_knowledge embedding failed for entry {entry_id}: {type(exc).__name__}")
+            raise HTTPException(503, "Could not update knowledge item: embedding service is temporarily unavailable")
         c.execute(
             "UPDATE knowledge_base SET question=%s, corrected_answer=%s, embedding=%s WHERE id=%s RETURNING id",
             (request.question, request.answer, q_vec, entry_id)
@@ -3026,7 +2941,6 @@ async def admin_system_status(token: Optional[str] = None):
     return {
         "database": {"ok": db_ok},
         "llm_backend": {"ok": ollama_ok, "url": ollama_url, "models": models},
-        "openrouter_fallback_configured": bool(OPENROUTER_API_KEY),
     }
 
 
@@ -3078,7 +2992,7 @@ async def convert_docx_to_pdf(file: UploadFile = File(...)):
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-init_db()
+init_db(expected_dimension=_EMBEDDING_PROFILE.dimension)
 if __name__ == "__main__":
     import uvicorn
 

@@ -39,6 +39,16 @@ services:
       - EMAIL_KEY=${EMAIL_KEY}
       - ADMIN_EMAILS=${ADMIN_EMAILS}
       - FRONTEND_URL=${FRONTEND_URL}
+      # Keep these embedding-profile entries bare deliberately. Unresolved keys
+      # must stay absent rather than becoming present-but-empty and activating the
+      # fail-closed explicit-override path. Verify docker-compose 1.29.2 .env
+      # propagation separately before deployment.
+      - EMBEDDING_PROVIDER
+      - EMBEDDING_MODEL
+      - EMBEDDING_DIMENSION
+      - EMBEDDING_QUERY_PREFIX
+      - EMBEDDING_DOCUMENT_PREFIX
+      - EMBEDDING_PROFILE_UNVERIFIED_ACK
     depends_on:
       synergereader-db:
         condition: service_healthy

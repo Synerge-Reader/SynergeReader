@@ -2,6 +2,7 @@ import io
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_PDF_PAGES = 150
@@ -23,14 +24,34 @@ class UnsupportedFileTypeError(ExtractionError):
         super().__init__(user_message=msg, http_status=415)
 
 
-@dataclass
-class ExtractionResult:
+@dataclass(frozen=True)
+class ParsedPage:
+    page_number: Optional[int]   # PDF: true 1-based source page number. DOCX/text: None.
     text: str
-    file_type: str          # "pdf", "docx", "text"
+
+
+@dataclass
+class ParsedDocument:
+    pages: list[ParsedPage]
+    document_type: str          # "pdf", "docx", "text"
     page_count: int = 0
     char_count: int = 0
     truncated: bool = False
-    warnings: list = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def text(self) -> str:
+        return "\n\n".join(p.text for p in self.pages)
+
+    @property
+    def file_type(self) -> str:
+        return self.document_type
+
+
+# Compatibility alias for existing type imports and result attribute
+# access. ParsedDocument preserves the attributes used by current
+# consumers.
+ExtractionResult = ParsedDocument
 
 
 def looks_like_text(content: bytes) -> bool:
@@ -91,49 +112,74 @@ def sanitize_filename(filename: "str | None") -> str:
     return name[:255] or "untitled"
 
 
-def _extract_pdf(content: bytes, filename: str) -> ExtractionResult:
+def _truncate_pages(
+    pages: list[ParsedPage],
+    limit: int,
+) -> tuple[list[ParsedPage], bool]:
+    """Truncate PDF pages so that '\\n\\n'.join(text) stays within limit.
+
+    PDF-only: keeps true source page numbers intact for every page that
+    survives (partially or fully) the cut. DOCX/text use their own
+    single-string truncation to stay character-for-character identical to
+    the pre-refactor output.
+    """
+    sep = "\n\n"
+    combined_len = 0
+    new_pages = []
+    for page in pages:
+        prefix_len = len(sep) if new_pages else 0
+        piece_len = prefix_len + len(page.text)
+        if combined_len + piece_len <= limit:
+            new_pages.append(page)
+            combined_len += piece_len
+        else:
+            remaining = limit - combined_len - prefix_len
+            if remaining > 0:
+                new_pages.append(ParsedPage(page_number=page.page_number, text=page.text[:remaining]))
+            return new_pages, True
+    return new_pages, False
+
+
+def _extract_pdf(content: bytes, filename: str) -> ParsedDocument:
     try:
         import pdfplumber
     except ImportError as e:
         raise ExtractionError("PDF processing is not available on the server.", 500) from e
 
     with pdfplumber.open(io.BytesIO(content)) as pdf:
-        pages = pdf.pages
-        if len(pages) > MAX_PDF_PAGES:
+        pdf_pages = pdf.pages
+        if len(pdf_pages) > MAX_PDF_PAGES:
             raise ExtractionError(
                 f"PDF exceeds the {MAX_PDF_PAGES}-page limit. Please upload a shorter document.",
                 422,
             )
 
-        parts = []
-        for i, page in enumerate(pages, start=1):
+        pages = []
+        for i, page in enumerate(pdf_pages, start=1):
             page_text = page.extract_text()
             if page_text and page_text.strip():
-                parts.append(f"\n\n[Page {i}]\n\n{page_text}")
+                pages.append(ParsedPage(page_number=i, text=page_text))
 
-        if not parts:
+        if not pages:
             raise ExtractionError(
                 "This PDF appears to be scanned or image-based. Text extraction is not supported for image-only PDFs.",
                 422,
             )
 
-        text = "".join(parts)
-        truncated = False
-        if len(text) > MAX_EXTRACTED_CHARS:
-            text = text[:MAX_EXTRACTED_CHARS]
-            truncated = True
+        pages, truncated = _truncate_pages(pages, MAX_EXTRACTED_CHARS)
+        text = "\n\n".join(p.text for p in pages)
 
-        return ExtractionResult(
-            text=text,
-            file_type="pdf",
-            page_count=len(pages),
+        return ParsedDocument(
+            pages=pages,
+            document_type="pdf",
+            page_count=len(pdf_pages),
             char_count=len(text),
             truncated=truncated,
             warnings=["Document truncated to 300,000 characters."] if truncated else [],
         )
 
 
-def _extract_docx(content: bytes, filename: str) -> ExtractionResult:
+def _extract_docx(content: bytes, filename: str) -> ParsedDocument:
     try:
         import docx as python_docx
     except ImportError as e:
@@ -153,16 +199,18 @@ def _extract_docx(content: bytes, filename: str) -> ExtractionResult:
     if not text.strip():
         raise ExtractionError("This Word document appears to be empty or contains only images.", 422)
 
-    return ExtractionResult(
-        text=text,
-        file_type="docx",
+    pages = [ParsedPage(page_number=None, text=text)]
+
+    return ParsedDocument(
+        pages=pages,
+        document_type="docx",
         char_count=len(text),
         truncated=truncated,
         warnings=["Document truncated to 300,000 characters."] if truncated else [],
     )
 
 
-def _extract_text(content: bytes, filename: str) -> ExtractionResult:
+def _extract_text(content: bytes, filename: str) -> ParsedDocument:
     try:
         text = content.decode("utf-8")
     except UnicodeDecodeError:
@@ -176,16 +224,18 @@ def _extract_text(content: bytes, filename: str) -> ExtractionResult:
     if not text.strip():
         raise ExtractionError("Uploaded text file is empty.", 422)
 
-    return ExtractionResult(
-        text=text,
-        file_type="text",
+    pages = [ParsedPage(page_number=None, text=text)]
+
+    return ParsedDocument(
+        pages=pages,
+        document_type="text",
         char_count=len(text),
         truncated=truncated,
         warnings=["Document truncated to 300,000 characters."] if truncated else [],
     )
 
 
-def extract_text_from_upload(filename: str, content: bytes) -> ExtractionResult:
+def extract_text_from_upload(filename: str, content: bytes) -> ParsedDocument:
     if len(content) == 0:
         raise ExtractionError("Uploaded file is empty.", 422)
     if len(content) > MAX_FILE_BYTES:
