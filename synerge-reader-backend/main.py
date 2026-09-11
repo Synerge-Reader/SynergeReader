@@ -1,3 +1,6 @@
+from contextlib import asynccontextmanager
+import sys
+
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from document_parser import extract_text_from_upload, ExtractionError, sanitize_filename
 from document_chunker import chunk_document, build_chunk_locator
@@ -11,7 +14,7 @@ import string
 import datetime
 import re
 from typing import List, Optional
-from dbSetup import init_db,connect_to_postgres,test_postgres_connection
+from dbSetup import VectorSchemaError,init_db,connect_to_postgres,test_postgres_connection
 from psycopg2.extras import Json
 from rag_model_profiles import resolve_embedding_profile
 from ollama_embedding_provider import EmbeddingProviderError, OllamaEmbeddingProvider
@@ -37,7 +40,24 @@ from fastapi.responses import Response
 
 load_dotenv()
 
-app = FastAPI(title="SynergeReader API", version="2.0.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Initialize required database state before accepting requests."""
+    try:
+        _initialize_application()
+    except VectorSchemaError as exc:
+        message = " ".join(str(exc).splitlines())
+        print(
+            f"Application startup blocked by vector schema validation: {message}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise
+    yield
+
+
+app = FastAPI(title="SynergeReader API", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -136,6 +156,11 @@ def post_ollama(endpoint: str, payload: dict, *, stream: bool = False, timeout: 
 # import time, so a partial or unacknowledged override fails startup rather
 # than surfacing later as a confusing runtime error.
 _EMBEDDING_PROFILE = resolve_embedding_profile(os.environ)
+
+
+def _initialize_application() -> None:
+    """Initialize database state using the resolved embedding dimension."""
+    init_db(expected_dimension=_EMBEDDING_PROFILE.dimension)
 
 
 def _post_embedding_request(endpoint: str, payload: dict):
@@ -2992,7 +3017,6 @@ async def convert_docx_to_pdf(file: UploadFile = File(...)):
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-init_db(expected_dimension=_EMBEDDING_PROFILE.dimension)
 if __name__ == "__main__":
     import uvicorn
 

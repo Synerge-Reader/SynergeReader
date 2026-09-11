@@ -6,9 +6,9 @@ main.py, with the stdlib ``ast`` module); neither is ever imported, executed,
 or run through Docker/Compose anywhere in this file. There is no network,
 database, Ollama, container, or production access here.
 
-main.py is never imported because it unconditionally calls ``init_db(...)``
-at module scope -- importing it would attempt real database initialization
-during test collection.
+This file deliberately parses rather than imports ``main.py`` so it remains
+a source-only contract suite. Runtime import and lifespan behavior are covered
+separately by ``test_main_lifecycle.py``.
 
 What these tests prove: the legacy ``embed_chunks``/``chunk_text`` helpers
 and their fabricated zero-vector/``"/api/embeddings"`` fallbacks are gone
@@ -20,8 +20,9 @@ semantic direction (query vs. document); the composition boundary assigns
 and ``_EMBEDDING_PROVIDER`` exactly once from an appropriately-wired
 ``OllamaEmbeddingProvider(...)`` call, whose adapter forwards
 ``(endpoint, payload)`` to ``post_ollama`` with a pinned ``timeout=30``;
-``init_db(...)`` is called with the exact keyword binding
-``expected_dimension=_EMBEDDING_PROFILE.dimension``; ``EmbeddingProviderError``
+``init_db(...)`` is called exactly once through the lifespan-wired initializer
+with the exact keyword binding ``expected_dimension=_EMBEDDING_PROFILE.dimension``;
+``EmbeddingProviderError``
 propagates past (rather than being silently swallowed by) the specific
 broad-exception/fallback handlers named in the I3 spec; ``_save_kb_pairs``
 aborts its whole uncommitted batch atomically (rollback, no partial inserts,
@@ -413,18 +414,30 @@ def test_post_embedding_request_adapter_forwards_and_pins_timeout(main_tree):
 
 
 def test_init_db_called_with_expected_dimension_from_embedding_profile(main_tree):
-    module_level_calls = [
-        node.value
-        for node in main_tree.body
-        if isinstance(node, ast.Expr)
-        and isinstance(node.value, ast.Call)
-        and isinstance(node.value.func, ast.Name)
-        and node.value.func.id == "init_db"
-    ]
-    assert len(module_level_calls) == 1, (
-        f"expected exactly one module-level init_db(...) call, found {len(module_level_calls)}"
+    # Every module-body statement that is not a function or class definition
+    # runs at import time, so each one is walked in full -- not just bare
+    # `init_db(...)` expression statements, which would miss an assignment,
+    # or a call nested inside a module-level if/try/with.
+    for statement in main_tree.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        assert not _calls_to_name(statement, "init_db"), (
+            "init_db(...) must not run at module import; found a call in the "
+            f"module-level statement starting at line {statement.lineno}"
+        )
+        assert not _calls_to_name(statement, "_initialize_application"), (
+            "_initialize_application() must not run at module import; found a "
+            f"call in the module-level statement starting at line {statement.lineno}"
+        )
+
+    initializer = _find_function(main_tree, "_initialize_application")
+    initializer_calls = _calls_to_name(initializer, "init_db")
+    assert len(initializer_calls) == 1, (
+        "_initialize_application() must call init_db(...) exactly once; "
+        f"found {len(initializer_calls)} call(s)"
     )
-    call = module_level_calls[0]
+
+    call = initializer_calls[0]
     assert not call.args, "init_db must be called with no positional arguments"
 
     kwargs = {kw.arg: kw.value for kw in call.keywords}
@@ -437,6 +450,50 @@ def test_init_db_called_with_expected_dimension_from_embedding_profile(main_tree
         "not a literal, so a future edit can't silently reintroduce the 768 default"
     )
     assert isinstance(value.value, ast.Name) and value.value.id == "_EMBEDDING_PROFILE"
+
+    fastapi_calls = _calls_to_name(main_tree, "FastAPI")
+    assert len(fastapi_calls) == 1, (
+        f"expected exactly one FastAPI(...) application construction, found {len(fastapi_calls)}"
+    )
+    app_kwargs = {kw.arg: kw.value for kw in fastapi_calls[0].keywords}
+    assert "lifespan" in app_kwargs, "FastAPI(...) must receive lifespan=..."
+    lifespan_value = app_kwargs["lifespan"]
+    assert isinstance(lifespan_value, ast.Name), "lifespan= must reference a named function"
+
+    lifespan_fn = _find_function(main_tree, lifespan_value.id)
+    assert isinstance(lifespan_fn, ast.AsyncFunctionDef), (
+        f"the lifespan {lifespan_value.id!r} must be an async function"
+    )
+    assert len(lifespan_fn.decorator_list) == 1, (
+        "the lifespan must carry exactly one decorator, @asynccontextmanager; "
+        f"found {len(lifespan_fn.decorator_list)}"
+    )
+    decorator = lifespan_fn.decorator_list[0]
+    assert (
+        isinstance(decorator, ast.Name) and decorator.id == "asynccontextmanager"
+    ) or (
+        isinstance(decorator, ast.Attribute) and decorator.attr == "asynccontextmanager"
+    ), (
+        "the lifespan must be decorated with @asynccontextmanager (bare or "
+        "attribute-qualified); without it the async generator is never turned "
+        "into the context manager the ASGI server enters at startup"
+    )
+
+    lifecycle_calls = _calls_to_name(lifespan_fn, "_initialize_application")
+    assert len(lifecycle_calls) == 1, (
+        "the FastAPI lifespan must call _initialize_application() exactly once; "
+        f"found {len(lifecycle_calls)} call(s)"
+    )
+    yields = [node for node in ast.walk(lifespan_fn) if isinstance(node, ast.Yield)]
+    assert len(yields) == 1, f"the FastAPI lifespan must yield exactly once; found {len(yields)}"
+    # A source-order check, kept for readability of the contract. It is not
+    # treated as proof of control flow: test_main_lifecycle.py's
+    # test_configured_lifespan_initializes_once_before_yield actually drives
+    # the configured lifespan and asserts initialization has already happened
+    # while it sits suspended at this yield.
+    assert lifecycle_calls[0].lineno < yields[0].lineno, (
+        "_initialize_application() must appear before the lifespan yields control"
+    )
 
 
 # --- 6/7: the eight call sites use the exact _EMBEDDING_PROVIDER receiver, exclusively ---

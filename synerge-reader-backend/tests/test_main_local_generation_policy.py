@@ -1,10 +1,11 @@
 """Source/AST contract tests for the I3 local-generation policy.
 
-These tests read and parse source files only. They never import or execute
-``main.py`` (which unconditionally calls ``init_db(...)`` at module scope) or
-``GridApp.jsx``, and make no network, database, subprocess, or filesystem-write
-calls. Negative checks for the removed external provider are paired with
-positive checks that ``ask_question`` retains its local Ollama
+These tests read and parse source files only. They deliberately do not import
+or execute ``main.py`` or ``GridApp.jsx``; runtime import and lifespan behavior
+are covered separately by ``test_main_lifecycle.py``. They make no network,
+database, subprocess, or filesystem-write calls. Negative checks for the
+removed external provider are paired with positive checks that
+``ask_question`` retains its local Ollama
 ``/api/generate`` streaming structure, failed output is not persisted, and
 the admin-status UI/backend still report the fields that were not removed.
 

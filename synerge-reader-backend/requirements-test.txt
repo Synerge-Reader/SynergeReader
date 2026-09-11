@@ -1,0 +1,15 @@
+# Test-only dependencies for the backend suite.
+#
+# Runtime dependencies are declared in requiredInstall.txt and must be
+# installed separately. This file deliberately does not include it: that
+# pin set downgrades the environment the E1a-1 results were produced in,
+# and it pins uvloop, which has no Windows wheel.
+#
+# Environment that produced the E1a-1 baseline and results:
+#   Python 3.11.9, FastAPI 0.135.3, Starlette 1.0.0, anyio 4.13.0
+# requiredInstall.txt declares FastAPI 0.116.2 / Starlette 0.48.0 /
+# anyio 4.10.0. No declared-runtime validation has been performed.
+#
+# httpx is intentionally absent: no test imports it. The unit that
+# introduces the real route/TestClient harness must add it there.
+pytest==9.0.3
