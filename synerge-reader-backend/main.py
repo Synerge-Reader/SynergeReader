@@ -983,11 +983,33 @@ Keep the answer concise, structured, and directly responsive to the question."""
             yield f"__CONTEXT__{json.dumps(context_data)}__\n\n"
             yield "__READY__\n"
 
+            # A combined "All Documents" query (selected_items has one entry
+            # per document in scope) needs a much bigger output budget than a
+            # single-document question — asking for parties/dates/obligations/
+            # clauses across 10-15 documents just doesn't fit in 1000 tokens.
+            # Scale the budget with how many documents are actually in scope,
+            # capped so a single stray request can't run away.
+            #
+            # The bigger factor turned out to be temperature: 0.7 is tuned for
+            # natural chat, but for a structured multi-document extraction —
+            # "list every party/date/obligation across all N documents" — that
+            # much sampling randomness meant the model would sometimes stop
+            # after summarizing just the first document and call it done,
+            # other times cover all of them, with nothing forcing it to work
+            # through the full document list systematically. Turning
+            # temperature down for combined (2+ document) requests makes that
+            # extraction pass deterministic and complete instead of a coin
+            # flip on every regenerate; single-document chat keeps its
+            # original, more conversational temperature.
+            doc_count = len(selected_items) if selected_items else 1
+            max_tokens = 1000 if doc_count <= 1 else min(4000, 1000 + 200 * doc_count)
+            temperature = 0.7 if doc_count <= 1 else 0.2
+
             payload = {
                 "model": request.model,
                 "prompt": prompt,
-                "max_tokens": 1000,
-                "temperature": 0.7,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
                 "stream": True,
                 "keep_alive": OLLAMA_KEEP_ALIVE,
             }
@@ -1170,6 +1192,103 @@ async def get_documents():
             for r in rows
         ]
     except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/me/documents/search")
+async def search_my_documents(q: str = "", token: Optional[str] = None, limit: int = 8):
+    """Search the caller's own previously-uploaded documents by filename, for
+    the header search bar. Admin-only for now — everyone's document history
+    exists, but this is a new, lightly-tested surface, so it's gated to
+    admins the same way new features already start in this codebase (see
+    ADMIN_EMAILS / the KB write endpoints) until it's proven out."""
+    conn = connect_to_postgres()
+    try:
+        c = conn.cursor()
+        _require_admin(c, token)
+        c.execute("SELECT id FROM users WHERE token = %s", (token,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(401, "Invalid session")
+        user_id = row[0]
+
+        limit = max(1, min(limit, 25))
+        q_trimmed = q.strip()
+        if q_trimmed:
+            c.execute(
+                """
+                SELECT d.id, d.filename, d.upload_timestamp,
+                       (SELECT COUNT(*) FROM document_chunks WHERE document_id = d.id) AS chunks,
+                       di.doc_type
+                FROM documents d
+                LEFT JOIN document_insights di ON di.document_id = d.id
+                WHERE d.user_id = %s AND d.filename ILIKE %s
+                ORDER BY d.upload_timestamp DESC
+                LIMIT %s
+                """,
+                (user_id, f"%{q_trimmed}%", limit),
+            )
+        else:
+            # Empty query — show the user's most recent uploads rather than
+            # nothing, so opening the search bar isn't a blank state.
+            c.execute(
+                """
+                SELECT d.id, d.filename, d.upload_timestamp,
+                       (SELECT COUNT(*) FROM document_chunks WHERE document_id = d.id) AS chunks,
+                       di.doc_type
+                FROM documents d
+                LEFT JOIN document_insights di ON di.document_id = d.id
+                WHERE d.user_id = %s
+                ORDER BY d.upload_timestamp DESC
+                LIMIT %s
+                """,
+                (user_id, limit),
+            )
+        rows = c.fetchall()
+        conn.close()
+        return [
+            {"id": r[0], "filename": r[1], "upload_timestamp": r[2], "chunks": r[3], "doc_type": r[4]}
+            for r in rows
+        ]
+    except HTTPException:
+        conn.close()
+        raise
+    except Exception as e:
+        conn.close()
+        raise HTTPException(500, str(e))
+
+
+@app.get("/documents/{document_id}/content")
+async def get_document_content(document_id: int, token: Optional[str] = None):
+    """Fetch one document's stored extracted text by id, so a search result
+    can be opened without re-uploading the original file. Admin-only, and
+    scoped to the caller's own documents — matches search_my_documents above."""
+    conn = connect_to_postgres()
+    try:
+        c = conn.cursor()
+        _require_admin(c, token)
+        c.execute("SELECT id FROM users WHERE token = %s", (token,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(401, "Invalid session")
+        user_id = row[0]
+
+        c.execute(
+            "SELECT filename, content, upload_timestamp FROM documents WHERE id = %s AND user_id = %s",
+            (document_id, user_id),
+        )
+        doc = c.fetchone()
+        conn.close()
+        if not doc:
+            raise HTTPException(404, "Document not found")
+        return {"id": document_id, "filename": doc[0], "content": doc[1] or "", "upload_timestamp": doc[2]}
+    except HTTPException:
+        conn.close()
+        raise
+    except Exception as e:
+        conn.close()
         raise HTTPException(500, str(e))
 
 
