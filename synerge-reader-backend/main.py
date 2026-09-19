@@ -2,11 +2,16 @@ from contextlib import asynccontextmanager
 import sys
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from document_parser import extract_text_from_upload, ExtractionError, sanitize_filename
-from document_chunker import chunk_document, build_chunk_locator
+from document_parser import sanitize_filename
+from document_ingestion import (
+    CommittedDocument,
+    DocumentIngestionService,
+    DocumentMetadata,
+    UploadDocument,
+)
 from document_retrieval import build_relevant_chunks_query, retrieved_chunk_from_row
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from schemas import AskRequest, AskResponse, CorrectionRequest, RatingRequest,GoogleLoginRequest,LoginRequest,RegisterRequest,ResetPasswordRequest,ResendVerificationRequest
 from schemas import HistoryItem,HistoryRequest, KnowledgeItem,KnowledgeInsertRequest,ForgotPasswordRequest,KnowledgeUrlImportRequest
 import os
@@ -15,7 +20,6 @@ import datetime
 import re
 from typing import List, Optional
 from dbSetup import VectorSchemaError,init_db,connect_to_postgres,test_postgres_connection
-from psycopg2.extras import Json
 from rag_model_profiles import resolve_embedding_profile
 from ollama_embedding_provider import EmbeddingProviderError, OllamaEmbeddingProvider
 import requests
@@ -718,6 +722,126 @@ async def hash_password(password: str) -> str:
 
 
 
+def _resolve_uploader_id(auth_token: Optional[str]):
+    """Resolve an upload's owner from the existing users.token column.
+
+    Unchanged auth semantics for this slice: a token that matches a row gives
+    that user's id, anything else gives None (an anonymous upload), exactly as
+    before. The only behavioural change is hygiene -- the lookup cursor is now
+    closed as well as the connection, and a lookup failure is logged by
+    exception class name only, never with the token, the SQL, or the raw
+    exception text.
+    """
+    if not auth_token:
+        return None
+
+    lookup_conn = connect_to_postgres()
+    if lookup_conn is None:
+        return None
+
+    lookup_cursor = None
+    try:
+        lookup_cursor = lookup_conn.cursor()
+        lookup_cursor.execute("SELECT id FROM users WHERE token = %s", (auth_token,))
+        lookup_row = lookup_cursor.fetchone()
+        return lookup_row[0] if lookup_row else None
+    except Exception as exc:
+        print(f"[Upload] uploader lookup failed: {type(exc).__name__}")
+        return None
+    finally:
+        if lookup_cursor is not None:
+            try:
+                lookup_cursor.close()
+            except Exception:
+                pass
+        try:
+            lookup_conn.close()
+        except Exception:
+            pass
+
+
+class _PostCommitDispatchError(RuntimeError):
+    """At least one post-commit follow-up could not be started.
+
+    Raised with a fixed message and nothing else: no exception text, no
+    document or chunk content, no filename, no auth token, no SQL, and no
+    connection detail. DocumentIngestionService catches it and converts it into
+    its existing fixed warning on an already-indexed result.
+    """
+
+
+def _start_background_task(target, args) -> None:
+    """Construct and start one daemon follow-up thread.
+
+    Deliberately does NOT suppress a construction or start failure. A follow-up
+    that never began is something the caller has to know about, so that the
+    ingestion service can record its fixed post-commit warning; swallowing it
+    here would report a clean ingestion for work that never ran.
+
+    Isolated as its own module-level function so the post-commit dispatcher can
+    be exercised without spawning real threads.
+    """
+    from threading import Thread
+    Thread(target=target, args=args, daemon=True).start()
+
+
+def _dispatch_upload_followups(committed: CommittedDocument) -> None:
+    """Post-commit work for one ingested document.
+
+    DocumentIngestionService calls this only after the document's transaction
+    has committed and its connection has been closed, and treats any failure
+    here as a warning on an already-indexed result -- so neither follow-up can
+    turn a committed document into a reported ingestion failure. Both existing
+    follow-ups are preserved and receive the committed document id, the
+    service-sanitized filename, and the server-extracted text.
+
+    Both follow-ups are attempted even if the first one cannot be started, and
+    only the FACT of a failed start is recorded -- never the exception, its
+    text, or anything about the document. If either start failed, one generic
+    _PostCommitDispatchError is raised after both attempts.
+
+    Scope of what this can detect: only a failure to START a thread. Once a
+    follow-up thread is running, it owns its own errors (both targets already
+    swallow and log their own failures), and nothing that happens inside it
+    afterwards can be observed synchronously here or turned into a warning on
+    the ingestion result.
+    """
+    payload = (committed.document_id, committed.filename, committed.text)
+    failed_starts = 0
+    for follow_up in (generate_kb_from_document, _extract_document_insights):
+        try:
+            _start_background_task(follow_up, payload)
+        except Exception:
+            # Only the count is kept. The exception object is never bound,
+            # logged, re-raised, or attached to anything that leaves here.
+            failed_starts += 1
+
+    if failed_starts:
+        # Raised outside the except block on purpose: with no active exception
+        # context there is no implicit chaining, so the original error cannot
+        # ride along on __context__ into any caller's log.
+        print(f"[Upload] post-commit follow-ups not started: {failed_starts}")
+        raise _PostCommitDispatchError("post-commit follow-up could not be started")
+
+
+def _build_ingestion_service() -> DocumentIngestionService:
+    """Compose the verified ingestion service with this application's parts.
+
+    connect_to_postgres is passed as the connection factory specifically
+    because it already applies pgvector's register_vector() to every
+    connection it returns; the service inserts each embedding as a plain
+    list[float], which psycopg2 can only adapt to the `vector` type on a
+    registered connection. No second, unregistered psycopg2 connection path
+    is introduced anywhere in the upload flow.
+    """
+    return DocumentIngestionService(
+        connection_factory=connect_to_postgres,
+        embedding_provider=_EMBEDDING_PROVIDER,
+        embedding_profile=_EMBEDDING_PROFILE,
+        dispatch_after_commit=_dispatch_upload_followups,
+    )
+
+
 @app.post("/upload")
 async def upload_documents(
     file: UploadFile = File(None),
@@ -729,19 +853,19 @@ async def upload_documents(
     doi_url: Optional[str] = Form(None),
     auth_token: Optional[str] = Form(None),
 ):
-    uploader_id = None
-    if auth_token:
-        lookup_conn = connect_to_postgres()
-        if lookup_conn is not None:
-            try:
-                lookup_c = lookup_conn.cursor()
-                lookup_c.execute("SELECT id FROM users WHERE token = %s", (auth_token,))
-                lookup_row = lookup_c.fetchone()
-                if lookup_row:
-                    uploader_id = lookup_row[0]
-            finally:
-                lookup_conn.close()
+    """Thin transport adapter over DocumentIngestionService.
 
+    This route no longer parses, chunks, embeds, or writes anything itself. It
+    reads each uploaded file's ORIGINAL bytes exactly once, maps the form
+    fields onto the ingestion contract, hands the batch to the service in the
+    order the client sent it, and returns the service's batch envelope under
+    the service's own aggregated HTTP status (200 / 207 / 422 / 503). Each
+    document owns a separate transaction inside the service, so one file's
+    failure can never erase a sibling that already committed.
+    """
+    # The empty-request check comes first on purpose: a request with no files
+    # has nothing to ingest, so it must not open a database connection or run
+    # an uploader lookup even when an auth_token field was supplied.
     if file and files:
         upload_list = [file] + files
     elif files:
@@ -751,129 +875,38 @@ async def upload_documents(
     else:
         raise HTTPException(400, "No files provided")
 
-    results = []
-    for f in upload_list:
+    uploader_id = _resolve_uploader_id(auth_token)
+
+    metadata = DocumentMetadata(
+        author=author,
+        title=title,
+        publication_date=publication_date,
+        source=source,
+        doi_url=doi_url,
+    )
+
+    uploads = []
+    for upload_file in upload_list:
         try:
-            content = await f.read()
-            safe_filename = sanitize_filename(f.filename)
-            try:
-                result = extract_text_from_upload(safe_filename, content)
-                text = result.text
-            except ExtractionError as e:
-                raise HTTPException(status_code=e.http_status, detail=e.user_message)
-
-            if not text.strip():
-                results.append({"error": "Empty file", "filename": safe_filename})
-                continue
-
-            chunks = chunk_document(result)
-            chunk_texts = [chunk.text for chunk in chunks]
-
-            try:
-                embeddings = _EMBEDDING_PROVIDER.embed_documents(chunk_texts)
-            except EmbeddingProviderError as exc:
-                print(f"[Upload] Embedding failed for {safe_filename}: {type(exc).__name__}")
-                results.append({"error": "Embedding service is temporarily unavailable", "filename": safe_filename})
-                continue
-
-            if len(embeddings) != len(chunks):
-                print(
-                    f"[Upload] Embedding count mismatch for {safe_filename}: "
-                    f"{len(embeddings)} embeddings for {len(chunks)} chunks"
-                )
-                results.append({"error": "Embedding service returned an unexpected result", "filename": safe_filename})
-                continue
-
-            # Embedding and count validation are already complete above —
-            # the ingestion write connection only opens once both have
-            # succeeded, so an embedding failure never touches the database.
-            conn = connect_to_postgres()
-            if conn is None:
-                raise HTTPException(500, "Failed to connect to PostgreSQL")
-            try:
-                c = conn.cursor()
-                c.execute(
-                    """
-                    INSERT INTO documents
-                    (filename, upload_timestamp, content, author, title, publication_date, source, doi_url, user_id)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                    """,
-                    (
-                        f.filename,
-                        datetime.datetime.now().isoformat(),
-                        text,
-                        author,
-                        title,
-                        publication_date,
-                        source,
-                        doi_url,
-                        uploader_id,
-                    ),
-                )
-
-                doc_id = c.fetchone()[0]
-
-                for chunk, embedding in zip(chunks, embeddings):
-                    locator_json = build_chunk_locator(chunk, result.document_type)
-                    c.execute(
-                        """
-                        INSERT INTO document_chunks
-                        (document_id, chunk_text, chunk_index, embedding, page_start, page_end, locator_json)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        (
-                            doc_id,
-                            chunk.text,
-                            chunk.chunk_index,
-                            embedding,
-                            chunk.page_start,
-                            chunk.page_end,
-                            Json(locator_json),
-                        ),
-                    )
-
-                conn.commit()
-            finally:
-                conn.close()
-
-            results.append(
-                {
-                    "message": "Uploaded",
-                    "filename": safe_filename,
-                    "document_id": doc_id,
-                    "chunks_count": len(chunks),
-                }
+            # Read once: an UploadFile's stream cannot be replayed, and these
+            # are the original PDF/DOCX/TXT bytes the service must parse.
+            content = await upload_file.read()
+        except Exception as exc:
+            print(f"[Upload] could not read an uploaded file: {type(exc).__name__}")
+            # A non-bytes payload is rejected per-file by the service as an
+            # invalid upload, which keeps the rest of the batch intact.
+            content = None
+        uploads.append(
+            UploadDocument(
+                filename=upload_file.filename,
+                content=content,
+                metadata=metadata,
+                uploader_id=uploader_id,
             )
+        )
 
-            # Auto-generate KB entries from this document in the background
-            try:
-                from threading import Thread
-                Thread(
-                    target=generate_kb_from_document,
-                    args=(doc_id, safe_filename, text),
-                    daemon=True
-                ).start()
-            except Exception:
-                pass
-
-            # Auto-extract facts/keywords/entities for the admin Insights tab
-            try:
-                from threading import Thread
-                Thread(
-                    target=_extract_document_insights,
-                    args=(doc_id, safe_filename, text),
-                    daemon=True
-                ).start()
-            except Exception:
-                pass
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            results.append({"error": str(e), "filename": safe_filename})
-
-    return results
+    batch = _build_ingestion_service().ingest_batch(uploads)
+    return JSONResponse(status_code=batch.http_status, content=batch.to_dict())
 
 
 

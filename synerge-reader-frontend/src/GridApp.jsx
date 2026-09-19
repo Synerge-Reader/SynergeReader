@@ -2357,27 +2357,51 @@ export default function GridApp() {
           parsed = await parseTXT(file);
         }
 
-        // Send extracted text to backend
-        const fd  = new FormData();
-        const blob = new Blob([parsed.text], { type: "text/plain" });
-        fd.append("files", blob, file.name);
+        // Send the ORIGINAL file to the backend. The parse above stays local:
+        // it powers the preview, page rendering, text selection and suggested
+        // questions only. The server re-parses the original PDF/DOCX/TXT bytes
+        // itself, so wrapping parsed.text in a Blob here would destroy the very
+        // bytes ingestion needs.
+        const fd = new FormData();
+        fd.append("files", file, file.name);
         if (authToken) fd.append("auth_token", authToken);
 
-        let docId = null;
+        let result = null;
         try {
           const res = await fetch(`${BACKEND}/upload`, { method: "POST", body: fd });
-          if (res.ok) {
-            const data = await res.json();
-            if (Array.isArray(data) && data[0]?.document_id) docId = data[0].document_id;
-          }
+          // 207/422/503 still carry the structured batch envelope, so the body
+          // is read regardless of res.ok and only network/parse errors fall
+          // through to the catch below.
+          const data = await res.json().catch(() => null);
+          if (data && Array.isArray(data.results)) result = data.results[0] || null;
         } catch (_) {}
+
+        // Only a document the backend actually indexed may enter the UI —
+        // anything else would claim a searchable document that does not exist.
+        if (!result || result.status !== "indexed" || !result.document_id) {
+          // error_message comes from the ingestion contract's fixed safe-message
+          // table; it never carries server exception text.
+          setUploadErr(
+            result?.error_message
+              ? `${file.name}: ${result.error_message}`
+              : `${file.name} could not be indexed. Please try again.`
+          );
+          continue;
+        }
+
+        const docId        = result.document_id;
+        const backendName  = result.filename || file.name;
+        const chunksCount  = result.chunks_count || 0;
+        const docWarnings  = Array.isArray(result.warnings) ? result.warnings : [];
 
         const docType = /contract|agreement/i.test(file.name) ? "contract"
           : /code|statute|regulation/i.test(file.name) ? "statute" : "case";
 
         const newDoc = {
-          id:                docId || Date.now(),
+          id:                docId,
           name:              file.name,
+          backendFilename:   backendName,
+          chunksCount:       chunksCount,
           text:              parsed.text,
           pages:             parsed.pages,
           isPdf:             parsed.isPdf,
@@ -2397,7 +2421,7 @@ export default function GridApp() {
         setMainView("chat");
         setMessages(m => [...m, {
           id: Date.now(), role: "assistant", model: task?.model,
-          text: `"${file.name}" processed — ${parsed.pages} page${parsed.pages !== 1 ? "s" : ""} indexed. Ask a question or click a suggested question below.`,
+          text: `"${backendName}" indexed — ${chunksCount} searchable chunk${chunksCount !== 1 ? "s" : ""} from ${parsed.pages} page${parsed.pages !== 1 ? "s" : ""}.${docWarnings.length ? ` Note: ${docWarnings.join(" ")}` : ""} Ask a question or click a suggested question below.`,
           citations: [],
         }]);
 
