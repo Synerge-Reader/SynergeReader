@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import * as pdfjsLib from "pdfjs-dist/build/pdf";
 import { GlobalWorkerOptions } from "pdfjs-dist/build/pdf";
 import { renderAsync } from "docx-preview";
@@ -25,6 +25,11 @@ const TASK_MODES = [
   { id: "clause",     label: "Clause Extractor",   model: "llama3.1:8b",  color: "#0891b2" },
   { id: "summarize",  label: "Summarize",          model: "qwen3:latest", color: "#7c3aed" },
 ];
+
+// Model for the Compare modal's "explain what this change means" call — taken
+// from the same task-mode config as everything else instead of a literal tag,
+// so a model change is one edit in TASK_MODES.
+const EXPLAIN_MODEL = (TASK_MODES.find(t => t.id === "summarize") || {}).model || "llama3.1:8b";
 
 const MODEL_LABEL = {
   "llama3.1:8b":  "Llama 3.1 8B",
@@ -66,6 +71,9 @@ function IconPanel(props) {
 }
 function IconBook(props) {
   return (<svg {...iconBase} {...props}><path d="M4 19.5A2.5 2.5 0 016.5 17H20V4H6.5A2.5 2.5 0 004 6.5v13z" /><path d="M20 17v3H6.5A2.5 2.5 0 014 17.5" /></svg>);
+}
+function IconQuote(props) {
+  return (<svg {...iconBase} {...props} fill="currentColor" stroke="none"><path d="M7.17 6C4.86 7.86 3.5 10.4 3.5 13.2c0 2.7 1.6 4.3 3.6 4.3 1.8 0 3.1-1.4 3.1-3.1 0-1.6-1.1-2.9-2.7-3-.1-1.6.9-3.4 2.6-4.6L7.17 6zm9 0c-2.3 1.86-3.7 4.4-3.7 7.2 0 2.7 1.6 4.3 3.6 4.3 1.8 0 3.1-1.4 3.1-3.1 0-1.6-1.1-2.9-2.7-3-.1-1.6.9-3.4 2.6-4.6L16.17 6z" /></svg>);
 }
 function IconDatabase(props) {
   return (<svg {...iconBase} {...props}><ellipse cx="12" cy="5" rx="8" ry="3" /><path d="M4 5v14c0 1.66 3.58 3 8 3s8-1.34 8-3V5" /><path d="M4 12c0 1.66 3.58 3 8 3s8-1.34 8-3" /></svg>);
@@ -899,8 +907,14 @@ function PdfViewer({ doc, highlightPage }) {
           const pg = i + 1;
           const hi = pg === highlightPage;
           return (
+            // flexShrink:0 is load-bearing here: this container is a
+            // flex-column with overflow:auto, and without it the browser
+            // treats each card's automatic min-height as 0 and COMPRESSES
+            // every card to fit the container instead of letting them keep
+            // their natural height and scroll — on a many-page document that
+            // rendered as blank-looking, near-zero-height cards.
             <div key={pg} id={`vpg-${pg}`} style={{
-              width: "100%", maxWidth: "680px", background: "#fff",
+              width: "100%", maxWidth: "680px", flexShrink: 0, background: "#fff",
               border: hi ? "2px solid #3b82f6" : "1px solid #d1d5db",
               boxShadow: hi ? "0 0 0 3px rgba(59,130,246,.15)" : "0 1px 3px rgba(0,0,0,.06)",
               borderRadius: "2px", transition: "all .2s", overflow: "hidden",
@@ -915,10 +929,10 @@ function PdfViewer({ doc, highlightPage }) {
                   fontFamily: "'Courier New',monospace",
                   textTransform: "uppercase", letterSpacing: ".06em",
                   overflow: "hidden", textOverflow: "ellipsis",
-                  whiteSpace: "nowrap", maxWidth: "70%",
+                  whiteSpace: "nowrap", minWidth: 0, flex: "1 1 auto",
                 }}>{doc.name}</span>
-                <span style={{ fontSize: "9px", color: "#9ca3af", fontFamily: "'Courier New',monospace" }}>
-                  {pg} / {textPages.length}
+                <span style={{ fontSize: "9px", color: "#9ca3af", fontFamily: "'Courier New',monospace", whiteSpace: "nowrap", flexShrink: 0, marginLeft: "10px" }}>
+                  {doc.fromHistory ? "Extracted text · " : ""}{pg} / {textPages.length}
                 </span>
               </div>
               {hi && (
@@ -966,7 +980,7 @@ function PdfViewer({ doc, highlightPage }) {
       alignItems: "center", gap: "12px",
     }}>
       {Array.from({ length: pageCount }, (_, i) => i + 1).map(pg => (
-        <div key={pg} style={{ width: "100%", maxWidth: "680px" }}>
+        <div key={pg} style={{ width: "100%", maxWidth: "680px", flexShrink: 0 }}>
           <PdfCanvasPage
             pdfDoc={pdfDoc}
             pageNum={pg}
@@ -1117,9 +1131,11 @@ function DocxViewer({ doc }) {
     }}>
       <div style={{ display: "flex", flexDirection: "column", alignItems: "center", width: "100%" }}>
 
-        {/* toolbar */}
+        {/* toolbar — flexShrink:0 so a tall rendered document below it (in
+            the same overflow:auto flex column) can't compress this instead
+            of just scrolling past it. */}
         <div style={{
-          width: "100%", maxWidth: "780px",
+          width: "100%", maxWidth: "780px", flexShrink: 0,
           background: "#fff", border: "1px solid #d1d5db",
           borderBottom: "1px solid #e5e7eb",
           borderRadius: "2px 2px 0 0",
@@ -1140,7 +1156,7 @@ function DocxViewer({ doc }) {
         {/* loading */}
         {!rendered && !error && (
           <div style={{
-            width: "100%", maxWidth: "780px", background: "#fff",
+            width: "100%", maxWidth: "780px", flexShrink: 0, background: "#fff",
             border: "1px solid #d1d5db", borderTop: "none",
             padding: "60px", display: "flex", alignItems: "center", justifyContent: "center",
           }}>
@@ -1153,7 +1169,7 @@ function DocxViewer({ doc }) {
         {/* error */}
         {error && (
           <div style={{
-            width: "100%", maxWidth: "780px", background: "#fff",
+            width: "100%", maxWidth: "780px", flexShrink: 0, background: "#fff",
             border: "1px solid #fca5a5", borderTop: "none",
             padding: "20px", color: "#991b1b", fontSize: "12px",
           }}>
@@ -1161,11 +1177,14 @@ function DocxViewer({ doc }) {
           </div>
         )}
 
-        {/* docx-preview mount point — height grows with content, no overflow:hidden */}
+        {/* docx-preview mount point — height grows with content, no
+            overflow:hidden. flexShrink:0 for the same reason as the toolbar
+            above: this is the tall one, so it's the one most at risk of
+            being silently compressed instead of scrolling. */}
         <div
           ref={containerRef}
           style={{
-            width: "100%", maxWidth: "780px",
+            width: "100%", maxWidth: "780px", flexShrink: 0,
             background: "#fff",
             border: "1px solid #d1d5db",
             borderTop: "none",
@@ -1193,16 +1212,23 @@ function DocxViewer({ doc }) {
         .docx-preview section.docx:last-child { border-bottom: none !important; }
         .docx-preview { font-family: Arial, sans-serif; width: 100% !important; }
         .docx-preview img { max-width: 100%; height: auto; }
-        /* Word tables carry fixed pixel/point widths from the original document —
-           without this they overflow the panel and get clipped on the right edge. */
+        /* Word tables carry fixed pixel/point column widths from the original
+           document. Squeezing them to the panel's width (table-layout:fixed +
+           width:100%) used to make wide tables illegible — columns crushed,
+           text broken mid-word. Instead let the table keep its authored
+           width and become its own horizontally-scrollable region (the same
+           display:block + overflow-x trick GitHub uses for markdown tables),
+           so every column stays readable and reachable via a scrollbar
+           without dragging the surrounding paragraph text sideways with it. */
         .docx-preview table {
-          table-layout: fixed !important;
-          width: 100% !important;
+          display: block !important;
+          overflow-x: auto !important;
+          table-layout: auto !important;
+          width: max-content !important;
           max-width: 100% !important;
           box-sizing: border-box !important;
         }
         .docx-preview table td, .docx-preview table th {
-          word-break: break-word !important;
           overflow-wrap: break-word !important;
           box-sizing: border-box !important;
         }
@@ -1292,6 +1318,12 @@ function Composer({ input, setInput, onSend, onAttach, uploading, disabled, plac
 }
 
 const ALL_DOCS = "__all_docs__"; // sentinel activeDocId meaning "combined across every uploaded document"
+// How much of EACH document the combined ("All Documents") requests send: the
+// opening portion only, ~16k chars split across the set (never below 2k per doc).
+// One definition so the chat path, the tool path and the summary caption agree.
+function combinedPerDocLimit(docCount) {
+  return Math.max(2000, Math.min(8000, Math.floor(16000 / Math.max(docCount, 1))));
+}
 
 // ── Small shared utilities for the Knowledge Base & Chat History views ──────
 function timeAgo(iso) {
@@ -1401,6 +1433,51 @@ function extractJson(text, kind) {
   try { return JSON.parse(m[0]); } catch { return null; }
 }
 
+// ── word-level diff (LCS-based) — powers the "Compare selections" redline
+// view. Tokenizes on whitespace boundaries (keeping the trailing whitespace
+// attached to each word so re-joining the tokens reproduces the original
+// spacing exactly), finds the longest common subsequence of tokens between
+// the two texts, then walks both sequences against it to mark every token
+// as unchanged / removed (only in `a`) / added (only in `b`). O(n·m) on
+// token count, which is trivial at paragraph/clause length (selections are
+// already capped at 4000 chars before reaching here).
+function tokenizeForDiff(text) {
+  return (text.match(/\S+\s*/g) || []);
+}
+function computeWordDiff(a, b) {
+  const tokensA = tokenizeForDiff(a);
+  const tokensB = tokenizeForDiff(b);
+  const n = tokensA.length, m = tokensB.length;
+  // dp[i][j] = LCS length of tokensA[i:] and tokensB[j:] (trimmed comparison
+  // ignores trailing whitespace so "word " and "word\n" still match).
+  const norm = t => t.trim();
+  const dp = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = norm(tokensA[i]) === norm(tokensB[j])
+        ? dp[i + 1][j + 1] + 1
+        : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const out = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (norm(tokensA[i]) === norm(tokensB[j])) {
+      out.push({ type: "equal", text: tokensB[j] });
+      i++; j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      out.push({ type: "removed", text: tokensA[i] });
+      i++;
+    } else {
+      out.push({ type: "added", text: tokensB[j] });
+      j++;
+    }
+  }
+  while (i < n) { out.push({ type: "removed", text: tokensA[i] }); i++; }
+  while (j < m) { out.push({ type: "added", text: tokensB[j] }); j++; }
+  return out;
+}
+
 const SEVERITY_TONE = { High: "suspended", Medium: "corrected", Low: "active" };
 const CARD_SHADOW = "0 1px 2px rgba(16,24,40,.04), 0 1px 3px rgba(16,24,40,.05)";
 const toolCardStyle = { background: "#fff", border: "1px solid #eef0f3", borderRadius: "14px", padding: "16px", boxShadow: CARD_SHADOW };
@@ -1409,6 +1486,194 @@ const rerunBtnStyle = {
   borderRadius: "9px", padding: "7px 13px", fontSize: "12px", fontWeight: 600, color: "#374151",
   cursor: "pointer", fontFamily: UI_FONT, flexShrink: 0, whiteSpace: "nowrap",
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COMPARE / DIFF MODAL — redlines every queued selection against the first
+// ("baseline"), word by word: struck-through red = only in the baseline,
+// underlined green = only in this selection. Pure client-side diff, no
+// backend round-trip — it's just text already sitting in front of the user.
+// ─────────────────────────────────────────────────────────────────────────────
+function DiffModal({ items, onClose, explainDiffPair }) {
+  const [baseIdx, setBaseIdx] = useState(0);
+  const base = items[baseIdx] || items[0];
+  const others = items.filter((_, i) => i !== baseIdx);
+
+  // The LCS diff is O(n·m) in words, so compute it once per (items, baseline)
+  // instead of on every render — the modal re-renders whenever an AI
+  // explanation starts, finishes or fails.
+  const diffs = useMemo(() => {
+    const b = items[baseIdx] || items[0];
+    const out = {};
+    items.forEach((it, i) => { if (i !== baseIdx) out[it.id] = computeWordDiff(b?.text || "", it.text); });
+    return out;
+  }, [items, baseIdx]);
+
+  // AI explanations are per (baseline, candidate) pair — keyed by the
+  // candidate's id. Resetting on baseline change is correct: every pair's
+  // meaning changes when the baseline does, so a stale explanation from a
+  // different baseline would be actively misleading, not just outdated.
+  const [explanations, setExplanations] = useState({}); // { [candidateId]: { loading, text, error } }
+  useEffect(() => { setExplanations({}); }, [baseIdx]);
+
+  const handleExplain = useCallback(async (candidate) => {
+    setExplanations(prev => ({ ...prev, [candidate.id]: { loading: true, text: null, error: null } }));
+    try {
+      const text = await explainDiffPair(base, candidate);
+      setExplanations(prev => ({ ...prev, [candidate.id]: { loading: false, text, error: null } }));
+    } catch (e) {
+      setExplanations(prev => ({ ...prev, [candidate.id]: { loading: false, text: null, error: e.message || "Could not explain this difference." } }));
+    }
+  }, [base, explainDiffPair]);
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, background: "rgba(15,23,42,.5)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        zIndex: 200, padding: "24px", fontFamily: UI_FONT,
+      }}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        style={{
+          width: "100%", maxWidth: "760px", maxHeight: "85vh", display: "flex", flexDirection: "column",
+          background: "#fff", borderRadius: "16px", overflow: "hidden",
+          boxShadow: "0 24px 64px rgba(15,23,42,.35)",
+        }}
+      >
+        {/* header */}
+        <div style={{
+          flexShrink: 0, padding: "18px 22px", borderBottom: "1px solid #f0f0f0",
+          display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "16px",
+        }}>
+          <div>
+            <div style={{ fontSize: "15.5px", fontWeight: 700, color: "#111827" }}>Compare selections</div>
+            <div style={{ fontSize: "12px", color: "#6b7280", marginTop: "2px" }}>
+              {items.length} selections · redlined against the baseline below
+            </div>
+          </div>
+          <button onClick={onClose} style={{
+            background: "none", border: "none", color: "#6b7280", cursor: "pointer",
+            padding: "5px", borderRadius: "7px", display: "flex", flexShrink: 0,
+          }}><IconX width={18} height={18} /></button>
+        </div>
+
+        {/* baseline picker + legend */}
+        <div style={{
+          flexShrink: 0, padding: "12px 22px", borderBottom: "1px solid #f0f0f0",
+          display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", flexWrap: "wrap",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+            <span style={{ fontSize: "11.5px", color: "#6b7280", fontWeight: 600 }}>Baseline:</span>
+            {items.map((item, i) => (
+              <button key={item.id} onClick={() => setBaseIdx(i)} style={{
+                fontSize: "11.5px", fontWeight: 600, padding: "5px 11px", borderRadius: "20px",
+                border: `1px solid ${i === baseIdx ? "#93c5fd" : "#e5e7eb"}`,
+                background: i === baseIdx ? "#eff6ff" : "#fff",
+                color: i === baseIdx ? "#1d4ed8" : "#6b7280",
+                cursor: "pointer", fontFamily: UI_FONT, maxWidth: "160px",
+                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+              }} title={item.docName}>{`#${i + 1} ${item.docName || "Selection"}`}</button>
+            ))}
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "12px", fontSize: "11px", color: "#6b7280", flexShrink: 0 }}>
+            <span style={{ display: "flex", alignItems: "center", gap: "5px" }}>
+              <span style={{ width: "10px", height: "10px", borderRadius: "3px", background: "#fecaca", display: "inline-block" }} />Removed
+            </span>
+            <span style={{ display: "flex", alignItems: "center", gap: "5px" }}>
+              <span style={{ width: "10px", height: "10px", borderRadius: "3px", background: "#bbf7d0", display: "inline-block" }} />Added
+            </span>
+          </div>
+        </div>
+
+        {/* redlined comparisons */}
+        <div style={{ flex: 1, overflow: "auto", padding: "18px 22px 22px" }}>
+          <div style={{ fontSize: "10.5px", fontWeight: 700, letterSpacing: ".05em", textTransform: "uppercase", color: "#9ca3af", marginBottom: "6px" }}>
+            Baseline — {base?.docName || "Selection"}
+          </div>
+          <div style={{
+            fontSize: "13px", lineHeight: "1.7", color: "#374151", background: "#f8fafc",
+            border: "1px solid #eef0f3", borderRadius: "10px", padding: "12px 14px", marginBottom: "20px",
+            whiteSpace: "pre-wrap", overflowWrap: "anywhere",
+          }}>{base?.text}</div>
+
+          {others.map((item, idx) => {
+            const diff = diffs[item.id] || [];
+            const explanation = explanations[item.id];
+            return (
+              <div key={item.id} style={{ marginBottom: idx === others.length - 1 ? 0 : "20px" }}>
+                <div style={{ fontSize: "10.5px", fontWeight: 700, letterSpacing: ".05em", textTransform: "uppercase", color: "#9ca3af", marginBottom: "6px" }}>
+                  vs. {item.docName || "Selection"}
+                </div>
+                <div style={{
+                  fontSize: "13px", lineHeight: "1.8", color: "#374151",
+                  border: "1px solid #eef0f3", borderRadius: explanation ? "10px 10px 0 0" : "10px",
+                  padding: "12px 14px",
+                  whiteSpace: "pre-wrap", overflowWrap: "anywhere",
+                }}>
+                  {diff.map((tok, i) => tok.type === "equal" ? (
+                    <span key={i}>{tok.text}</span>
+                  ) : tok.type === "removed" ? (
+                    <span key={i} style={{ background: "#fee2e2", color: "#991b1b", textDecoration: "line-through", textDecorationColor: "#dc2626" }}>{tok.text}</span>
+                  ) : (
+                    <span key={i} style={{ background: "#dcfce7", color: "#166534", textDecoration: "underline", textDecorationColor: "#16a34a" }}>{tok.text}</span>
+                  ))}
+                </div>
+
+                {/* AI explanation — the redline above shows WHICH words
+                    changed; this is what the model thinks that change
+                    actually MEANS (legal effect, who it favors, what risk
+                    moved), fetched on demand per pair rather than
+                    automatically for every comparison in the queue. */}
+                {!explanation && (
+                  <button
+                    onClick={() => handleExplain(item)}
+                    style={{
+                      display: "flex", alignItems: "center", gap: "6px", width: "100%",
+                      background: "#faf5ff", border: "1px solid #eef0f3", borderTop: "none",
+                      borderRadius: "0 0 10px 10px", padding: "8px 14px", cursor: "pointer",
+                      fontSize: "11.5px", fontWeight: 600, color: "#7c3aed", fontFamily: UI_FONT,
+                    }}
+                    onMouseEnter={e => e.currentTarget.style.background = "#f3e8ff"}
+                    onMouseLeave={e => e.currentTarget.style.background = "#faf5ff"}
+                  ><IconWand width={12} height={12} /> Explain what this change means</button>
+                )}
+                {explanation?.loading && (
+                  <div style={{
+                    display: "flex", alignItems: "center", gap: "7px",
+                    background: "#faf5ff", border: "1px solid #eef0f3", borderTop: "none",
+                    borderRadius: "0 0 10px 10px", padding: "10px 14px",
+                    fontSize: "12px", color: "#7c3aed", animation: "pulse 1.4s ease-in-out infinite",
+                  }}>
+                    <IconWand width={12} height={12} /> Reading what changed…
+                  </div>
+                )}
+                {explanation?.error && (
+                  <div style={{
+                    background: "#fef2f2", border: "1px solid #fecaca", borderTop: "none",
+                    borderRadius: "0 0 10px 10px", padding: "10px 14px",
+                    fontSize: "12px", color: "#991b1b",
+                  }}>{explanation.error}</div>
+                )}
+                {explanation?.text && (
+                  <div style={{
+                    background: "#faf5ff", border: "1px solid #eef0f3", borderTop: "none",
+                    borderRadius: "0 0 10px 10px", padding: "10px 14px",
+                    display: "flex", alignItems: "flex-start", gap: "8px",
+                  }}>
+                    <IconWand width={13} height={13} style={{ color: "#7c3aed", flexShrink: 0, marginTop: "2px" }} />
+                    <div style={{ fontSize: "12.5px", lineHeight: "1.6", color: "#4c1d95" }}>{explanation.text}</div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TASK-MODE TOOL PANELS — each mode gets a purpose-built view instead of a
@@ -1682,6 +1947,11 @@ function SummaryToolView({ summaryResult, summaryLength, setSummaryLength, onRun
         } />
 
       {toolLoading && !summaryResult && <LoadingCard text="Reading the document…" />}
+      {summaryResult?.parsed && summaryResult.combinedDocs > 1 && (
+        <div style={{ fontSize: "11.5px", color: "#6b7280", background: "#f8fafc", border: "1px solid #eef0f3", borderRadius: "10px", padding: "8px 12px", marginBottom: "12px", lineHeight: "1.5" }}>
+          Combined brief across {summaryResult.combinedDocs} documents, built from roughly the first {summaryResult.perDocChars.toLocaleString()} characters of each — anything later in a long document isn't reflected. Items name the document they came from.
+        </div>
+      )}
       {summaryResult?.parsed && (
         <div style={{ display: "grid", gap: "12px" }}>
           <SummarySection title="Parties Involved" items={summaryResult.parties} icon={IconUser} />
@@ -1762,6 +2032,9 @@ function ToolPanel(props) {
 export default function GridApp() {
   const [docs,        setDocs]        = useState([]);
   const [activeDocId, setActiveDocId] = useState(null);
+  const [deletingDocId, setDeletingDocId] = useState(null); // id currently being deleted (sidebar × button)
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null); // id whose × has been clicked once and is awaiting a second click to confirm
+  const confirmTimerRef = useRef(null);
   const [activeTask,  setActiveTask]  = useState("research");
   const [messages,    setMessages]    = useState([]);
   const [input,       setInput]       = useState("");
@@ -1871,6 +2144,100 @@ export default function GridApp() {
   const isAllScope = activeDocId === ALL_DOCS;
   const activeDoc  = docs.find(d => d.id === activeDocId) || null;
 
+  // ── header search bar — admin-only for now, searches the signed-in admin's
+  // own document history (not just what's uploaded this session) and opens
+  // a result straight into the chat/source panel. ─────────────────────────
+  const [docSearchQuery,   setDocSearchQuery]   = useState("");
+  const [docSearchResults, setDocSearchResults] = useState([]);
+  const [docSearchOpen,    setDocSearchOpen]    = useState(false);
+  const [docSearchLoading, setDocSearchLoading] = useState(false);
+  const [docSearchOpening, setDocSearchOpening] = useState(null); // id currently being opened
+  const docSearchRef = useRef(null);
+
+  useEffect(() => {
+    if (!docSearchOpen || !currentUser?.is_admin) return;
+    // `cancelled` flips in the cleanup, i.e. as soon as the query, the token
+    // or the user changes (or the effect unmounts) — so a slow response for an
+    // older query, or one that lands after a logout / account switch, can't
+    // overwrite newer results or show another account's documents.
+    let cancelled = false;
+    const t = setTimeout(() => {
+      setDocSearchLoading(true);
+      fetch(`${BACKEND}/me/documents/search?q=${encodeURIComponent(docSearchQuery)}`, {
+        headers: { Authorization: `Bearer ${authToken || ""}` },
+      })
+        .then(r => r.ok ? r.json() : [])
+        .then(data => { if (!cancelled) setDocSearchResults(Array.isArray(data) ? data : []); })
+        .catch(() => { if (!cancelled) setDocSearchResults([]); })
+        .finally(() => { if (!cancelled) setDocSearchLoading(false); });
+    }, 250); // debounce — avoid firing a request on every keystroke
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [docSearchQuery, docSearchOpen, authToken, currentUser]);
+
+  useEffect(() => {
+    if (!docSearchOpen) return;
+    const onDown = e => { if (docSearchRef.current && !docSearchRef.current.contains(e.target)) setDocSearchOpen(false); };
+    const onKey  = e => { if (e.key === "Escape") setDocSearchOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [docSearchOpen]);
+
+  const openSearchedDocument = useCallback(async (result) => {
+    // Already open this session (e.g. re-searching something just uploaded) —
+    // just switch to it instead of adding a duplicate.
+    const existing = docs.find(d => d.id === result.id);
+    if (existing) {
+      setActiveDocId(existing.id);
+      setHlPage(null);
+      setSourceOpen(true);
+      setMainView("chat");
+      setDocSearchOpen(false);
+      setDocSearchQuery("");
+      return;
+    }
+    setDocSearchOpening(result.id);
+    try {
+      const res = await fetch(`${BACKEND}/documents/${result.id}/content`, {
+        headers: { Authorization: `Bearer ${authToken || ""}` },
+      });
+      if (!res.ok) throw new Error("Could not open that document");
+      const data = await res.json();
+      const words = (data.content || "").split(/\s+/).filter(Boolean).length;
+      const newDoc = {
+        id: data.id,
+        persisted: true,
+        fromHistory: true, // extracted text only — no original file, no real pages/layout
+        name: data.filename,
+        text: data.content || "",
+        pages: Math.max(1, Math.ceil(words / 350)),
+        isPdf: false,
+        isDocx: false,
+        htmlPages: null,
+        html: null,
+        arrayBuffer: null,
+        convertedFromDocx: false,
+        type: /contract|agreement/i.test(data.filename) ? "contract"
+          : /code|statute|regulation/i.test(data.filename) ? "statute" : "case",
+      };
+      setDocs(prev => [...prev, newDoc]);
+      setActiveDocId(newDoc.id);
+      setHlPage(null);
+      setSourceOpen(true);
+      setMainView("chat");
+      setNotification(`Reopened "${data.filename}" from your document history.`);
+    } catch (err) {
+      setNotification(err.message || "Could not open that document.");
+    } finally {
+      setDocSearchOpening(null);
+      setDocSearchOpen(false);
+      setDocSearchQuery("");
+    }
+  }, [docs, authToken]);
+
   // ── "select text in the source panel, ask about just that" ────────────────
   // selPopover: the small floating "Ask about selection" button shown right
   // after the user releases a text selection. selectedContext: what they
@@ -1882,6 +2249,35 @@ export default function GridApp() {
   const [selectedContext, setSelectedContext] = useState(null); // { text, docName } or null
   const sourcePanelRef = useRef(null);
 
+  // ── "compare selections" — queue up 2+ highlighted passages (from the
+  // same or different documents) and view a word-level redline diff between
+  // a baseline and each of the others. compareQueue holds what's been added
+  // via the popover's "Add to compare" button; the floating tray (rendered
+  // near the source panel) shows the queue and opens compareModalOpen once
+  // there's enough to diff. Capped at 5 so the diff view stays readable.
+  const [compareQueue,     setCompareQueue]     = useState([]); // [{ id, text, docName }]
+  const COMPARE_MAX = 5;
+
+  const handleAddToCompare = useCallback((text, docName, docId) => {
+    setCompareQueue(prev => {
+      if (prev.length >= COMPARE_MAX) {
+        setNotification(`You can compare up to ${COMPARE_MAX} selections at once — remove one first.`);
+        return prev;
+      }
+      const next = [...prev, { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, text: text.slice(0, 4000), docName, docId }];
+      setNotification(
+        next.length === 1
+          ? "Added to comparison — select one more passage to diff."
+          : `Added to comparison (${next.length}/${COMPARE_MAX}).`
+      );
+      return next;
+    });
+  }, []);
+  const handleRemoveFromCompare = useCallback(id => {
+    setCompareQueue(prev => prev.filter(item => item.id !== id));
+  }, []);
+  const [compareModalOpen, setCompareModalOpen] = useState(false);
+
   const handleSourceMouseUp = useCallback(() => {
     const sel = window.getSelection();
     const text = sel ? sel.toString().trim() : "";
@@ -1891,9 +2287,17 @@ export default function GridApp() {
     const rect = sel.getRangeAt(0).getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) { setSelPopover(null); return; }
     const wrapperRect = sourcePanelRef.current.getBoundingClientRect();
+    // Clamp x so the 4-icon toolbar (~155px wide) can't get cut off against
+    // the panel's edges when the selection sits near the left/right margin
+    // of a narrower source panel — margin is ~half that width plus a little
+    // buffer, so the clamped center still leaves the full pill on screen
+    // even at the panel's ~280px minimum width.
+    const HALF_POPOVER = 85;
+    const rawX = rect.left - wrapperRect.left + rect.width / 2;
+    const clampedX = Math.min(Math.max(rawX, HALF_POPOVER), Math.max(wrapperRect.width - HALF_POPOVER, HALF_POPOVER));
     setSelPopover({
       text: text.slice(0, 6000), // guard against pathological whole-document selections
-      x: rect.left - wrapperRect.left + rect.width / 2,
+      x: clampedX,
       y: rect.top - wrapperRect.top,
     });
   }, []);
@@ -2377,6 +2781,7 @@ export default function GridApp() {
 
         const newDoc = {
           id:                docId || Date.now(),
+          persisted:         !!docId, // false = the /upload call failed; nothing to delete server-side
           name:              file.name,
           text:              parsed.text,
           pages:             parsed.pages,
@@ -2421,6 +2826,71 @@ export default function GridApp() {
     setUploading(false);
     if (fileInputRef.current) fileInputRef.current.value = "";
   }, [task, docs.length, authToken]);
+
+  // ── remove a document — the small × button on each sidebar row.
+  //
+  // Two clicks: the first arms the button ("Delete?" for a few seconds), the
+  // second confirms — deletion is permanent, so a stray click shouldn't do it.
+  // The server call is DELETE /me/documents/{id} with the caller's bearer
+  // token: it removes only a document that belongs to the signed-in user,
+  // by id (never by filename, which can be duplicated or belong to someone
+  // else), and only THEN is the doc dropped locally — a failed request leaves
+  // it in the list instead of silently vanishing while still in the database.
+  // Docs that never made it to the server (upload failed to persist) have
+  // nothing to delete remotely and are just removed from the list.
+  const removeDocLocally = useCallback((doc) => {
+    const next = docs.filter(d => d.id !== doc.id);
+    setDocs(next);
+    setActiveDocId(current => {
+      if (current === doc.id) return next[0]?.id ?? null;
+      if (current === ALL_DOCS && next.length <= 1) return next[0]?.id ?? null;
+      return current;
+    });
+    // Derived client state that quotes this document: queued comparison
+    // selections and a pending "Ask about this selection" chip.
+    setCompareQueue(prev => prev.filter(item => item.docId !== doc.id));
+    setSelectedContext(prev => (prev && prev.docName === doc.name ? null : prev));
+    setSelPopover(null);
+  }, [docs]);
+
+  const handleDeleteDoc = useCallback(async (doc, e) => {
+    e.stopPropagation();
+    if (deletingDocId) return;
+
+    if (doc.persisted === false) { removeDocLocally(doc); return; }
+
+    if (confirmDeleteId !== doc.id) {
+      clearTimeout(confirmTimerRef.current);
+      setConfirmDeleteId(doc.id);
+      confirmTimerRef.current = setTimeout(() => setConfirmDeleteId(null), 5000);
+      return;
+    }
+    clearTimeout(confirmTimerRef.current);
+    setConfirmDeleteId(null);
+
+    setDeletingDocId(doc.id);
+    try {
+      const res = await fetch(`${BACKEND}/me/documents/${doc.id}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${authToken || ""}` },
+      });
+      if (res.status === 404) {
+        // Not found in THIS account — already deleted elsewhere, or uploaded
+        // before signing in. Nothing more the server can do; drop it from the
+        // list and say exactly that rather than claiming a delete happened.
+        removeDocLocally(doc);
+        setNotification(`"${doc.name}" wasn't found in your account, so it was only removed from this list.`);
+        return;
+      }
+      if (!res.ok) throw new Error(`Could not delete "${doc.name}" (${res.status})`);
+      removeDocLocally(doc);
+      setNotification(`Deleted "${doc.name}".`);
+    } catch (err) {
+      setNotification(err.message || `Could not delete "${doc.name}".`);
+    } finally {
+      setDeletingDocId(null);
+    }
+  }, [deletingDocId, confirmDeleteId, authToken, removeDocLocally]);
 
   async function fetchSuggestions(snippet, filename, model) {
     setSuggestions([]);
@@ -2480,7 +2950,13 @@ export default function GridApp() {
   }
 
   // ── ask / stream ──────────────────────────────────────────────────────────
-  const sendMessage = useCallback(async (text, taskOverride) => {
+  // contextOverride lets a caller fire a message with a selection that hasn't
+  // (and won't) go through setSelectedContext first — e.g. the source panel's
+  // "Search sources" action, which sends its own canned question immediately
+  // rather than waiting for the user to type one. Reading selectedContext from
+  // state right after setting it would still see the stale pre-update value,
+  // so an explicit override sidesteps that instead of relying on state timing.
+  const sendMessage = useCallback(async (text, taskOverride, contextOverride, flags) => {
     if (!text.trim() || typing) return;
 
     if (abortRef.current) abortRef.current.abort();
@@ -2499,7 +2975,7 @@ export default function GridApp() {
     // Consume the pending selection (if any) for this one message, then clear
     // it — it shouldn't silently carry over and get attached to a later,
     // unrelated question.
-    const askedContext = selectedContext;
+    const askedContext = contextOverride !== undefined ? contextOverride : selectedContext;
     const userMsg = { id: Date.now(), role: "user", text, scope, context: askedContext };
     setMessages(m => [...m, userMsg]);
     setInput("");
@@ -2508,13 +2984,17 @@ export default function GridApp() {
 
     const prefix = effectiveTaskId !== "research" ? TASK_PROMPTS[effectiveTaskId] + "\n\n" : "";
     const msgId  = Date.now() + 1;
-    setMessages(m => [...m, { id: msgId, role: "assistant", model: effectiveTask?.model, text: "", citations: [], streaming: true }]);
+    setMessages(m => [...m, { id: msgId, role: "assistant", model: effectiveTask?.model, text: "", citations: [], streaming: true, unverified: !!flags?.unverified }]);
 
     // Combined mode sends the exact text of every doc the user uploaded in this
     // session, so answers are scoped to those documents only — not the shared,
     // unfiltered vector index, which can contain unrelated documents other users uploaded.
-    const perDocLimit = Math.max(2000, Math.min(8000, Math.floor(16000 / Math.max(docs.length, 1))));
-    const combinedSelections = isAllScope
+    const perDocLimit = combinedPerDocLimit(docs.length);
+    // An explicit selection is the user's chosen context, so it wins: the
+    // backend ranks `selections` ahead of `selected_text`, which meant the
+    // combined-document bundle silently replaced a highlighted passage (the
+    // quote shown in the chat said one thing, the model saw another).
+    const combinedSelections = isAllScope && !askedContext?.text
       ? docs.map(d => ({
           id:            String(d.id),
           document_name: d.name,
@@ -2590,11 +3070,41 @@ export default function GridApp() {
     setTyping(false);
   }, [activeTask, activeDoc, isAllScope, docs.length, task, typing, handleCitation, authToken, selectedContext]);
 
+  // "Analyze related legal issues" (tooltip; formerly "Search sources") — the second option on the source panel's selection
+  // popover. Fires straight off, using the Related Precedents system prompt
+  // for just this one message (via taskOverride) without switching the app's
+  // actual Task Mode, and passes the selection as an explicit contextOverride
+  // so it doesn't depend on selectedContext state having landed yet.
+  const handleSearchSelectionSources = useCallback((text, docName) => {
+    sendMessage(
+      "Identify the legal issues raised by this passage and discuss doctrines or well-known precedents that may relate to it. " +
+      "This is AI analysis, not a lookup of verified sources: begin with one short sentence saying so, and if you are not certain a case " +
+      "or citation exists, say that plainly instead of presenting it as authority.",
+      "precedents",
+      { text, docName },
+      { unverified: true }, // UI adds a fixed caveat under the answer — not left to the model to remember
+    );
+  }, [sendMessage]);
+
+  // "Summarize" — the third option on the selection popover. Same
+  // fire-immediately pattern as Search sources, forced onto the plain
+  // Research & Q&A prompt (no task-mode system prompt prefix) so the answer
+  // is a short, plain-English summary rather than the structured
+  // parties/dates/obligations format the Summarize *task mode* uses for
+  // whole documents — that shape doesn't fit a single highlighted passage.
+  const handleSummarizeSelection = useCallback((text, docName) => {
+    sendMessage(
+      "Summarize this highlighted passage in 2-4 clear, plain-English sentences. Focus on its practical effect, not a word-for-word restatement.",
+      "research",
+      { text, docName },
+    );
+  }, [sendMessage]);
+
   // ── task-mode tools — non-streaming, structured-output calls that reuse the
   // same /ask + document-context machinery as chat, but ask the model for JSON
   // and render the parsed result as a purpose-built view instead of a chat bubble.
   const runToolQuery = useCallback(async (promptText, modelOverride) => {
-    const perDocLimit = Math.max(2000, Math.min(8000, Math.floor(16000 / Math.max(docs.length, 1))));
+    const perDocLimit = combinedPerDocLimit(docs.length);
     const combinedSelections = isAllScope
       ? docs.map(d => ({
           id: String(d.id), document_name: d.name,
@@ -2630,6 +3140,53 @@ export default function GridApp() {
     }
     return full;
   }, [docs, isAllScope, activeDoc, task, authToken]);
+
+  // ── AI explanation of a diff — the Compare modal's redline is a literal
+  // word-level diff (exact wording changed), which doesn't say anything
+  // about what those changes actually MEAN. This sends the two passages
+  // being compared as their own explicit `selections` (independent of
+  // whatever document is currently open/active) and asks the model to
+  // explain the substance of the difference — legal effect, who it favors,
+  // what risk it shifts — not just restate which words moved.
+  const explainDiffPair = useCallback(async (baseline, candidate) => {
+    const res = await fetch(`${BACKEND}/ask`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        question:
+          "Selection 1 is the baseline; Selection 2 is being compared against it. " +
+          "Explain in plain English what actually changed in MEANING between them — not which " +
+          "words differ (that's already shown separately), but the practical and, if this is a " +
+          "legal passage, legal effect: what right, obligation, deadline, or risk shifted, and " +
+          "which party the change favors or disfavors. If the two say essentially the same thing " +
+          "despite different wording, say so plainly. Keep it to 2-4 sentences.",
+        model: EXPLAIN_MODEL,
+        active_document_name: null,
+        selected_text: "",
+        selections: [
+          { id: String(baseline.id || "baseline"), document_name: baseline.docName || "Selection 1", text: baseline.text },
+          { id: String(candidate.id || "candidate"), document_name: candidate.docName || "Selection 2", text: candidate.text },
+        ],
+        auth_token: authToken || null,
+      }),
+    });
+    if (!res.ok) throw new Error(`Server error (${res.status})`);
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let full = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const raw = dec.decode(value);
+      if (raw.includes("__ENTRY_ID__")) continue;
+      if (/^__(SEARCHING|READY|CONTEXT)/.test(raw.trim())) continue;
+      if (raw.startsWith("__ERROR__")) {
+        throw new Error(raw.replace(/^__ERROR__/, "").replace(/__$/, "").trim() || "Backend error");
+      }
+      full += raw;
+    }
+    return full.trim();
+  }, [authToken]);
 
   const runArgumentTool = useCallback(async (claim) => {
     if (!claim.trim() || toolLoading) return;
@@ -2686,17 +3243,36 @@ export default function GridApp() {
     if (toolLoading) return;
     setToolLoading(true); setToolError("");
     const lengthInstruction = { brief: "very brief (2-3 sentences per section)", standard: "standard", detailed: "thorough and detailed" }[length] || "standard";
+    // In combined ("All Documents") scope the context below is really N
+    // separate documents concatenated under their own "Document file: ..."
+    // headers. The original prompt only said "summary of the document"
+    // (singular), so the model would often stop after the first one. This
+    // version names the count and requires every document to be CONSIDERED —
+    // but not to appear in every section: a contract with no dates just has
+    // nothing to add under Key Dates, and forcing an entry there would make
+    // the model invent one. Each item carries its source file name so it can
+    // be checked. Only the opening of each document is sent (see
+    // combinedPerDocLimit), which the prompt says so the model doesn't imply
+    // it read further.
+    const N = docs.length;
+    const scopeInstruction = isAllScope
+      ? `Produce a ${lengthInstruction} combined summary. The context below contains ${N} separate documents, each introduced by its own "Document file: ..." header, and only the opening portion of each document is provided. ` +
+        `Work through the documents ONE AT A TIME, in the order given, and for each one record every party, date, obligation and notable clause that its text explicitly states. ` +
+        `Do not skip a document, and do not drop stated items just to keep the answer short — the finished lists should reflect all ${N} documents. ` +
+        `Use only what the supplied text explicitly states; never infer or invent a party, date, amount or clause. If a document states nothing for a section it simply adds nothing there, which is expected. ` +
+        `End every item with the source document's file name in parentheses, e.g. "... (contract.pdf)".`
+      : `Produce a ${lengthInstruction} structured summary of the document.`;
     try {
-      const prompt = `You are a legal document analyst. Produce a ${lengthInstruction} structured summary of the document.\n\nReturn ONLY a JSON object with this exact shape, no markdown, no explanation outside the JSON:\n{"parties": ["..."], "key_dates": [{"date": "...", "description": "..."}], "obligations": ["..."], "notable_clauses": ["..."]}\nIf a section doesn't apply, return an empty array for it.`;
+      const prompt = `You are a legal document analyst. ${scopeInstruction}\n\nReturn ONLY a JSON object with this exact shape, no markdown, no explanation outside the JSON:\n{"parties": ["..."], "key_dates": [{"date": "...", "description": "..."}], "obligations": ["..."], "notable_clauses": ["..."]}\nIf nothing is stated for a section, return an empty array for it.`;
       const full = await runToolQuery(prompt);
       const data = extractJson(full, "object");
-      setSummaryByDoc(prev => ({ ...prev, [activeDocId]: { ...(data || {}), raw: full, parsed: !!data, length, ranAt: new Date().toISOString() } }));
+      setSummaryByDoc(prev => ({ ...prev, [activeDocId]: { ...(data || {}), raw: full, parsed: !!data, length, ranAt: new Date().toISOString(), combinedDocs: isAllScope ? docs.length : 0, perDocChars: isAllScope ? combinedPerDocLimit(docs.length) : 0 } }));
     } catch (e) {
       setToolError(e.message || "Could not generate the summary.");
     } finally {
       setToolLoading(false);
     }
-  }, [runToolQuery, activeDocId, toolLoading]);
+  }, [runToolQuery, activeDocId, toolLoading, isAllScope, docs.length]);
 
   const runPrecedentsTool = useCallback(async () => {
     if (toolLoading) return;
@@ -2878,8 +3454,11 @@ export default function GridApp() {
             {docs.map(doc => {
               const active = doc.id === activeDocId;
               const typeColor = DOC_TYPE_COLOR[doc.type] || "#6b7080";
+              const deleting = doc.id === deletingDocId;
+              const confirming = doc.id === confirmDeleteId;
               return (
                 <div key={doc.id}
+                  className="doc-row"
                   onClick={() => { setActiveDocId(doc.id); setHlPage(null); setMainView("chat"); }}
                   style={{
                     display: "flex", alignItems: "center", gap: "9px",
@@ -2905,9 +3484,29 @@ export default function GridApp() {
                       overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
                     }}>{doc.name}</div>
                     <div style={{ fontSize: "10px", color: "#5b6072" }}>
-                      {doc.pages} page{doc.pages !== 1 ? "s" : ""} · {doc.type}
+                      {deleting ? "Deleting…" : doc.fromHistory ? <>extracted text · {doc.type}</> : <>{doc.pages} page{doc.pages !== 1 ? "s" : ""} · {doc.type}</>}
                     </div>
                   </div>
+                  {(authToken || doc.persisted === false) && (
+                    <button
+                      className={`doc-row-delete${confirming ? " armed" : ""}`}
+                      onClick={e => handleDeleteDoc(doc, e)}
+                      onBlur={() => { if (confirming) setConfirmDeleteId(null); }}
+                      disabled={deleting}
+                      title={confirming ? "Click again to permanently delete" : `Delete "${doc.name}"`}
+                      style={{
+                        height: "20px", minWidth: "20px", flexShrink: 0, borderRadius: "6px",
+                        padding: confirming ? "0 8px" : 0,
+                        background: confirming ? "rgba(248,113,113,.18)" : "transparent",
+                        border: "none", color: confirming ? "#f87171" : "#6b7280",
+                        fontSize: "10.5px", fontWeight: 700, fontFamily: UI_FONT,
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        cursor: deleting ? "default" : "pointer",
+                      }}
+                      onMouseEnter={e => { e.stopPropagation(); if (!deleting && !confirming) { e.currentTarget.style.background = "rgba(248,113,113,.15)"; e.currentTarget.style.color = "#f87171"; } }}
+                      onMouseLeave={e => { e.stopPropagation(); if (!confirming) { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "#6b7280"; } }}
+                    >{deleting ? <IconRefresh width={11} height={11} /> : confirming ? "Delete?" : <IconX width={11} height={11} />}</button>
+                  )}
                 </div>
               );
             })}
@@ -3078,66 +3677,261 @@ export default function GridApp() {
         }}>{notification}</div>
       )}
 
+      {/* ── Compare tray — a persistent bottom-right queue of selections
+          picked up from the source panel's "Add to compare" button. Stays
+          visible across task-mode/view switches (fixed to the viewport, not
+          nested in the source panel) so building up a comparison set isn't
+          undone by navigating around while you collect passages. ── */}
+      {compareQueue.length > 0 && (
+        <div style={{
+          position: "fixed", bottom: "20px", right: "20px", width: "280px",
+          background: "#fff", border: "1px solid #e5e7eb", borderRadius: "14px",
+          boxShadow: "0 14px 36px rgba(15,23,42,.16), 0 2px 8px rgba(15,23,42,.06)",
+          zIndex: 150, fontFamily: UI_FONT, overflow: "hidden",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "11px 14px 8px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "7px", fontSize: "12.5px", fontWeight: 700, color: "#111827" }}>
+              <IconLayers width={14} height={14} style={{ color: "#7c3aed" }} />
+              Comparing ({compareQueue.length})
+            </div>
+            <button onClick={() => setCompareQueue([])} style={{
+              background: "none", border: "none", color: "#9ca3af", cursor: "pointer",
+              fontSize: "11px", fontFamily: UI_FONT, fontWeight: 600, padding: "2px 4px",
+            }}>Clear</button>
+          </div>
+          <div style={{ maxHeight: "160px", overflowY: "auto", padding: "0 8px" }}>
+            {compareQueue.map((item, i) => (
+              <div key={item.id} style={{
+                display: "flex", alignItems: "center", gap: "8px",
+                padding: "6px 6px", borderRadius: "8px",
+              }}
+                onMouseEnter={e => e.currentTarget.style.background = "#f8fafc"}
+                onMouseLeave={e => e.currentTarget.style.background = "none"}
+              >
+                <div style={{
+                  width: "20px", height: "20px", borderRadius: "6px", flexShrink: 0,
+                  background: "#f3e8ff", color: "#7c3aed", fontSize: "10px", fontWeight: 700,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                }}>{i + 1}</div>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontSize: "11.5px", color: "#374151", fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {item.docName || "Selection"}
+                  </div>
+                  <div style={{ fontSize: "10.5px", color: "#9ca3af", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {item.text.slice(0, 48)}{item.text.length > 48 ? "…" : ""}
+                  </div>
+                </div>
+                <button onClick={() => handleRemoveFromCompare(item.id)} title="Remove" style={{
+                  background: "none", border: "none", color: "#9ca3af", cursor: "pointer",
+                  padding: "3px", borderRadius: "6px", display: "flex", flexShrink: 0,
+                }}
+                  onMouseEnter={e => { e.currentTarget.style.background = "#fee2e2"; e.currentTarget.style.color = "#dc2626"; }}
+                  onMouseLeave={e => { e.currentTarget.style.background = "none"; e.currentTarget.style.color = "#9ca3af"; }}
+                ><IconX width={12} height={12} /></button>
+              </div>
+            ))}
+          </div>
+          <div style={{ padding: "10px 14px 12px" }}>
+            {compareQueue.length < 2 ? (
+              <div style={{ fontSize: "11px", color: "#9ca3af", textAlign: "center" }}>
+                Select one more passage to compare
+              </div>
+            ) : (
+              <button onClick={() => setCompareModalOpen(true)} style={{
+                width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: "7px",
+                background: "linear-gradient(180deg,#7c3aed,#6d28d9)", border: "none", color: "#fff",
+                borderRadius: "9px", padding: "9px", cursor: "pointer",
+                fontSize: "12.5px", fontFamily: UI_FONT, fontWeight: 600,
+                boxShadow: "0 2px 10px rgba(124,58,237,.28)",
+              }}><IconLayers width={14} height={14} />Compare {compareQueue.length} selections</button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {compareModalOpen && compareQueue.length >= 2 && (
+        <DiffModal items={compareQueue} onClose={() => setCompareModalOpen(false)} explainDiffPair={explainDiffPair} />
+      )}
+
       {/* ── MAIN COLUMN ────────────────────────────────────────────────── */}
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, background: "#fff" }}>
+      {/* minWidth floor so the chat header's controls (search, Show Source,
+          account menu) always have enough room to render without overlapping
+          — the source panel below gives up space first when the window gets
+          tight, instead of this column being squeezed arbitrarily small. */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: "420px", background: "#fff" }}>
 
         {/* header */}
         <div style={{
-          height: "52px", flexShrink: 0, display: "flex", alignItems: "center",
-          gap: "10px", padding: "0 14px", borderBottom: "1px solid #f0f0f0",
+          height: "64px", flexShrink: 0, display: "flex", alignItems: "center",
+          gap: "16px", padding: "0 20px", borderBottom: "1px solid #f0f0f0",
         }}>
-          {!sidebarOpen && (
-            <button onClick={() => setSidebarOpen(true)} title="Open sidebar" style={{
-              background: "none", border: "none", color: "#6b7280", cursor: "pointer",
-              padding: "5px", borderRadius: "6px", display: "flex",
-            }}><IconPanel width={18} height={18} /></button>
-          )}
-          <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: "8px" }}>
-            <span style={{ fontSize: "13.5px", fontWeight: 600, color: "#111827", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {mainView === "chat" ? (isAllScope ? `All Documents (${docs.length})` : activeDoc ? activeDoc.name : "SynergeReader Legal AI")
-                : mainView === "precedents" ? "Case Library"
-                : mainView === "admin" ? "Admin Dashboard"
-                : mainView === "dashboard" ? "My Dashboard"
-                : "Knowledge Base"}
-            </span>
-            {mainView === "chat" && (activeDoc || isAllScope) && (
-              <Badge color={task?.color || "#0891b2"}>{modelName}</Badge>
+          {/* left group — sidebar toggle + document title/badge. flex:1 so it
+              shares remaining space equally with the right group below,
+              which is what keeps the search bar in the middle truly centered
+              instead of pinned by absolute positioning (which used to ignore
+              how narrow this column gets once the source panel is open, and
+              overlapped the title/buttons — see the width/minWidth guards
+              below and on the search block itself). */}
+          <div style={{ flex: "1 1 0", minWidth: 0, display: "flex", alignItems: "center", gap: "10px", overflow: "hidden" }}>
+            {!sidebarOpen && (
+              <button onClick={() => setSidebarOpen(true)} title="Open sidebar" style={{
+                background: "none", border: "none", color: "#6b7280", cursor: "pointer",
+                padding: "5px", borderRadius: "6px", display: "flex", flexShrink: 0,
+              }}><IconPanel width={19} height={19} /></button>
+            )}
+            {/* Skip the title/badge entirely when the source panel is open on
+                a single document — its own header right next door already
+                shows that filename, so this would just be a redundant copy
+                competing for the same tight space. */}
+            {!(mainView === "chat" && sourceOpen && activeDoc && !isAllScope) && (
+              <div style={{ minWidth: 0, display: "flex", alignItems: "center", gap: "8px" }}>
+                <span style={{ fontSize: "14.5px", fontWeight: 600, color: "#111827", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {mainView === "chat" ? (isAllScope ? `All Documents (${docs.length})` : activeDoc ? activeDoc.name : "SynergeReader Legal AI")
+                    : mainView === "precedents" ? "Case Library"
+                    : mainView === "admin" ? "Admin Dashboard"
+                    : mainView === "dashboard" ? "My Dashboard"
+                    : "Knowledge Base"}
+                </span>
+                {mainView === "chat" && (activeDoc || isAllScope) && (
+                  <Badge color={task?.color || "#0891b2"}>{modelName}</Badge>
+                )}
+              </div>
             )}
           </div>
-          {mainView === "chat" && activeDoc && (
-            <button onClick={() => setSourceOpen(o => !o)} title={sourceOpen ? "Hide source panel" : "Show source panel"} style={{
-              display: "flex", alignItems: "center", gap: "6px",
-              background: sourceOpen ? "#eff6ff" : "#f8fafc",
-              border: `1px solid ${sourceOpen ? "#bfdbfe" : "#e5e7eb"}`,
-              color: sourceOpen ? "#1d4ed8" : "#4b5563",
-              borderRadius: "8px", padding: "6px 10px", cursor: "pointer",
-              fontSize: "12px", fontFamily: UI_FONT, fontWeight: 500,
-            }}><IconPanel width={14} height={14} />{sourceOpen ? "Hide Source" : "Show Source"}</button>
+
+          {/* ── header document search — admin-only for now (see the note on
+              /me/documents/search). Searches this admin's own upload history,
+              not just what's loaded in this session, and reopens a result
+              straight into the chat/source panel. A real flex child (not
+              absolutely positioned / vw-sized) so it shrinks gracefully —
+              including in the narrow chat column that results when the
+              source panel is open side-by-side — instead of overlapping the
+              title or the buttons on the right. ── */}
+          {currentUser?.is_admin && (
+            <div ref={docSearchRef} style={{
+              position: "relative", flex: "0 1 440px", minWidth: "120px",
+            }}>
+              <div style={{ position: "relative" }}>
+                <div style={{ position: "absolute", left: "13px", top: "50%", transform: "translateY(-50%)", color: "#9ca3af", display: "flex", pointerEvents: "none" }}>
+                  <IconSearch width={16} height={16} />
+                </div>
+                <input
+                  value={docSearchQuery}
+                  onFocus={() => setDocSearchOpen(true)}
+                  onChange={e => { setDocSearchQuery(e.target.value); setDocSearchOpen(true); }}
+                  placeholder="Search your documents…"
+                  style={{
+                    width: "100%", border: "1px solid #d9d9e3", borderRadius: "10px",
+                    padding: "10px 16px 10px 40px", fontSize: "14px", fontFamily: UI_FONT,
+                    color: "#1e293b", outline: "none", background: "#fff", boxSizing: "border-box",
+                    transition: "border-color .12s, box-shadow .12s",
+                  }}
+                  onFocusCapture={e => { e.currentTarget.style.borderColor = "#93c5fd"; e.currentTarget.style.boxShadow = "0 0 0 3px rgba(59,130,246,.12)"; }}
+                  onBlurCapture={e => { e.currentTarget.style.borderColor = "#d9d9e3"; e.currentTarget.style.boxShadow = "none"; }}
+                />
+              </div>
+
+              {docSearchOpen && (
+                <div style={{
+                  // matches the input's width when it has room, but never
+                  // shrinks below a usable size even when the input itself
+                  // has been squeezed narrow (e.g. source panel open) — it's
+                  // a floating overlay, so it's fine for it to be wider than
+                  // the input it hangs off of.
+                  position: "absolute", top: "calc(100% + 8px)", left: 0,
+                  width: "max(100%, 340px)", maxWidth: "min(440px, 90vw)", maxHeight: "400px", overflowY: "auto",
+                  background: "#fff", border: "1px solid #e5e7eb", borderRadius: "14px",
+                  boxShadow: "0 14px 36px rgba(15,23,42,.16), 0 2px 8px rgba(15,23,42,.06)",
+                  zIndex: 50, fontFamily: UI_FONT,
+                }}>
+                  <div style={{ padding: "11px 16px", fontSize: "11px", fontWeight: 700, letterSpacing: ".04em", textTransform: "uppercase", color: "#9ca3af", borderBottom: "1px solid #f0f0f0" }}>
+                    {docSearchQuery.trim() ? "Matching documents" : "Your recent documents"}
+                  </div>
+
+                  {docSearchLoading && (
+                    <div style={{ padding: "18px 16px", fontSize: "13.5px", color: "#9ca3af" }}>Searching…</div>
+                  )}
+
+                  {!docSearchLoading && docSearchResults.length === 0 && (
+                    <div style={{ padding: "18px 16px", fontSize: "13.5px", color: "#9ca3af" }}>
+                      {docSearchQuery.trim() ? `No documents match "${docSearchQuery.trim()}".` : "You haven't uploaded any documents yet."}
+                    </div>
+                  )}
+
+                  {!docSearchLoading && docSearchResults.map(r => (
+                    <button
+                      key={r.id}
+                      onClick={() => openSearchedDocument(r)}
+                      disabled={docSearchOpening === r.id}
+                      style={{
+                        display: "flex", alignItems: "center", gap: "12px", width: "100%",
+                        background: "none", border: "none", borderBottom: "1px solid #f4f5f7",
+                        padding: "12px 16px", cursor: docSearchOpening === r.id ? "default" : "pointer",
+                        textAlign: "left",
+                      }}
+                      onMouseEnter={e => e.currentTarget.style.background = "#f8fafc"}
+                      onMouseLeave={e => e.currentTarget.style.background = "none"}
+                    >
+                      <div style={{
+                        width: "32px", height: "32px", borderRadius: "8px", background: "#eef2ff", color: "#4f46e5",
+                        display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+                      }}><IconFile width={15} height={15} /></div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: "13.5px", fontWeight: 600, color: "#111827", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {r.filename}
+                        </div>
+                        <div style={{ fontSize: "11.5px", color: "#9ca3af", marginTop: "2px" }}>
+                          {r.doc_type ? `${r.doc_type} · ` : ""}{timeAgo(r.upload_timestamp)}
+                        </div>
+                      </div>
+                      {docSearchOpening === r.id && <span style={{ fontSize: "11.5px", color: "#9ca3af", flexShrink: 0 }}>Opening…</span>}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           )}
 
-          {/* ── account menu — top-right of the (light) chat header, same
-              click-to-open dropdown pattern GitHub/Slack/etc. use ── */}
-          {currentUser && (
+          {/* right group — Show Source + account menu. Fixed to its natural
+              content width (never shrinks) so these controls stay fully
+              usable no matter how narrow the chat column gets (e.g. the
+              source panel open side-by-side on a smaller window) — it's the
+              left group and the search bar that give up space first. */}
+          <div style={{ flex: "0 0 auto", display: "flex", alignItems: "center", justifyContent: "flex-end", gap: "10px" }}>
+            {mainView === "chat" && activeDoc && (
+              <button onClick={() => setSourceOpen(o => !o)} title={sourceOpen ? "Hide source panel" : "Show source panel"} style={{
+                display: "flex", alignItems: "center", gap: "7px",
+                background: sourceOpen ? "#eff6ff" : "#f8fafc",
+                border: `1px solid ${sourceOpen ? "#bfdbfe" : "#e5e7eb"}`,
+                color: sourceOpen ? "#1d4ed8" : "#4b5563",
+                borderRadius: "9px", padding: "8px 13px", cursor: "pointer",
+                fontSize: "13px", fontFamily: UI_FONT, fontWeight: 500, flexShrink: 0,
+              }}><IconPanel width={15} height={15} />{sourceOpen ? "Hide Source" : "Show Source"}</button>
+            )}
+
+            {/* ── account menu — top-right of the (light) chat header, same
+                click-to-open dropdown pattern GitHub/Slack/etc. use ── */}
+            {currentUser && (
             <div ref={userMenuRef} style={{ position: "relative", flexShrink: 0 }}>
               <button
                 onClick={() => setUserMenuOpen(o => !o)}
                 title={currentUser.username}
                 style={{
-                  display: "flex", alignItems: "center", gap: "5px",
+                  display: "flex", alignItems: "center", gap: "6px",
                   background: userMenuOpen ? "#f3f4f6" : "transparent",
-                  border: "none", borderRadius: "20px", padding: "3px 7px 3px 3px",
+                  border: "none", borderRadius: "22px", padding: "3px 8px 3px 3px",
                   cursor: "pointer", transition: "background .12s",
                 }}
                 onMouseEnter={e => { if (!userMenuOpen) e.currentTarget.style.background = "#f8fafc"; }}
                 onMouseLeave={e => { if (!userMenuOpen) e.currentTarget.style.background = "transparent"; }}
               >
                 <div style={{
-                  width: "26px", height: "26px", borderRadius: "50%",
+                  width: "30px", height: "30px", borderRadius: "50%",
                   background: currentUser.is_admin ? "linear-gradient(135deg,#a78bfa,#7c3aed)" : "linear-gradient(135deg,#60a5fa,#1d4ed8)",
                   display: "flex", alignItems: "center", justifyContent: "center",
-                  color: "#fff", fontSize: "10px", fontWeight: 700, flexShrink: 0,
+                  color: "#fff", fontSize: "11px", fontWeight: 700, flexShrink: 0,
                 }}>{(currentUser.username || "?").slice(0, 2).toUpperCase()}</div>
-                <IconChevronDown width={13} height={13} style={{ color: "#9ca3af" }} />
+                <IconChevronDown width={14} height={14} style={{ color: "#9ca3af" }} />
               </button>
 
               {userMenuOpen && (
@@ -3223,7 +4017,8 @@ export default function GridApp() {
                 </div>
               )}
             </div>
-          )}
+            )}
+          </div>
         </div>
 
         {/* ── CHAT VIEW ── */}
@@ -3336,6 +4131,19 @@ export default function GridApp() {
                                 {msg.scope.type === "all" ? `📎 All Documents (${msg.scope.count})` : `📎 ${msg.scope.name}`}
                               </div>
                             )}
+                            {msg.context?.text && (
+                              <div style={{
+                                maxWidth: "75%", display: "flex", alignItems: "flex-start", gap: "7px",
+                                background: "#eff6ff", border: "1px solid #dbeafe",
+                                borderRadius: "12px", padding: "8px 11px", marginBottom: "6px",
+                              }}>
+                                <IconQuote width={12} height={12} style={{ color: "#60a5fa", flexShrink: 0, marginTop: "3px" }} />
+                                <div style={{
+                                  fontSize: "12px", color: "#3b5378", lineHeight: "1.5", fontStyle: "italic",
+                                  display: "-webkit-box", WebkitLineClamp: 3, WebkitBoxOrient: "vertical", overflow: "hidden",
+                                }}>{msg.context.text}</div>
+                              </div>
+                            )}
                             <div style={{
                               maxWidth: "75%", background: "#f4f4f5",
                               borderRadius: "20px", padding: "10px 16px",
@@ -3368,6 +4176,16 @@ export default function GridApp() {
                               {msg.text}
                               {msg.streaming && <span style={{ opacity: .5, animation: "blink 1s infinite" }}>▊</span>}
                             </div>
+                            {msg.unverified && (
+                              <div style={{
+                                marginTop: "8px", display: "inline-flex", alignItems: "center", gap: "6px",
+                                fontSize: "11px", color: "#92400e", background: "#fffbeb", border: "1px solid #fde68a",
+                                borderRadius: "8px", padding: "4px 9px", lineHeight: "1.4",
+                              }}>
+                                <IconAlertTriangle width={12} height={12} />
+                                AI analysis only — any cases or citations above are not verified against a source.
+                              </div>
+                            )}
                             {msg.citations?.length > 0 && (
                               <div style={{ marginTop: "8px", display: "flex", flexWrap: "wrap", gap: "5px" }}>
                                 {msg.citations.map((c, i) => (
@@ -5352,7 +6170,12 @@ export default function GridApp() {
           onMouseUp={handleSourceMouseUp}
           onScrollCapture={() => setSelPopover(null)}
           style={{
-            width: "min(46vw, 640px)", flexShrink: 0,
+            // shrinks before the chat column does (which has its own
+            // minWidth floor precisely so this is the side that gives up
+            // space first on a narrower window) — the document itself
+            // already scrolls internally, so a narrower panel just means
+            // more scrolling, not lost or overlapping controls.
+            width: "min(46vw, 640px)", flexShrink: 1, minWidth: "280px",
             borderLeft: "1px solid #e5e7eb", position: "relative",
             display: "flex", flexDirection: "column", overflow: "hidden",
           }}>
@@ -5370,27 +6193,113 @@ export default function GridApp() {
           </div>
           <PdfViewer doc={activeDoc} highlightPage={hlPage} />
 
-          {/* Floating "Ask about selection" button — appears right after the
-              user releases a text selection anywhere in this panel (real DOM
-              text for DOCX/TXT, a transparent pdf.js text layer for PDF). */}
+          {/* Floating selection toolbar — appears right after the user
+              releases a text selection anywhere in this panel (real DOM text
+              for DOCX/TXT, a transparent pdf.js text layer for PDF). Four
+              compact actions so it still fits a narrow source panel: drop the
+              selection into the composer to ask a custom question, fire an
+              immediate "find related sources" query, fire an immediate
+              plain-English summary of just this passage, or queue it for the
+              compare/diff tray to redline against another selection. */}
           {selPopover && (
-            <button
+            <div
               onMouseDown={e => e.stopPropagation()}
               onMouseUp={e => e.stopPropagation()}
-              onClick={handleAskAboutSelection}
               style={{
                 position: "absolute",
                 left: selPopover.x, top: Math.max(selPopover.y, 8),
-                transform: "translate(-50%, calc(-100% - 8px))",
-                zIndex: 30, display: "flex", alignItems: "center", gap: "6px",
-                background: "#111827", color: "#fff", border: "none",
-                borderRadius: "20px", padding: "7px 14px", fontSize: "12.5px",
-                fontWeight: 600, fontFamily: UI_FONT, cursor: "pointer",
-                boxShadow: "0 4px 14px rgba(0,0,0,.25)", whiteSpace: "nowrap",
+                transform: "translate(-50%, calc(-100% - 10px))",
+                zIndex: 30, display: "flex", alignItems: "stretch",
+                background: "#111827", borderRadius: "12px",
+                boxShadow: "0 8px 24px rgba(0,0,0,.28), 0 2px 6px rgba(0,0,0,.16)",
+                fontFamily: UI_FONT, whiteSpace: "nowrap",
               }}
             >
-              <IconScale width={13} height={13} /> Ask about selection
-            </button>
+              {/* Icon-only, not icon+label — with 4 actions now, text labels
+                  pushed the toolbar past 350px wide, which overflowed a
+                  source panel at its narrower widths no matter how the
+                  anchor point was clamped. Tooltips (title=) carry the
+                  labels instead, same trade every compact selection
+                  toolbar (Medium, Google Docs) makes. */}
+              <button
+                onClick={handleAskAboutSelection}
+                title="Ask a question about this selection"
+                style={{
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  background: "none", border: "none", color: "#fff", cursor: "pointer",
+                  width: "38px", height: "38px", flexShrink: 0,
+                  borderRadius: "12px 0 0 12px", transition: "background .12s",
+                }}
+                onMouseEnter={e => e.currentTarget.style.background = "#1f2937"}
+                onMouseLeave={e => e.currentTarget.style.background = "none"}
+              ><IconScale width={15} height={15} /></button>
+
+              <div style={{ width: "1px", background: "#2d3341", margin: "8px 0" }} />
+
+              <button
+                onClick={() => {
+                  const { text } = selPopover;
+                  setSelPopover(null);
+                  window.getSelection()?.removeAllRanges();
+                  handleSearchSelectionSources(text, activeDoc?.name || "");
+                }}
+                title="Analyze related legal issues (AI analysis — not verified sources)"
+                style={{
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  background: "none", border: "none", color: "#fff", cursor: "pointer",
+                  width: "38px", height: "38px", flexShrink: 0,
+                  transition: "background .12s",
+                }}
+                onMouseEnter={e => e.currentTarget.style.background = "#1f2937"}
+                onMouseLeave={e => e.currentTarget.style.background = "none"}
+              ><IconBook width={15} height={15} /></button>
+
+              <div style={{ width: "1px", background: "#2d3341", margin: "8px 0" }} />
+
+              <button
+                onClick={() => {
+                  const { text } = selPopover;
+                  setSelPopover(null);
+                  window.getSelection()?.removeAllRanges();
+                  handleSummarizeSelection(text, activeDoc?.name || "");
+                }}
+                title="Summarize this highlighted passage"
+                style={{
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  background: "none", border: "none", color: "#fff", cursor: "pointer",
+                  width: "38px", height: "38px", flexShrink: 0,
+                  transition: "background .12s",
+                }}
+                onMouseEnter={e => e.currentTarget.style.background = "#1f2937"}
+                onMouseLeave={e => e.currentTarget.style.background = "none"}
+              ><IconWand width={15} height={15} /></button>
+
+              <div style={{ width: "1px", background: "#2d3341", margin: "8px 0" }} />
+
+              <button
+                onClick={() => {
+                  const { text } = selPopover;
+                  setSelPopover(null);
+                  window.getSelection()?.removeAllRanges();
+                  handleAddToCompare(text, activeDoc?.name || "", activeDoc?.id);
+                }}
+                title="Add to compare — build a redline diff against another selection"
+                style={{
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  background: "none", border: "none", color: "#fff", cursor: "pointer",
+                  width: "38px", height: "38px", flexShrink: 0,
+                  borderRadius: "0 12px 12px 0", transition: "background .12s",
+                }}
+                onMouseEnter={e => e.currentTarget.style.background = "#1f2937"}
+                onMouseLeave={e => e.currentTarget.style.background = "none"}
+              ><IconLayers width={15} height={15} /></button>
+
+              {/* small caret pointing down at the selected text */}
+              <div style={{
+                position: "absolute", left: "50%", bottom: "-5px", transform: "translateX(-50%) rotate(45deg)",
+                width: "10px", height: "10px", background: "#111827", borderRadius: "0 0 2px 0",
+              }} />
+            </div>
           )}
         </div>
       )}
@@ -5447,6 +6356,23 @@ function Styles() {
       }
       .pdfTextLayer ::selection { background: rgba(37,99,235,.35); }
       .pdfTextLayer ::-moz-selection { background: rgba(37,99,235,.35); }
+
+      /* Sidebar document row's × delete button — hidden until the row is
+         hovered (or focused, for keyboard users), so the list stays clean
+         at rest instead of showing a delete icon on every single row. */
+      .doc-row .doc-row-delete {
+        opacity: 0;
+        pointer-events: none;
+        transform: scale(.85);
+        transition: opacity .12s, transform .12s, background .12s, color .12s;
+      }
+      .doc-row:hover .doc-row-delete,
+      .doc-row .doc-row-delete.armed,
+      .doc-row .doc-row-delete:focus-visible {
+        opacity: 1;
+        pointer-events: auto;
+        transform: scale(1);
+      }
     `}</style>
   );
 }
