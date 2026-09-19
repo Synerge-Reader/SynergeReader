@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import * as pdfjsLib from "pdfjs-dist/build/pdf";
 import { GlobalWorkerOptions } from "pdfjs-dist/build/pdf";
 import { renderAsync } from "docx-preview";
@@ -25,6 +25,11 @@ const TASK_MODES = [
   { id: "clause",     label: "Clause Extractor",   model: "llama3.1:8b",  color: "#0891b2" },
   { id: "summarize",  label: "Summarize",          model: "qwen3:latest", color: "#7c3aed" },
 ];
+
+// Model for the Compare modal's "explain what this change means" call — taken
+// from the same task-mode config as everything else instead of a literal tag,
+// so a model change is one edit in TASK_MODES.
+const EXPLAIN_MODEL = (TASK_MODES.find(t => t.id === "summarize") || {}).model || "llama3.1:8b";
 
 const MODEL_LABEL = {
   "llama3.1:8b":  "Llama 3.1 8B",
@@ -924,10 +929,10 @@ function PdfViewer({ doc, highlightPage }) {
                   fontFamily: "'Courier New',monospace",
                   textTransform: "uppercase", letterSpacing: ".06em",
                   overflow: "hidden", textOverflow: "ellipsis",
-                  whiteSpace: "nowrap", maxWidth: "70%",
+                  whiteSpace: "nowrap", minWidth: 0, flex: "1 1 auto",
                 }}>{doc.name}</span>
-                <span style={{ fontSize: "9px", color: "#9ca3af", fontFamily: "'Courier New',monospace" }}>
-                  {pg} / {textPages.length}
+                <span style={{ fontSize: "9px", color: "#9ca3af", fontFamily: "'Courier New',monospace", whiteSpace: "nowrap", flexShrink: 0, marginLeft: "10px" }}>
+                  {doc.fromHistory ? "Extracted text · " : ""}{pg} / {textPages.length}
                 </span>
               </div>
               {hi && (
@@ -1313,6 +1318,12 @@ function Composer({ input, setInput, onSend, onAttach, uploading, disabled, plac
 }
 
 const ALL_DOCS = "__all_docs__"; // sentinel activeDocId meaning "combined across every uploaded document"
+// How much of EACH document the combined ("All Documents") requests send: the
+// opening portion only, ~16k chars split across the set (never below 2k per doc).
+// One definition so the chat path, the tool path and the summary caption agree.
+function combinedPerDocLimit(docCount) {
+  return Math.max(2000, Math.min(8000, Math.floor(16000 / Math.max(docCount, 1))));
+}
 
 // ── Small shared utilities for the Knowledge Base & Chat History views ──────
 function timeAgo(iso) {
@@ -1487,6 +1498,16 @@ function DiffModal({ items, onClose, explainDiffPair }) {
   const base = items[baseIdx] || items[0];
   const others = items.filter((_, i) => i !== baseIdx);
 
+  // The LCS diff is O(n·m) in words, so compute it once per (items, baseline)
+  // instead of on every render — the modal re-renders whenever an AI
+  // explanation starts, finishes or fails.
+  const diffs = useMemo(() => {
+    const b = items[baseIdx] || items[0];
+    const out = {};
+    items.forEach((it, i) => { if (i !== baseIdx) out[it.id] = computeWordDiff(b?.text || "", it.text); });
+    return out;
+  }, [items, baseIdx]);
+
   // AI explanations are per (baseline, candidate) pair — keyed by the
   // candidate's id. Resetting on baseline change is correct: every pair's
   // meaning changes when the baseline does, so a stale explanation from a
@@ -1578,7 +1599,7 @@ function DiffModal({ items, onClose, explainDiffPair }) {
           }}>{base?.text}</div>
 
           {others.map((item, idx) => {
-            const diff = computeWordDiff(base?.text || "", item.text);
+            const diff = diffs[item.id] || [];
             const explanation = explanations[item.id];
             return (
               <div key={item.id} style={{ marginBottom: idx === others.length - 1 ? 0 : "20px" }}>
@@ -1926,6 +1947,11 @@ function SummaryToolView({ summaryResult, summaryLength, setSummaryLength, onRun
         } />
 
       {toolLoading && !summaryResult && <LoadingCard text="Reading the document…" />}
+      {summaryResult?.parsed && summaryResult.combinedDocs > 1 && (
+        <div style={{ fontSize: "11.5px", color: "#6b7280", background: "#f8fafc", border: "1px solid #eef0f3", borderRadius: "10px", padding: "8px 12px", marginBottom: "12px", lineHeight: "1.5" }}>
+          Combined brief across {summaryResult.combinedDocs} documents, built from roughly the first {summaryResult.perDocChars.toLocaleString()} characters of each — anything later in a long document isn't reflected. Items name the document they came from.
+        </div>
+      )}
       {summaryResult?.parsed && (
         <div style={{ display: "grid", gap: "12px" }}>
           <SummarySection title="Parties Involved" items={summaryResult.parties} icon={IconUser} />
@@ -2007,6 +2033,8 @@ export default function GridApp() {
   const [docs,        setDocs]        = useState([]);
   const [activeDocId, setActiveDocId] = useState(null);
   const [deletingDocId, setDeletingDocId] = useState(null); // id currently being deleted (sidebar × button)
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null); // id whose × has been clicked once and is awaiting a second click to confirm
+  const confirmTimerRef = useRef(null);
   const [activeTask,  setActiveTask]  = useState("research");
   const [messages,    setMessages]    = useState([]);
   const [input,       setInput]       = useState("");
@@ -2128,15 +2156,22 @@ export default function GridApp() {
 
   useEffect(() => {
     if (!docSearchOpen || !currentUser?.is_admin) return;
+    // `cancelled` flips in the cleanup, i.e. as soon as the query, the token
+    // or the user changes (or the effect unmounts) — so a slow response for an
+    // older query, or one that lands after a logout / account switch, can't
+    // overwrite newer results or show another account's documents.
+    let cancelled = false;
     const t = setTimeout(() => {
       setDocSearchLoading(true);
-      fetch(`${BACKEND}/me/documents/search?q=${encodeURIComponent(docSearchQuery)}&token=${encodeURIComponent(authToken || "")}`)
+      fetch(`${BACKEND}/me/documents/search?q=${encodeURIComponent(docSearchQuery)}`, {
+        headers: { Authorization: `Bearer ${authToken || ""}` },
+      })
         .then(r => r.ok ? r.json() : [])
-        .then(data => setDocSearchResults(Array.isArray(data) ? data : []))
-        .catch(() => setDocSearchResults([]))
-        .finally(() => setDocSearchLoading(false));
+        .then(data => { if (!cancelled) setDocSearchResults(Array.isArray(data) ? data : []); })
+        .catch(() => { if (!cancelled) setDocSearchResults([]); })
+        .finally(() => { if (!cancelled) setDocSearchLoading(false); });
     }, 250); // debounce — avoid firing a request on every keystroke
-    return () => clearTimeout(t);
+    return () => { cancelled = true; clearTimeout(t); };
   }, [docSearchQuery, docSearchOpen, authToken, currentUser]);
 
   useEffect(() => {
@@ -2166,12 +2201,16 @@ export default function GridApp() {
     }
     setDocSearchOpening(result.id);
     try {
-      const res = await fetch(`${BACKEND}/documents/${result.id}/content?token=${encodeURIComponent(authToken || "")}`);
+      const res = await fetch(`${BACKEND}/documents/${result.id}/content`, {
+        headers: { Authorization: `Bearer ${authToken || ""}` },
+      });
       if (!res.ok) throw new Error("Could not open that document");
       const data = await res.json();
       const words = (data.content || "").split(/\s+/).filter(Boolean).length;
       const newDoc = {
         id: data.id,
+        persisted: true,
+        fromHistory: true, // extracted text only — no original file, no real pages/layout
         name: data.filename,
         text: data.content || "",
         pages: Math.max(1, Math.ceil(words / 350)),
@@ -2219,13 +2258,13 @@ export default function GridApp() {
   const [compareQueue,     setCompareQueue]     = useState([]); // [{ id, text, docName }]
   const COMPARE_MAX = 5;
 
-  const handleAddToCompare = useCallback((text, docName) => {
+  const handleAddToCompare = useCallback((text, docName, docId) => {
     setCompareQueue(prev => {
       if (prev.length >= COMPARE_MAX) {
         setNotification(`You can compare up to ${COMPARE_MAX} selections at once — remove one first.`);
         return prev;
       }
-      const next = [...prev, { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, text: text.slice(0, 4000), docName }];
+      const next = [...prev, { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, text: text.slice(0, 4000), docName, docId }];
       setNotification(
         next.length === 1
           ? "Added to comparison — select one more passage to diff."
@@ -2742,6 +2781,7 @@ export default function GridApp() {
 
         const newDoc = {
           id:                docId || Date.now(),
+          persisted:         !!docId, // false = the /upload call failed; nothing to delete server-side
           name:              file.name,
           text:              parsed.text,
           pages:             parsed.pages,
@@ -2787,41 +2827,70 @@ export default function GridApp() {
     if (fileInputRef.current) fileInputRef.current.value = "";
   }, [task, docs.length, authToken]);
 
-  // ── remove a document — the small × button on each sidebar row. Every doc
-  // in `docs` was persisted via /upload (or reopened from history via
-  // /documents/{id}/content), so this is a real delete: it clears the row
-  // from the DB by filename (same endpoint the admin Documents tab already
-  // uses) and only THEN drops it from local state, so a failed request
-  // leaves the doc visible instead of silently vanishing from the sidebar
-  // while still sitting in the database.
+  // ── remove a document — the small × button on each sidebar row.
+  //
+  // Two clicks: the first arms the button ("Delete?" for a few seconds), the
+  // second confirms — deletion is permanent, so a stray click shouldn't do it.
+  // The server call is DELETE /me/documents/{id} with the caller's bearer
+  // token: it removes only a document that belongs to the signed-in user,
+  // by id (never by filename, which can be duplicated or belong to someone
+  // else), and only THEN is the doc dropped locally — a failed request leaves
+  // it in the list instead of silently vanishing while still in the database.
+  // Docs that never made it to the server (upload failed to persist) have
+  // nothing to delete remotely and are just removed from the list.
+  const removeDocLocally = useCallback((doc) => {
+    const next = docs.filter(d => d.id !== doc.id);
+    setDocs(next);
+    setActiveDocId(current => {
+      if (current === doc.id) return next[0]?.id ?? null;
+      if (current === ALL_DOCS && next.length <= 1) return next[0]?.id ?? null;
+      return current;
+    });
+    // Derived client state that quotes this document: queued comparison
+    // selections and a pending "Ask about this selection" chip.
+    setCompareQueue(prev => prev.filter(item => item.docId !== doc.id));
+    setSelectedContext(prev => (prev && prev.docName === doc.name ? null : prev));
+    setSelPopover(null);
+  }, [docs]);
+
   const handleDeleteDoc = useCallback(async (doc, e) => {
     e.stopPropagation();
     if (deletingDocId) return;
+
+    if (doc.persisted === false) { removeDocLocally(doc); return; }
+
+    if (confirmDeleteId !== doc.id) {
+      clearTimeout(confirmTimerRef.current);
+      setConfirmDeleteId(doc.id);
+      confirmTimerRef.current = setTimeout(() => setConfirmDeleteId(null), 5000);
+      return;
+    }
+    clearTimeout(confirmTimerRef.current);
+    setConfirmDeleteId(null);
+
     setDeletingDocId(doc.id);
     try {
-      const res = await fetch(`${BACKEND}/documents/delete`, {
+      const res = await fetch(`${BACKEND}/me/documents/${doc.id}`, {
         method: "DELETE",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filename: doc.name }),
+        headers: { Authorization: `Bearer ${authToken || ""}` },
       });
-      if (!res.ok && res.status !== 404) throw new Error(`Could not delete "${doc.name}" (${res.status})`);
-
-      setDocs(prev => {
-        const next = prev.filter(d => d.id !== doc.id);
-        setActiveDocId(current => {
-          if (current === doc.id) return next[0]?.id ?? null;
-          if (current === ALL_DOCS && next.length <= 1) return next[0]?.id ?? null;
-          return current;
-        });
-        return next;
-      });
+      if (res.status === 404) {
+        // Not found in THIS account — already deleted elsewhere, or uploaded
+        // before signing in. Nothing more the server can do; drop it from the
+        // list and say exactly that rather than claiming a delete happened.
+        removeDocLocally(doc);
+        setNotification(`"${doc.name}" wasn't found in your account, so it was only removed from this list.`);
+        return;
+      }
+      if (!res.ok) throw new Error(`Could not delete "${doc.name}" (${res.status})`);
+      removeDocLocally(doc);
       setNotification(`Deleted "${doc.name}".`);
     } catch (err) {
       setNotification(err.message || `Could not delete "${doc.name}".`);
     } finally {
       setDeletingDocId(null);
     }
-  }, [deletingDocId]);
+  }, [deletingDocId, confirmDeleteId, authToken, removeDocLocally]);
 
   async function fetchSuggestions(snippet, filename, model) {
     setSuggestions([]);
@@ -2887,7 +2956,7 @@ export default function GridApp() {
   // rather than waiting for the user to type one. Reading selectedContext from
   // state right after setting it would still see the stale pre-update value,
   // so an explicit override sidesteps that instead of relying on state timing.
-  const sendMessage = useCallback(async (text, taskOverride, contextOverride) => {
+  const sendMessage = useCallback(async (text, taskOverride, contextOverride, flags) => {
     if (!text.trim() || typing) return;
 
     if (abortRef.current) abortRef.current.abort();
@@ -2915,13 +2984,17 @@ export default function GridApp() {
 
     const prefix = effectiveTaskId !== "research" ? TASK_PROMPTS[effectiveTaskId] + "\n\n" : "";
     const msgId  = Date.now() + 1;
-    setMessages(m => [...m, { id: msgId, role: "assistant", model: effectiveTask?.model, text: "", citations: [], streaming: true }]);
+    setMessages(m => [...m, { id: msgId, role: "assistant", model: effectiveTask?.model, text: "", citations: [], streaming: true, unverified: !!flags?.unverified }]);
 
     // Combined mode sends the exact text of every doc the user uploaded in this
     // session, so answers are scoped to those documents only — not the shared,
     // unfiltered vector index, which can contain unrelated documents other users uploaded.
-    const perDocLimit = Math.max(2000, Math.min(8000, Math.floor(16000 / Math.max(docs.length, 1))));
-    const combinedSelections = isAllScope
+    const perDocLimit = combinedPerDocLimit(docs.length);
+    // An explicit selection is the user's chosen context, so it wins: the
+    // backend ranks `selections` ahead of `selected_text`, which meant the
+    // combined-document bundle silently replaced a highlighted passage (the
+    // quote shown in the chat said one thing, the model saw another).
+    const combinedSelections = isAllScope && !askedContext?.text
       ? docs.map(d => ({
           id:            String(d.id),
           document_name: d.name,
@@ -2997,16 +3070,19 @@ export default function GridApp() {
     setTyping(false);
   }, [activeTask, activeDoc, isAllScope, docs.length, task, typing, handleCitation, authToken, selectedContext]);
 
-  // "Search sources" — the second option on the source panel's selection
+  // "Analyze related legal issues" (tooltip; formerly "Search sources") — the second option on the source panel's selection
   // popover. Fires straight off, using the Related Precedents system prompt
   // for just this one message (via taskOverride) without switching the app's
   // actual Task Mode, and passes the selection as an explicit contextOverride
   // so it doesn't depend on selectedContext state having landed yet.
   const handleSearchSelectionSources = useCallback((text, docName) => {
     sendMessage(
-      "Find and summarize relevant legal precedents, case law, and background sources for this passage.",
+      "Identify the legal issues raised by this passage and discuss doctrines or well-known precedents that may relate to it. " +
+      "This is AI analysis, not a lookup of verified sources: begin with one short sentence saying so, and if you are not certain a case " +
+      "or citation exists, say that plainly instead of presenting it as authority.",
       "precedents",
       { text, docName },
+      { unverified: true }, // UI adds a fixed caveat under the answer — not left to the model to remember
     );
   }, [sendMessage]);
 
@@ -3028,7 +3104,7 @@ export default function GridApp() {
   // same /ask + document-context machinery as chat, but ask the model for JSON
   // and render the parsed result as a purpose-built view instead of a chat bubble.
   const runToolQuery = useCallback(async (promptText, modelOverride) => {
-    const perDocLimit = Math.max(2000, Math.min(8000, Math.floor(16000 / Math.max(docs.length, 1))));
+    const perDocLimit = combinedPerDocLimit(docs.length);
     const combinedSelections = isAllScope
       ? docs.map(d => ({
           id: String(d.id), document_name: d.name,
@@ -3084,7 +3160,7 @@ export default function GridApp() {
           "legal passage, legal effect: what right, obligation, deadline, or risk shifted, and " +
           "which party the change favors or disfavors. If the two say essentially the same thing " +
           "despite different wording, say so plainly. Keep it to 2-4 sentences.",
-        model: "qwen3:latest",
+        model: EXPLAIN_MODEL,
         active_document_name: null,
         selected_text: "",
         selections: [
@@ -3167,23 +3243,30 @@ export default function GridApp() {
     if (toolLoading) return;
     setToolLoading(true); setToolError("");
     const lengthInstruction = { brief: "very brief (2-3 sentences per section)", standard: "standard", detailed: "thorough and detailed" }[length] || "standard";
-    // In combined ("All Documents") scope the context below is actually N
-    // separate documents concatenated together, each under its own
-    // "Document file: ..." header — but the original prompt only ever said
-    // "summary of the document" (singular), with nothing telling the model
-    // there was more than one to get through. Left to its own judgment, it
-    // would inconsistently stop after the first document — sometimes
-    // covering all of them, more often just one, varying run to run with no
-    // way to predict which. Naming the count and requiring per-document
-    // coverage makes that explicit instead of implicit.
+    // In combined ("All Documents") scope the context below is really N
+    // separate documents concatenated under their own "Document file: ..."
+    // headers. The original prompt only said "summary of the document"
+    // (singular), so the model would often stop after the first one. This
+    // version names the count and requires every document to be CONSIDERED —
+    // but not to appear in every section: a contract with no dates just has
+    // nothing to add under Key Dates, and forcing an entry there would make
+    // the model invent one. Each item carries its source file name so it can
+    // be checked. Only the opening of each document is sent (see
+    // combinedPerDocLimit), which the prompt says so the model doesn't imply
+    // it read further.
+    const N = docs.length;
     const scopeInstruction = isAllScope
-      ? `The context below contains ${docs.length} separate documents, each introduced by its own "Document file: ..." header. Produce ONE combined summary that covers every one of these ${docs.length} documents — do not stop after the first document. Every section (parties, key_dates, obligations, notable_clauses) must include at least one entry from each of the ${docs.length} documents, so the full arrays span all of them, not just the first.`
+      ? `Produce a ${lengthInstruction} combined summary. The context below contains ${N} separate documents, each introduced by its own "Document file: ..." header, and only the opening portion of each document is provided. ` +
+        `Work through the documents ONE AT A TIME, in the order given, and for each one record every party, date, obligation and notable clause that its text explicitly states. ` +
+        `Do not skip a document, and do not drop stated items just to keep the answer short — the finished lists should reflect all ${N} documents. ` +
+        `Use only what the supplied text explicitly states; never infer or invent a party, date, amount or clause. If a document states nothing for a section it simply adds nothing there, which is expected. ` +
+        `End every item with the source document's file name in parentheses, e.g. "... (contract.pdf)".`
       : `Produce a ${lengthInstruction} structured summary of the document.`;
     try {
-      const prompt = `You are a legal document analyst. ${scopeInstruction}\n\nReturn ONLY a JSON object with this exact shape, no markdown, no explanation outside the JSON:\n{"parties": ["..."], "key_dates": [{"date": "...", "description": "..."}], "obligations": ["..."], "notable_clauses": ["..."]}\nIf a section doesn't apply, return an empty array for it.`;
+      const prompt = `You are a legal document analyst. ${scopeInstruction}\n\nReturn ONLY a JSON object with this exact shape, no markdown, no explanation outside the JSON:\n{"parties": ["..."], "key_dates": [{"date": "...", "description": "..."}], "obligations": ["..."], "notable_clauses": ["..."]}\nIf nothing is stated for a section, return an empty array for it.`;
       const full = await runToolQuery(prompt);
       const data = extractJson(full, "object");
-      setSummaryByDoc(prev => ({ ...prev, [activeDocId]: { ...(data || {}), raw: full, parsed: !!data, length, ranAt: new Date().toISOString() } }));
+      setSummaryByDoc(prev => ({ ...prev, [activeDocId]: { ...(data || {}), raw: full, parsed: !!data, length, ranAt: new Date().toISOString(), combinedDocs: isAllScope ? docs.length : 0, perDocChars: isAllScope ? combinedPerDocLimit(docs.length) : 0 } }));
     } catch (e) {
       setToolError(e.message || "Could not generate the summary.");
     } finally {
@@ -3372,6 +3455,7 @@ export default function GridApp() {
               const active = doc.id === activeDocId;
               const typeColor = DOC_TYPE_COLOR[doc.type] || "#6b7080";
               const deleting = doc.id === deletingDocId;
+              const confirming = doc.id === confirmDeleteId;
               return (
                 <div key={doc.id}
                   className="doc-row"
@@ -3400,23 +3484,29 @@ export default function GridApp() {
                       overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
                     }}>{doc.name}</div>
                     <div style={{ fontSize: "10px", color: "#5b6072" }}>
-                      {deleting ? "Deleting…" : <>{doc.pages} page{doc.pages !== 1 ? "s" : ""} · {doc.type}</>}
+                      {deleting ? "Deleting…" : doc.fromHistory ? <>extracted text · {doc.type}</> : <>{doc.pages} page{doc.pages !== 1 ? "s" : ""} · {doc.type}</>}
                     </div>
                   </div>
-                  <button
-                    className="doc-row-delete"
-                    onClick={e => handleDeleteDoc(doc, e)}
-                    disabled={deleting}
-                    title={`Delete "${doc.name}"`}
-                    style={{
-                      width: "20px", height: "20px", flexShrink: 0, borderRadius: "6px",
-                      background: "transparent", border: "none", color: "#6b7280",
-                      display: "flex", alignItems: "center", justifyContent: "center",
-                      cursor: deleting ? "default" : "pointer",
-                    }}
-                    onMouseEnter={e => { e.stopPropagation(); if (!deleting) { e.currentTarget.style.background = "rgba(248,113,113,.15)"; e.currentTarget.style.color = "#f87171"; } }}
-                    onMouseLeave={e => { e.stopPropagation(); e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "#6b7280"; }}
-                  >{deleting ? <IconRefresh width={11} height={11} /> : <IconX width={11} height={11} />}</button>
+                  {(authToken || doc.persisted === false) && (
+                    <button
+                      className={`doc-row-delete${confirming ? " armed" : ""}`}
+                      onClick={e => handleDeleteDoc(doc, e)}
+                      onBlur={() => { if (confirming) setConfirmDeleteId(null); }}
+                      disabled={deleting}
+                      title={confirming ? "Click again to permanently delete" : `Delete "${doc.name}"`}
+                      style={{
+                        height: "20px", minWidth: "20px", flexShrink: 0, borderRadius: "6px",
+                        padding: confirming ? "0 8px" : 0,
+                        background: confirming ? "rgba(248,113,113,.18)" : "transparent",
+                        border: "none", color: confirming ? "#f87171" : "#6b7280",
+                        fontSize: "10.5px", fontWeight: 700, fontFamily: UI_FONT,
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        cursor: deleting ? "default" : "pointer",
+                      }}
+                      onMouseEnter={e => { e.stopPropagation(); if (!deleting && !confirming) { e.currentTarget.style.background = "rgba(248,113,113,.15)"; e.currentTarget.style.color = "#f87171"; } }}
+                      onMouseLeave={e => { e.stopPropagation(); if (!confirming) { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "#6b7280"; } }}
+                    >{deleting ? <IconRefresh width={11} height={11} /> : confirming ? "Delete?" : <IconX width={11} height={11} />}</button>
+                  )}
                 </div>
               );
             })}
@@ -4086,6 +4176,16 @@ export default function GridApp() {
                               {msg.text}
                               {msg.streaming && <span style={{ opacity: .5, animation: "blink 1s infinite" }}>▊</span>}
                             </div>
+                            {msg.unverified && (
+                              <div style={{
+                                marginTop: "8px", display: "inline-flex", alignItems: "center", gap: "6px",
+                                fontSize: "11px", color: "#92400e", background: "#fffbeb", border: "1px solid #fde68a",
+                                borderRadius: "8px", padding: "4px 9px", lineHeight: "1.4",
+                              }}>
+                                <IconAlertTriangle width={12} height={12} />
+                                AI analysis only — any cases or citations above are not verified against a source.
+                              </div>
+                            )}
                             {msg.citations?.length > 0 && (
                               <div style={{ marginTop: "8px", display: "flex", flexWrap: "wrap", gap: "5px" }}>
                                 {msg.citations.map((c, i) => (
@@ -6143,7 +6243,7 @@ export default function GridApp() {
                   window.getSelection()?.removeAllRanges();
                   handleSearchSelectionSources(text, activeDoc?.name || "");
                 }}
-                title="Search for related legal precedents and sources"
+                title="Analyze related legal issues (AI analysis — not verified sources)"
                 style={{
                   display: "flex", alignItems: "center", justifyContent: "center",
                   background: "none", border: "none", color: "#fff", cursor: "pointer",
@@ -6181,7 +6281,7 @@ export default function GridApp() {
                   const { text } = selPopover;
                   setSelPopover(null);
                   window.getSelection()?.removeAllRanges();
-                  handleAddToCompare(text, activeDoc?.name || "");
+                  handleAddToCompare(text, activeDoc?.name || "", activeDoc?.id);
                 }}
                 title="Add to compare — build a redline diff against another selection"
                 style={{
@@ -6267,6 +6367,7 @@ function Styles() {
         transition: opacity .12s, transform .12s, background .12s, color .12s;
       }
       .doc-row:hover .doc-row-delete,
+      .doc-row .doc-row-delete.armed,
       .doc-row .doc-row-delete:focus-visible {
         opacity: 1;
         pointer-events: auto;
