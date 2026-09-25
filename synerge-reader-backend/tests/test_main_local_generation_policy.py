@@ -15,6 +15,7 @@ deployment, or the unrelated Resend or Google egress categories.
 """
 
 import ast
+import json
 from pathlib import Path
 
 import pytest
@@ -203,7 +204,23 @@ def test_local_generation_exception_is_safe_and_has_no_fallback_call(main_tree):
     yields = [node for node in ast.walk(handler) if isinstance(node, ast.Yield)]
     assert len(yields) == 2
     yielded_text = [_literal_text(node.value).lower() for node in yields]
-    assert all(text.startswith("__error__") and "ollama" in text for text in yielded_text)
+    # E2 transport migration. These two yields used to be ``__ERROR__...__``
+    # sentinel strings; the /ask stream now carries NDJSON events, so the same
+    # two failures are emitted as one-line ``{"type": "error", ...}`` objects.
+    # The policy being protected is unchanged and the checks below are
+    # stricter than the old prefix check: each yield must still be a plain
+    # string literal (so no exception text can be interpolated into it), and it
+    # must now also parse as a JSON error event carrying a literal message.
+    for node in yields:
+        assert isinstance(node.value, ast.Constant) and isinstance(node.value.value, str), (
+            "each generation-failure yield must be a plain string literal, not "
+            "an f-string or any expression that could interpolate raw internals"
+        )
+        event = json.loads(node.value.value)
+        assert event["type"] == "error", "a generation failure must emit an error event"
+        assert isinstance(event["message"], str) and event["message"]
+        assert isinstance(event["code"], str) and event["code"]
+    assert all("ollama" in text for text in yielded_text)
     assert any("model" in text and "installed" in text for text in yielded_text)
     assert any(
         "local llm server is not reachable" in text and "ollama_base_url" in text

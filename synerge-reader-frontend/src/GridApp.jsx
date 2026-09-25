@@ -189,23 +189,351 @@ function Badge({ children, color }) {
   );
 }
 
-function CitationChip({ page, label, onClick }) {
+// Reassembles the /ask NDJSON stream. A network chunk can split a line
+// anywhere, so partial input is buffered until a newline completes it. Answer
+// text only ever arrives as a JSON string inside a delta event, so an answer
+// that happens to contain an old double-underscore sentinel is just text.
+function createEventDecoder() {
+  let buffer = "";
+  const decode = (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return null;
+    try {
+      const event = JSON.parse(trimmed);
+      return event && typeof event.type === "string" ? event : null;
+    } catch (_) {
+      return null;   // a broken frame is dropped, never printed as content
+    }
+  };
+  return {
+    feed(chunk) {
+      buffer += chunk;
+      const events = [];
+      let index = buffer.indexOf("\n");
+      while (index !== -1) {
+        const event = decode(buffer.slice(0, index));
+        if (event) events.push(event);
+        buffer = buffer.slice(index + 1);
+        index = buffer.indexOf("\n");
+      }
+      return events;
+    },
+    close() {
+      const event = decode(buffer);
+      buffer = "";
+      return event ? [event] : [];
+    },
+  };
+}
+
+// ── citation text matching (TXT) ──────────────────────────────────────────
+// TXT evidence has no page, so navigation is done by finding the citation's
+// PUBLIC excerpt inside the document the browser already holds. The excerpt is
+// the bounded, server-supplied string; the full internal evidence text is never
+// sent to the client and is never used here.
+const TXT_WORDS_PER_PAGE = 350;
+
+function normalizeWords(text) {
+  return (text || "").replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
+}
+
+// Compared loosely so that punctuation or case differences between the stored
+// excerpt and the locally parsed text do not defeat an otherwise exact match.
+function matchToken(word) {
+  return word.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+// The words to search for. The trailing ellipsis is part of the excerpt's
+// presentation, not of the document, so it is dropped only when the backend
+// says the excerpt was actually truncated.
+function excerptNeedle(citation) {
+  let text = citation?.excerpt || "";
+  if (citation?.excerpt_truncated) text = text.replace(/\u2026\s*$/, "");
+  return normalizeWords(text);
+}
+
+function findWordRange(docWords, needleWords) {
+  if (!docWords.length || !needleWords.length) return null;
+  const doc = docWords.map(matchToken);
+  const needle = needleWords.map(matchToken).filter(Boolean);
+  if (!needle.length) return null;
+  const probe = needle.slice(0, Math.min(needle.length, 12));
+  for (let i = 0; i + probe.length <= doc.length; i++) {
+    let hit = true;
+    for (let j = 0; j < probe.length; j++) {
+      if (doc[i + j] !== probe[j]) { hit = false; break; }
+    }
+    if (hit) return { start: i, end: Math.min(i + needle.length, doc.length) };
+  }
+  return null;
+}
+
+// ── complete-document citations ───────────────────────────────────────────
+// When the whole document was supplied to the model, no single passage is
+// "the" support: the answer may rest on anything in it. The excerpt on such a
+// citation is only the document's bounded opening, so quoting it as the
+// supporting passage — or matching it to place a highlight — points the reader
+// at the first paragraph however far from it the real support lies. These
+// citations therefore say what is true, open the document, and claim no
+// location at all.
+const COMPLETE_DOCUMENT_LABEL = "Complete document reviewed";
+
+function isCompleteDocumentCitation(citation) {
+  return citation?.evidence_mode === "complete_document"
+    || citation?.source_type === "complete_document";
+}
+
+// Renders one preview page, marking the cited words when the highlighted range
+// overlaps this page. Plain text nodes plus <mark>, never raw HTML injection,
+// so ordinary text selection keeps working across the highlight.
+function renderPageWords(pageWords, offset, range) {
+  const plain = pageWords.join(" ");
+  if (!range) return plain;
+  const from = Math.max(range.start - offset, 0);
+  const to = Math.min(range.end - offset, pageWords.length);
+  if (to <= from) return plain;
+  const before = pageWords.slice(0, from).join(" ");
+  const hit = pageWords.slice(from, to).join(" ");
+  const after = pageWords.slice(to).join(" ");
+  return (
+    <>
+      {before ? before + " " : ""}
+      <mark style={{ background: "#fde68a", color: "inherit", padding: "0 1px" }}>{hit}</mark>
+      {after ? " " + after : ""}
+    </>
+  );
+}
+
+// One cited source, as the reader sees it: the display number the answer used,
+// the document it came from, a locator that is true (a real page, or the
+// honest "Relevant passage"), and the server's bounded excerpt. Internal ids
+// (C1..Cn), chunk indexes and retrieval scores are never shown.
+function CitationCard({ citation, onOpen }) {
   const [hov, setHov] = useState(false);
+  const source = citation.filename || citation.display_source || "Source";
+  const locator = citation.locator?.label || "Relevant passage";
+  // A complete-document citation gets the honest statement instead of a
+  // locator, and no quotation: its excerpt is the document's head, not the
+  // passage the answer used.
+  const wholeDocument = isCompleteDocumentCitation(citation);
+  const locatorLabel = wholeDocument ? COMPLETE_DOCUMENT_LABEL : locator;
+  return (
+    <div style={{
+      border: "1px solid #dbeafe", background: "#f8fbff", borderRadius: "8px",
+      padding: "8px 10px", display: "flex", gap: "8px", alignItems: "flex-start",
+      maxWidth: "100%",
+    }}>
+      <span style={{
+        flexShrink: 0, minWidth: "20px", height: "20px", borderRadius: "10px",
+        background: "#dbeafe", color: "#1d4ed8", fontSize: "11px", fontWeight: 700,
+        display: "inline-flex", alignItems: "center", justifyContent: "center",
+        padding: "0 6px",
+      }}>{citation.displayNumber}</span>
+      <div style={{ minWidth: 0, flex: 1 }}>
+        <div style={{ fontSize: "12px", fontWeight: 700, color: "#111827" }}>{source}</div>
+        <div style={{ fontSize: "11px", color: "#6b7280", marginTop: "1px" }}>{locatorLabel}</div>
+        {!wholeDocument && citation.excerpt && (
+          <div style={{
+            fontSize: "11.5px", color: "#374151", marginTop: "5px",
+            lineHeight: "1.5", fontStyle: "italic",
+          }}>“{citation.excerpt}”</div>
+        )}
+        <button
+          onClick={() => onOpen(citation)}
+          onMouseEnter={() => setHov(true)}
+          onMouseLeave={() => setHov(false)}
+          style={{
+            marginTop: "6px", padding: "3px 9px", fontSize: "11px", fontWeight: 600,
+            color: "#1d4ed8", background: hov ? "#dbeafe" : "#eff6ff",
+            border: "1px solid #bfdbfe", borderRadius: "5px", cursor: "pointer",
+          }}
+        >{wholeDocument ? "Open document" : "Open source"}</button>
+      </div>
+    </div>
+  );
+}
+
+// An inline marker the model wrote. A resolvable one becomes the display number
+// and opens the source; an unknown id stays visibly unresolved and inert.
+function InlineCitation({ citation, token, pending, onOpen }) {
+  const [hov, setHov] = useState(false);
+  if (!citation) {
+    // Until verification says which sources the answer used, nothing is known
+    // about this marker. Calling it invalid now would accuse every marker in a
+    // still-streaming answer of being fabricated.
+    if (pending) {
+      return <span style={{ color: "#9ca3af", fontSize: "11px", fontWeight: 700 }}>{token}</span>;
+    }
+    return (
+      <span
+        title="The model referenced a source that was not supplied to it."
+        style={{
+          color: "#b91c1c", background: "#fef2f2", border: "1px dashed #f87171",
+          borderRadius: "3px", padding: "0 3px", fontSize: "11px", fontWeight: 700,
+        }}
+      >{token}</span>
+    );
+  }
   return (
     <button
-      onClick={() => onClick(page)}
+      type="button"
+      onClick={() => onOpen(citation)}
       onMouseEnter={() => setHov(true)}
       onMouseLeave={() => setHov(false)}
+      title={`${citation.filename || "Source"} — ${citation.locator?.label || "Relevant passage"}`}
+      aria-label={`Open source ${citation.displayNumber}: ${citation.filename || "document"}`}
       style={{
-        display: "inline-flex", alignItems: "center", gap: "3px",
-        padding: "2px 8px",
-        background: hov ? "#bfdbfe" : "#dbeafe",
-        border: "1px solid #3b82f6", borderRadius: "3px",
-        color: "#1d4ed8", fontSize: "11px",
-        fontFamily: "'Courier New',monospace",
-        cursor: "pointer", fontWeight: 700, transition: "background .1s",
+        border: "1px solid #bfdbfe", background: hov ? "#dbeafe" : "#eff6ff",
+        color: "#1d4ed8", borderRadius: "4px", padding: "0 4px", margin: "0 1px",
+        fontSize: "10.5px", fontWeight: 700, cursor: "pointer", verticalAlign: "baseline",
       }}
-    >📄 p.{page}{label ? ` · ${label}` : ""}</button>
+    >{citation.displayNumber}</button>
+  );
+}
+
+// The answer, with every exact [Cn] token that resolves to a used source
+// replaced by its display number. Nothing else in the text is touched.
+function AnswerText({ text, citations, pending, onOpen }) {
+  const body = text || "";
+  const byId = {};
+  (citations || []).forEach(c => { byId[c.citation_id] = c; });
+  const nodes = [];
+  const pattern = /\[C(\d+)\]/g;
+  let last = 0;
+  let match;
+  while ((match = pattern.exec(body)) !== null) {
+    if (match.index > last) {
+      nodes.push(body.slice(last, match.index));
+    } else if (nodes.length) {
+      // Two markers written back to back. Without something between them the
+      // public numbers abut and "[C2][C3]" reads as a single citation "23".
+      nodes.push(
+        <span key={`sep-${match.index}`} aria-hidden="true" style={{ padding: "0 1px" }}>·</span>
+      );
+    }
+    const id = `C${parseInt(match[1], 10)}`;
+    nodes.push(
+      <InlineCitation
+        key={`${id}-${match.index}`}
+        citation={byId[id]}
+        token={match[0]}
+        pending={pending}
+        onOpen={onOpen}
+      />
+    );
+    last = match.index + match[0].length;
+  }
+  if (last < body.length) nodes.push(body.slice(last));
+  return <>{nodes}</>;
+}
+
+// What happened to one claim, in the reader's language. The backend's reason
+// is what separates "we checked and it is not supported" from "we never got to
+// check it" — collapsing those into one "not verified" count is what made the
+// old pills unreadable.
+const CLAIM_STATE_LABEL = {
+  supported:           { label: "Supported",                        color: "#15803d", background: "#dcfce7", border: "#86efac" },
+  partially_supported: { label: "Partly supported",                 color: "#b45309", background: "#fef3c7", border: "#fcd34d" },
+  no_citation:         { label: "Not supported by a cited document", color: "#b91c1c", background: "#fee2e2", border: "#fca5a5" },
+  invalid_citation:    { label: "Citation could not be resolved",    color: "#b91c1c", background: "#fee2e2", border: "#fca5a5" },
+  // The claim did cite a source; that source just does not state it. Saying
+  // "not supported by a cited document" would misdescribe what went wrong.
+  evidence_mismatch:   { label: "Cited source does not state this",  color: "#b91c1c", background: "#fee2e2", border: "#fca5a5" },
+  not_checked:         { label: "Not checked",                       color: "#475569", background: "#f1f5f9", border: "#cbd5e1" },
+  check_unavailable:   { label: "Check unavailable",                 color: "#475569", background: "#f1f5f9", border: "#cbd5e1" },
+};
+
+function claimStateKey(claim) {
+  if (claim.status === "supported") return "supported";
+  if (claim.status === "partially_supported") return "partially_supported";
+  if (claim.status === "unsupported") {
+    if (claim.reason === "invalid_citation") return "invalid_citation";
+    if (claim.reason === "evidence_terms_missing") return "evidence_mismatch";
+    return "no_citation";
+  }
+  // unverified: the reason says whether we ran out of budget or the verifier
+  // itself failed. Neither means the claim is wrong.
+  return (claim.reason === "verifier_unavailable" || claim.reason === "verifier_malformed")
+    ? "check_unavailable"
+    : "not_checked";
+}
+
+const SUPPORT_HEADLINE = {
+  supported:   "Supported by your documents",
+  unsupported: "Parts of this answer are not supported by your documents",
+  mixed:       "Some claims in this answer need checking",
+  incomplete:  "Citation check incomplete",
+  unavailable: "Citation check unavailable",
+};
+
+const UNSUPPORTED_KEYS = ["no_citation", "invalid_citation", "evidence_mismatch"];
+
+// The headline is a summary, not a verdict on the weakest sentence. An answer
+// whose substantive claims are all cited and supported should not be shown as
+// wholly unsupported because it opened with a framing sentence like "IRCoT and
+// Step-Back Prompting differ in their approach" — that sentence asserts
+// nothing about the documents, so nothing can cite it.
+//
+// The rule that does not move: an answer with no supported claim at all stays
+// red. Softening only applies where real, supported claims exist alongside the
+// unsupported ones, and the per-claim rows below always show the full detail.
+function supportHeadlineKey(claims) {
+  const keys = claims.map(claimStateKey);
+  const unsupported = keys.filter(k => UNSUPPORTED_KEYS.includes(k)).length;
+  const supported = keys.filter(k => k === "supported" || k === "partially_supported").length;
+  if (unsupported > 0 && supported === 0) return "unsupported";
+  if (unsupported > 0) return "mixed";
+  if (keys.some(k => k === "check_unavailable")) return "unavailable";
+  if (keys.some(k => k === "not_checked")) return "incomplete";
+  return "supported";
+}
+
+function ClaimSupportSummary({ claims, citations, onOpen }) {
+  const [open, setOpen] = useState(false);
+  if (!claims?.length) return null;
+  const headlineKey = supportHeadlineKey(claims);
+  const tone = headlineKey === "supported" ? "#15803d"
+    : headlineKey === "unsupported" ? "#b91c1c"
+    : headlineKey === "mixed" ? "#b45309" : "#475569";
+  return (
+    <div style={{ marginTop: "8px" }}>
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        aria-expanded={open}
+        style={{
+          display: "inline-flex", alignItems: "center", gap: "6px",
+          background: "none", border: "none", padding: 0, cursor: "pointer",
+          fontSize: "11.5px", fontWeight: 700, color: tone,
+        }}
+      >
+        {SUPPORT_HEADLINE[headlineKey]}
+        <span style={{ fontSize: "10px", color: "#9ca3af" }}>{open ? "▲ hide details" : "▼ details"}</span>
+      </button>
+      {open && (
+        <div style={{ marginTop: "6px", display: "flex", flexDirection: "column", gap: "5px" }}>
+          {claims.map((claim, i) => {
+            const state = CLAIM_STATE_LABEL[claimStateKey(claim)];
+            return (
+              <div key={i} style={{ display: "flex", gap: "7px", alignItems: "flex-start" }}>
+                <span style={{
+                  flexShrink: 0, padding: "1px 7px", borderRadius: "10px", fontSize: "10px",
+                  fontWeight: 700, color: state.color, background: state.background,
+                  border: `1px solid ${state.border}`,
+                }}>{state.label}</span>
+                <span style={{ fontSize: "11.5px", color: "#4b5563", lineHeight: "1.5" }}>
+                  {/* The claim text is what the model wrote, so it still
+                      carries raw [Cn] registry ids. It goes through the same
+                      rewriter as the answer body so the reader sees compact
+                      public numbers here too, never an internal id. */}
+                  <AnswerText text={claim.text} citations={citations} pending={false} onOpen={onOpen} />
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -836,7 +1164,7 @@ function PdfCanvasPage({ pdfDoc, pageNum, highlighted }) {
   );
 }
 
-function PdfViewer({ doc, highlightPage }) {
+function PdfViewer({ doc, highlightPage, highlightRange }) {
   const [pdfDoc,    setPdfDoc]    = useState(null);
   const [pageCount, setPageCount] = useState(0);
   const [loading,   setLoading]   = useState(false);
@@ -881,13 +1209,16 @@ function PdfViewer({ doc, highlightPage }) {
 
   // TXT — clean text pager
   if (!doc.isPdf && !doc.isDocx) {
-    const words    = (doc.text || "").split(/\s+/).filter(Boolean);
-    const PER_PAGE = 350;
+    const words    = normalizeWords(doc.text);
+    const PER_PAGE = TXT_WORDS_PER_PAGE;
     const textPages = [];
     for (let i = 0; i < words.length; i += PER_PAGE) {
-      textPages.push(words.slice(i, i + PER_PAGE).join(" "));
+      textPages.push(words.slice(i, i + PER_PAGE));
     }
-    if (!textPages.length) textPages.push("(empty document)");
+    if (!textPages.length) textPages.push(["(empty document)"]);
+    // A citation highlight belongs to one document; it must not bleed onto
+    // whichever document is opened next.
+    const citedRange = highlightRange && highlightRange.docId === doc.id ? highlightRange : null;
 
     return (
       <div ref={containerRef} style={{
@@ -895,15 +1226,24 @@ function PdfViewer({ doc, highlightPage }) {
         padding: "16px", display: "flex", flexDirection: "column",
         alignItems: "center", gap: "12px",
       }}>
-        {textPages.map((pageText, i) => {
+        {textPages.map((pageWords, i) => {
           const pg = i + 1;
-          const hi = pg === highlightPage;
+          const offset = i * PER_PAGE;
+          // A citation can straddle a preview-page boundary; each affected page
+          // marks its own portion, and navigation scrolls to the first.
+          const overlaps = !!citedRange
+            && citedRange.end > offset
+            && citedRange.start < offset + pageWords.length;
+          const hi = pg === highlightPage || overlaps;
           return (
             <div key={pg} id={`vpg-${pg}`} style={{
               width: "100%", maxWidth: "680px", background: "#fff",
               border: hi ? "2px solid #3b82f6" : "1px solid #d1d5db",
               boxShadow: hi ? "0 0 0 3px rgba(59,130,246,.15)" : "0 1px 3px rgba(0,0,0,.06)",
               borderRadius: "2px", transition: "all .2s", overflow: "hidden",
+              // Without this the card shrinks to fit the flex column, clips its
+              // own text, and the outer panel never gains anything to scroll.
+              flexShrink: 0,
             }}>
               <div style={{
                 display: "flex", justifyContent: "space-between",
@@ -938,7 +1278,7 @@ function PdfViewer({ doc, highlightPage }) {
                 // just overflows the card instead of wrapping. This breaks
                 // it as a last resort, without affecting normal prose.
                 overflowWrap: "anywhere",
-              }}>{pageText}</div>
+              }}>{renderPageWords(pageWords, offset, overlaps ? citedRange : null)}</div>
               {hi && <div style={{ height: "4px", background: "#fde047" }} />}
             </div>
           );
@@ -1767,6 +2107,8 @@ export default function GridApp() {
   const [input,       setInput]       = useState("");
   const [typing,      setTyping]      = useState(false);
   const [hlPage,      setHlPage]      = useState(null);
+  // The word range a TXT citation matched, scoped to one document id.
+  const [hlRange,     setHlRange]     = useState(null);
   const [uploading,   setUploading]   = useState(false);
   const [uploadErr,   setUploadErr]   = useState("");
   const [isDragging,  setIsDragging]  = useState(false);
@@ -1900,7 +2242,7 @@ export default function GridApp() {
 
   const handleAskAboutSelection = useCallback(() => {
     if (!selPopover) return;
-    setSelectedContext({ text: selPopover.text, docName: activeDoc?.name || "" });
+    setSelectedContext({ text: selPopover.text, docName: activeDoc?.name || "", docId: activeDoc?.id ?? null });
     setSelPopover(null);
     window.getSelection()?.removeAllRanges();
   }, [selPopover, activeDoc]);
@@ -2292,10 +2634,61 @@ export default function GridApp() {
     setPrecLoading(false);
   }, []);
 
-  const handleCitation = useCallback((page) => {
-    setHlPage(page);
+  // Opens the cited evidence: select the document the citation names when it
+  // is open locally, and highlight its page when the citation truthfully has
+  // one. A citation with no page (chunk/paragraph/selection locator) still
+  // opens the source panel rather than jumping to an invented page.
+  const handleCitation = useCallback((citation) => {
+    if (typeof citation === "number") {
+      setHlPage(citation);
+      setHlRange(null);
+      setSourceOpen(true);
+      return;
+    }
+    if (!citation || citation.invalid) return;
+
+    const target = citation.document_id != null
+      ? docs.find(d => d.id === citation.document_id)
+      : null;
+    if (target) setActiveDocId(target.id);
+    // Whatever happens next, the previous citation's highlight is stale.
+    setHlRange(null);
+
+    // Complete document: the model read the whole thing, so there is no
+    // supporting passage to scroll to. Open the document with the page and
+    // range cleared rather than matching the bounded head excerpt, which
+    // would highlight the opening paragraph wherever the support really is.
+    if (isCompleteDocumentCitation(citation)) {
+      setHlPage(null);
+      setSourceOpen(true);
+      return;
+    }
+
+    // PDF: the backend reported a real page, so use it.
+    const page = citation.locator?.page_start ?? null;
+    if (page) {
+      setHlPage(page);
+      setSourceOpen(true);
+      return;
+    }
+
+    // TXT: no page exists, so find the PUBLIC excerpt inside the document the
+    // browser already parsed. The full evidence text is never sent here.
+    if (target && !target.isPdf && !target.isDocx) {
+      const range = findWordRange(normalizeWords(target.text), excerptNeedle(citation));
+      if (range) {
+        setHlRange({ docId: target.id, start: range.start, end: range.end });
+        setHlPage(Math.floor(range.start / TXT_WORDS_PER_PAGE) + 1);
+        setSourceOpen(true);
+        return;
+      }
+    }
+
+    // DOCX, an unmatched excerpt, or a document not open locally: show the
+    // source and its excerpt, and invent no location.
+    setHlPage(null);
     setSourceOpen(true);
-  }, []);
+  }, [docs]);
 
   // Thumbs up/down on an assistant reply — persists to chat_history.rating via the
   // existing (previously unwired) /put_ratings endpoint, feeding the admin dashboard's
@@ -2474,16 +2867,22 @@ export default function GridApp() {
         }),
       });
       if (!res.ok) throw new Error();
-      const reader = res.body.getReader();
-      const dec    = new TextDecoder();
-      let   full   = "";
+      // Same NDJSON transport as chat: answer text arrives only in delta
+      // events. This path still sniffed the retired sentinel prefixes, which
+      // meant it read control frames as suggestion text.
+      const reader  = res.body.getReader();
+      const dec     = new TextDecoder();
+      const decoder = createEventDecoder();
+      let   full    = "";
+      const applyEvent = (event) => {
+        if (event.type === "delta" && typeof event.text === "string") full += event.text;
+      };
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        const chunk = dec.decode(value);
-        if (/^__(SEARCHING|READY|CONTEXT|ENTRY_ID)/.test(chunk.trim())) continue;
-        full += chunk;
+        decoder.feed(dec.decode(value, { stream: true })).forEach(applyEvent);
       }
+      decoder.close().forEach(applyEvent);
       const match = full.match(/\[[\s\S]*?\]/);
       if (match) {
         const arr = JSON.parse(match[0]);
@@ -2534,16 +2933,19 @@ export default function GridApp() {
     const msgId  = Date.now() + 1;
     setMessages(m => [...m, { id: msgId, role: "assistant", model: effectiveTask?.model, text: "", citations: [], streaming: true }]);
 
-    // Combined mode sends the exact text of every doc the user uploaded in this
-    // session, so answers are scoped to those documents only — not the shared,
-    // unfiltered vector index, which can contain unrelated documents other users uploaded.
-    const perDocLimit = Math.max(2000, Math.min(8000, Math.floor(16000 / Math.max(docs.length, 1))));
-    const combinedSelections = isAllScope
-      ? docs.map(d => ({
-          id:            String(d.id),
-          document_name: d.name,
-          text:          (d.text || "").slice(0, perDocLimit) || `(No extractable text for ${d.name})`,
-        }))
+    // Document scope travels as backend document ids. Combined mode no longer
+    // ships the concatenated text of every open document as if the user had
+    // highlighted it: the server holds those documents, retrieves from them
+    // within this user's authorized scope, and reports what it actually used.
+    // Only a real highlight is sent as selected evidence.
+    const scopeDocumentIds = docs.map(d => d.id).filter(id => Number.isInteger(id));
+    const explicitSelections = askedContext?.text
+      ? [{
+          id:            String(askedContext.id || "selection-1"),
+          text:          askedContext.text,
+          document_name: askedContext.docName || "",
+          document_id:   Number.isInteger(askedContext.docId) ? askedContext.docId : null,
+        }]
       : [];
 
     try {
@@ -2555,52 +2957,99 @@ export default function GridApp() {
           question:             prefix + text,
           model:                effectiveTask?.model || "llama3.1:8b",
           active_document_name: isAllScope ? null : (activeDoc?.name || null),
+          active_document_id:   isAllScope ? null : (Number.isInteger(activeDoc?.id) ? activeDoc.id : null),
+          document_ids:         isAllScope ? scopeDocumentIds : [],
           selected_text:        askedContext?.text || "",
-          selections:           combinedSelections,
+          selections:           explicitSelections,
           auth_token:           authToken || null,
         }),
       });
       if (!res.ok) throw new Error(`${res.status}`);
 
-      const reader = res.body.getReader();
-      const dec    = new TextDecoder();
-      let   full   = "";
+      const reader   = res.body.getReader();
+      const dec      = new TextDecoder();
+      const decoder  = createEventDecoder();
+      let   full     = "";
+      let   candidates = [];
+      let   citations = [];
+      let   finished = false;
+      let   failed   = false;
+      let   verified = false;
+
+      const applyEvent = (event) => {
+        if (event.type === "evidence") {
+          // Retrieval candidates. They are NOT sources yet: the answer may use
+          // one of them, so nothing is shown until verification reports which
+          // ids were actually cited.
+          candidates = Array.isArray(event.citations) ? event.citations : [];
+          setMessages(prev => prev.map(msg =>
+            msg.id === msgId
+              ? { ...msg, citations: [], evidenceMode: event.mode, sourcesPending: true }
+              : msg
+          ));
+        } else if (event.type === "delta") {
+          full += typeof event.text === "string" ? event.text : "";
+          setMessages(prev => prev.map(msg => msg.id === msgId ? { ...msg, text: full } : msg));
+        } else if (event.type === "verification") {
+          verified = true;
+          // Display numbers follow first use in the answer, which is the order
+          // the backend reports — never the candidate array's position.
+          const byId = {};
+          candidates.forEach(c => { byId[c.citation_id] = c; });
+          citations = (event.used_citation_ids || [])
+            .map(id => byId[id])
+            .filter(Boolean)
+            .map((record, index) => ({ ...record, displayNumber: index + 1 }));
+          setMessages(prev => prev.map(msg => msg.id === msgId
+            ? {
+                ...msg,
+                claims: event.claims || [],
+                citations,
+                invalidCitationIds: event.invalid_citation_ids || [],
+                sourcesPending: false,
+              }
+            : msg));
+        } else if (event.type === "entry_id") {
+          setMessages(prev => prev.map(msg =>
+            msg.id === msgId ? { ...msg, entryId: event.entry_id } : msg
+          ));
+        } else if (event.type === "error") {
+          failed = true;
+          setMessages(prev => prev.map(msg => msg.id === msgId
+            ? { ...msg, text: full || event.message || "Backend error.", streaming: false, sourcesPending: false }
+            : msg));
+        } else if (event.type === "done") {
+          // done(ok:false) is the backend saying the answer did not complete —
+          // an evidence or generation failure that closed the stream cleanly.
+          // Treating it as success would show a half-answer as finished, then
+          // auto-navigate to a citation and count it toward the KB.
+          finished = true;
+          if (event.ok === false) failed = true;
+        }
+      };
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        const raw = dec.decode(value);
-        if (raw.includes("__ENTRY_ID__")) {
-          const m = raw.match(/__ENTRY_ID__(\d+)__/);
-          if (m) setMessages(prev => prev.map(msg =>
-            msg.id === msgId ? { ...msg, entryId: parseInt(m[1]) } : msg
-          ));
-          continue;
-        }
-        if (/^__(SEARCHING|READY|CONTEXT)/.test(raw.trim())) continue;
-        if (raw.startsWith("__ERROR__")) {
-          const detail = raw.match(/^__ERROR__(.*?)__?$/s)?.[1]?.trim();
-          setMessages(prev => prev.map(msg =>
-            msg.id === msgId ? { ...msg, text: detail || "Backend error — check that Ollama is running.", streaming: false } : msg
-          ));
-          setTyping(false);
-          return;
-        }
-        full += raw;
-        setMessages(prev => prev.map(msg => msg.id === msgId ? { ...msg, text: full } : msg));
+        decoder.feed(dec.decode(value, { stream: true })).forEach(applyEvent);
       }
+      decoder.close().forEach(applyEvent);
 
-      // Extract page citations from answer text
-      const refs = [...full.matchAll(/\b(?:page|p\.)\s*(\d+)\b/gi)]
-        .map(m => ({ page: parseInt(m[1]), label: `p.${m[1]}` }))
-        .filter((v, i, a) => a.findIndex(x => x.page === v.page) === i)
-        .slice(0, 5);
-
-      setMessages(prev => prev.map(msg =>
-        msg.id === msgId ? { ...msg, text: full, citations: refs, streaming: false } : msg
-      ));
-      if (refs.length) handleCitation(refs[0].page);
-      setKbCount(k => k + 1);
+      // An interrupted stream must not read as a finished answer. Without a
+      // verification event nothing is known about which candidates the answer
+      // used, so none of them are presented as cited sources.
+      setMessages(prev => prev.map(msg => msg.id === msgId
+        ? {
+            ...msg,
+            text: full || (failed ? msg.text : "The answer stream ended before it finished."),
+            streaming: false,
+            incomplete: !finished || failed,
+            sourcesPending: false,
+            citations: verified ? msg.citations : [],
+          }
+        : msg));
+      if (!failed && citations.length) handleCitation(citations[0]);
+      if (!failed) setKbCount(k => k + 1);
 
     } catch (err) {
       if (err.name !== "AbortError") {
@@ -2618,13 +3067,9 @@ export default function GridApp() {
   // same /ask + document-context machinery as chat, but ask the model for JSON
   // and render the parsed result as a purpose-built view instead of a chat bubble.
   const runToolQuery = useCallback(async (promptText, modelOverride) => {
-    const perDocLimit = Math.max(2000, Math.min(8000, Math.floor(16000 / Math.max(docs.length, 1))));
-    const combinedSelections = isAllScope
-      ? docs.map(d => ({
-          id: String(d.id), document_name: d.name,
-          text: (d.text || "").slice(0, perDocLimit) || `(No extractable text for ${d.name})`,
-        }))
-      : [];
+    // Same scope rule as chat: backend document ids, never a concatenated
+    // client-side document dump posing as a selection.
+    const scopeDocumentIds = docs.map(d => d.id).filter(id => Number.isInteger(id));
     const res = await fetch(`${BACKEND}/ask`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2632,26 +3077,30 @@ export default function GridApp() {
         question:             promptText,
         model:                modelOverride || task?.model || "llama3.1:8b",
         active_document_name: isAllScope ? null : (activeDoc?.name || null),
+        active_document_id:   isAllScope ? null : (Number.isInteger(activeDoc?.id) ? activeDoc.id : null),
+        document_ids:         isAllScope ? scopeDocumentIds : [],
         selected_text:        "",
-        selections:           combinedSelections,
+        selections:           [],
         auth_token:           authToken || null,
       }),
     });
     if (!res.ok) throw new Error(`Server error (${res.status})`);
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
+    const reader  = res.body.getReader();
+    const dec     = new TextDecoder();
+    const decoder = createEventDecoder();
     let full = "";
+    let streamError = null;
+    const applyEvent = (event) => {
+      if (event.type === "delta" && typeof event.text === "string") full += event.text;
+      else if (event.type === "error") streamError = event.message || "Backend error";
+    };
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      const raw = dec.decode(value);
-      if (raw.includes("__ENTRY_ID__")) continue;
-      if (/^__(SEARCHING|READY|CONTEXT)/.test(raw.trim())) continue;
-      if (raw.startsWith("__ERROR__")) {
-        throw new Error(raw.replace(/^__ERROR__/, "").replace(/__$/, "").trim() || "Backend error");
-      }
-      full += raw;
+      decoder.feed(dec.decode(value, { stream: true })).forEach(applyEvent);
     }
+    decoder.close().forEach(applyEvent);
+    if (streamError) throw new Error(streamError);
     return full;
   }, [docs, isAllScope, activeDoc, task, authToken]);
 
@@ -3389,16 +3838,31 @@ export default function GridApp() {
                               fontSize: "14.5px", color: "#1e293b", lineHeight: "1.7",
                               whiteSpace: "pre-wrap",
                             }}>
-                              {msg.text}
+                              <AnswerText text={msg.text} citations={msg.citations} pending={msg.streaming || msg.sourcesPending} onOpen={handleCitation} />
                               {msg.streaming && <span style={{ opacity: .5, animation: "blink 1s infinite" }}>▊</span>}
                             </div>
+                            {msg.incomplete && !msg.streaming && (
+                              <div style={{
+                                marginTop: "6px", fontSize: "11px", color: "#b45309",
+                                fontFamily: "'Courier New',monospace",
+                              }}>⚠ This answer did not finish streaming.</div>
+                            )}
+                            {msg.sourcesPending && (
+                              <div style={{
+                                marginTop: "8px", fontSize: "11px", color: "#6b7280",
+                              }}>Checking sources…</div>
+                            )}
                             {msg.citations?.length > 0 && (
-                              <div style={{ marginTop: "8px", display: "flex", flexWrap: "wrap", gap: "5px" }}>
+                              <div style={{ marginTop: "8px", display: "flex", flexDirection: "column", gap: "6px" }}>
+                                <div style={{ fontSize: "10.5px", color: "#6b7280", fontWeight: 700, letterSpacing: ".04em" }}>
+                                  {msg.citations.length === 1 ? "SOURCE" : "SOURCES"}
+                                </div>
                                 {msg.citations.map((c, i) => (
-                                  <CitationChip key={i} page={c.page} label="" onClick={handleCitation} />
+                                  <CitationCard key={c.citation_id || i} citation={c} onOpen={handleCitation} />
                                 ))}
                               </div>
                             )}
+                            <ClaimSupportSummary claims={msg.claims} citations={msg.citations} onOpen={handleCitation} />
                             {!msg.streaming && msg.entryId && (
                               <div style={{ display: "flex", alignItems: "center", gap: "4px", marginTop: "8px" }}>
                                 <button
@@ -5392,7 +5856,7 @@ export default function GridApp() {
               background: "none", border: "none", color: "#6b7280", cursor: "pointer", padding: "4px", display: "flex",
             }}><IconX width={16} height={16} /></button>
           </div>
-          <PdfViewer doc={activeDoc} highlightPage={hlPage} />
+          <PdfViewer doc={activeDoc} highlightPage={hlPage} highlightRange={hlRange} />
 
           {/* Floating "Ask about selection" button — appears right after the
               user releases a text selection anywhere in this panel (real DOM
