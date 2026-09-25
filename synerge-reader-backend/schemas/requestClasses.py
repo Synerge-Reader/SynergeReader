@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
@@ -28,6 +28,12 @@ class AskRequest(BaseModel):
     # but are never treated as authorization.
     active_document_id: Optional[int] = None
     document_ids: List[int] = Field(default_factory=list)
+    # What the caller will render, which decides the prompt rules and whether
+    # claims are verified -- never which documents may be read. document_qa is
+    # cited prose graded claim by claim; structured_json is JSON-only tool
+    # output; model_reasoning is open-ended AI analysis shown with an
+    # "AI analysis only" notice. The values match citation_generation.AnswerMode.
+    mode: Literal["document_qa", "structured_json", "model_reasoning"] = "document_qa"
 
 
 class AskResponse(BaseModel):

@@ -530,6 +530,100 @@ def build_generation_prompt(
     )
 
 
+# --- answer modes ------------------------------------------------------------
+#
+# The mode says what the caller will render, and so which rules the model
+# answers under and whether its claims are graded. It never changes which
+# evidence is supplied: planning and authorization are identical in every mode.
+# Only document_qa output is shown as cited prose with per-claim support, so
+# only document_qa runs claim extraction and verification.
+
+
+class AnswerMode(str, Enum):
+    DOCUMENT_QA = "document_qa"
+    STRUCTURED_JSON = "structured_json"
+    MODEL_REASONING = "model_reasoning"
+
+
+def evidence_scope_statement(mode: EvidenceMode) -> str:
+    """What the supplied evidence is, so no mode overstates its coverage."""
+    if mode is EvidenceMode.COMPLETE_DOCUMENT:
+        return "The evidence above is the complete text of the document."
+    if mode is EvidenceMode.SELECTED_TEXT:
+        return "The evidence above is text the user selected, not a complete document."
+    return (
+        "The evidence above is a set of passages retrieved from the documents, "
+        "not their complete text. Do not describe it as covering a whole "
+        "document or every document."
+    )
+
+
+STRUCTURED_OUTPUT_RULES = (
+    "Output rules:\n"
+    "- Produce exactly the output the request above asks for. When it asks for "
+    "JSON, output only that JSON, with no prose and no markdown fences.\n"
+    "- Take every statement about the documents from the evidence blocks above. "
+    "Never invent a party, date, amount, clause, quotation, or page number.\n"
+    "- Refer to a location by the document name and location shown in its "
+    "evidence block, never by its citation id: do not write ids such as [C1].\n"
+    "- If the evidence does not establish something the request asks for, "
+    "leave it empty or say so inside the requested format rather than guessing."
+)
+
+STRUCTURED_NO_EVIDENCE_INSTRUCTION = (
+    "No document evidence is available for this request. Produce the requested "
+    "output format, leave every document-derived field empty, and say inside "
+    "that format that no document evidence was available. Never invent "
+    "document content."
+)
+
+MODEL_REASONING_RULES = (
+    "Analysis rules:\n"
+    "- This answer is AI analysis, not a lookup of verified sources.\n"
+    "- You may draw on general legal knowledge such as doctrines and well-known "
+    "precedents, but never present a case, statute, or citation as confirmed. "
+    "If you are not certain one exists, say so plainly.\n"
+    "- Describe what the evidence above says accurately, and do not attribute "
+    "to it anything it does not state.\n"
+    "- Do not write citation ids such as [C1]; refer to the supplied text by "
+    "its document name or as the passage.\n"
+    "- Do not output internal tags, metadata, or JSON."
+)
+
+MODEL_REASONING_NO_EVIDENCE_INSTRUCTION = (
+    "No document text was supplied. Say so, and keep any analysis general: do "
+    "not describe the contents of a document you were not given."
+)
+
+
+def build_mode_prompt(
+    mode: AnswerMode,
+    question: str,
+    registry: CitationRegistry,
+    *,
+    extra_context: str = "",
+) -> str:
+    """The prompt for a structured_json or model_reasoning answer.
+
+    document_qa is deliberately not handled here: its citation rules live in
+    build_generation_prompt and stay the single path for graded answers.
+    """
+    if mode is AnswerMode.STRUCTURED_JSON:
+        rules, no_evidence = STRUCTURED_OUTPUT_RULES, STRUCTURED_NO_EVIDENCE_INSTRUCTION
+    elif mode is AnswerMode.MODEL_REASONING:
+        rules, no_evidence = MODEL_REASONING_RULES, MODEL_REASONING_NO_EVIDENCE_INSTRUCTION
+    else:
+        raise ValueError(f"build_mode_prompt does not build {mode!r} prompts")
+    if registry.is_empty:
+        return f"<question>\n{question.strip()}\n</question>\n\n{no_evidence}"
+    extra = f"\n\n{extra_context.strip()}" if extra_context.strip() else ""
+    return (
+        f"<evidence>\n{build_evidence_blocks(registry)}\n</evidence>{extra}\n\n"
+        f"<question>\n{question.strip()}\n</question>\n\n"
+        f"{evidence_scope_statement(registry.evidence_mode)}\n{rules}"
+    )
+
+
 # --- parsing and claim verification ----------------------------------------
 
 
@@ -963,6 +1057,21 @@ def generate_citations(
     return CitationGenerationResult(
         registry=registry,
         claims=tuple(claims),
+        invalid_citation_ids=parsed.invalid_ids,
+        used_citation_ids=parsed.valid_ids,
+    )
+
+
+def citations_without_claims(answer: str, registry: CitationRegistry) -> CitationGenerationResult:
+    """The registered ids an answer used, with no claim extraction or grading.
+
+    For modes whose output is not shown as graded prose. No verifier runs and
+    no claim is produced, so nothing can be labelled supported; the used ids
+    still say which supplied evidence the answer drew on.
+    """
+    parsed = parse_citation_markers(answer, registry)
+    return CitationGenerationResult(
+        registry=registry,
         invalid_citation_ids=parsed.invalid_ids,
         used_citation_ids=parsed.valid_ids,
     )

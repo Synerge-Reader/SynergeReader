@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 import sys
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Header
 from document_parser import sanitize_filename
 from document_ingestion import (
     CommittedDocument,
@@ -27,10 +27,13 @@ from answer_evidence import (
     SelectedTextInput,
 )
 from citation_generation import (
+    AnswerMode,
     CitationGenerationResult,
     CitationLimits,
     CitationRegistry,
     build_generation_prompt,
+    build_mode_prompt,
+    citations_without_claims,
     generate_citations,
     safe_error,
 )
@@ -1250,9 +1253,18 @@ def _ollama_claim_verifier(claim: str, records, model: str) -> Optional[str]:
     return _claim_verifier_status(response.json().get("response"))
 
 
-def _resolve_citations(answer_text: str, registry, verifier=None) -> CitationGenerationResult:
-    """Parse and verify one answer, never raising into the response stream."""
+def _resolve_citations(
+    answer_text: str, registry, verifier=None, *, check_claims: bool = True
+) -> CitationGenerationResult:
+    """Parse one answer, never raising into the response stream.
+
+    Claims are extracted and verified only when they will be shown graded
+    (document_qa). Otherwise only the used citation ids are parsed: no verifier
+    call is spent, and no claim can be labelled supported.
+    """
     try:
+        if not check_claims:
+            return citations_without_claims(answer_text, registry)
         return generate_citations(answer_text, registry, verifier, _CITATION_LIMITS)
     except Exception as exc:
         print(f"[Ask] citation resolution failed: {type(exc).__name__}")
@@ -1263,6 +1275,9 @@ def _resolve_citations(answer_text: str, registry, verifier=None) -> CitationGen
 async def ask_question(request: AskRequest):
     answer_parts = []
     entry_id = None
+    # Decides the prompt rules and whether claims are graded; evidence
+    # planning and authorization below are the same in every mode.
+    answer_mode = AnswerMode(request.mode)
 
     def verify_claim(claim, records):
         return _ollama_claim_verifier(claim, records, request.model)
@@ -1295,9 +1310,14 @@ async def ask_question(request: AskRequest):
                 kb_block += "</knowledge_base_corrections>"
             # ─────────────────────────────────────────────────────────────
 
-            prompt = build_generation_prompt(
-                request.question, registry, extra_context=kb_block
-            )
+            if answer_mode is AnswerMode.DOCUMENT_QA:
+                prompt = build_generation_prompt(
+                    request.question, registry, extra_context=kb_block
+                )
+            else:
+                prompt = build_mode_prompt(
+                    answer_mode, request.question, registry, extra_context=kb_block
+                )
 
             yield evidence_event(
                 registry.to_dict()["citations"],
@@ -1375,7 +1395,12 @@ async def ask_question(request: AskRequest):
 
         full_answer = "".join(answer_parts)
 
-        citation_result = _resolve_citations(full_answer, registry, verify_claim)
+        citation_result = _resolve_citations(
+            full_answer,
+            registry,
+            verify_claim,
+            check_claims=answer_mode is AnswerMode.DOCUMENT_QA,
+        )
         yield verification_event(
             [claim.to_dict() for claim in citation_result.claims],
             invalid_citation_ids=citation_result.invalid_citation_ids,
@@ -1528,52 +1553,181 @@ async def get_documents():
         raise HTTPException(500, str(e))
 
 
-class DeleteDocumentRequest(BaseModel):
-    filename: str
+def _bearer_token(authorization: Optional[str]) -> Optional[str]:
+    """Token from an ``Authorization: Bearer <token>`` header, or None when the
+    header is missing or malformed. Used by the document-history endpoints below
+    instead of a ``?token=`` query parameter, which ends up in browser history
+    and proxy/access logs."""
+    if not authorization:
+        return None
+    scheme, _, value = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not value.strip():
+        return None
+    return value.strip()
 
 
-@app.delete("/documents/delete")
-async def delete_document(request: DeleteDocumentRequest):
-    """Delete a document and its chunks from the database"""
-    conn = None
+def _open_db():
+    """A live connection, or a clean 503. connect_to_postgres() returns None
+    when the database is unreachable, and callers that went straight to
+    conn.cursor() / conn.close() crashed with an AttributeError instead."""
+    conn = connect_to_postgres()
+    if conn is None:
+        raise HTTPException(503, "Database temporarily unavailable")
+    return conn
+
+
+def _user_id_for_token(cursor, token: Optional[str]):
+    if not token:
+        raise HTTPException(401, "Unauthorized")
+    cursor.execute("SELECT id FROM users WHERE token = %s", (token,))
+    row = cursor.fetchone()
+    if not row:
+        raise HTTPException(401, "Invalid session")
+    return row[0]
+
+
+@app.get("/me/documents/search")
+async def search_my_documents(
+    q: str = "",
+    limit: int = 8,
+    authorization: Optional[str] = Header(None),
+):
+    """Search the caller's own previously-uploaded documents by filename, for
+    the header search bar. Admin-only for now — everyone's document history
+    exists, but this is a new surface, so it's gated to admins the same way new
+    features already start in this codebase (see ADMIN_EMAILS / the KB write
+    endpoints) until it's proven out."""
+    token = _bearer_token(authorization)
+    conn = _open_db()
     try:
-        conn = connect_to_postgres()
-        if conn is None:
-            raise HTTPException(500, "Failed to connect to PostgreSQL")
         c = conn.cursor()
-        
-        # First, find the document by filename
-        c.execute("SELECT id FROM documents WHERE filename = %s", (request.filename,))
-        row = c.fetchone()
-        
-        if not row:
-            conn.close()
-            raise HTTPException(404, f"Document '{request.filename}' not found")
-        
-        doc_id = row[0]
-        
-        # Delete associated chunks first (foreign key constraint)
-        c.execute("DELETE FROM document_chunks WHERE document_id = %s", (doc_id,))
-        chunks_deleted = c.rowcount
-        
-        # Delete the document
-        c.execute("DELETE FROM documents WHERE id = %s", (doc_id,))
-        
-        conn.commit()
-        
-        return {
-            "message": "Document deleted successfully",
-            "filename": request.filename,
-            "document_id": doc_id,
-            "chunks_deleted": chunks_deleted
-        }
+        _require_admin(c, token)
+        user_id = _user_id_for_token(c, token)
+
+        limit = max(1, min(limit, 25))
+        q_trimmed = q.strip()
+        if q_trimmed:
+            c.execute(
+                """
+                SELECT d.id, d.filename, d.upload_timestamp,
+                       (SELECT COUNT(*) FROM document_chunks WHERE document_id = d.id) AS chunks,
+                       di.doc_type
+                FROM documents d
+                LEFT JOIN document_insights di ON di.document_id = d.id
+                WHERE d.user_id = %s AND d.filename ILIKE %s
+                ORDER BY d.upload_timestamp DESC
+                LIMIT %s
+                """,
+                (user_id, f"%{q_trimmed}%", limit),
+            )
+        else:
+            # Empty query — show the user's most recent uploads rather than
+            # nothing, so opening the search bar isn't a blank state.
+            c.execute(
+                """
+                SELECT d.id, d.filename, d.upload_timestamp,
+                       (SELECT COUNT(*) FROM document_chunks WHERE document_id = d.id) AS chunks,
+                       di.doc_type
+                FROM documents d
+                LEFT JOIN document_insights di ON di.document_id = d.id
+                WHERE d.user_id = %s
+                ORDER BY d.upload_timestamp DESC
+                LIMIT %s
+                """,
+                (user_id, limit),
+            )
+        rows = c.fetchall()
+        return [
+            {"id": r[0], "filename": r[1], "upload_timestamp": r[2], "chunks": r[3], "doc_type": r[4]}
+            for r in rows
+        ]
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, str(e))
+        print(f"[search_my_documents] failed: {type(e).__name__}: {e}")
+        raise HTTPException(500, "Could not search documents")
     finally:
-        if conn is not None:
-            conn.close()
+        conn.close()
+
+
+@app.get("/documents/{document_id}/content")
+async def get_document_content(document_id: int, authorization: Optional[str] = Header(None)):
+    """Fetch one document's stored extracted text by id, so a search result
+    can be opened without re-uploading the original file. Admin-only, and
+    scoped to the caller's own documents — matches search_my_documents above."""
+    token = _bearer_token(authorization)
+    conn = _open_db()
+    try:
+        c = conn.cursor()
+        _require_admin(c, token)
+        user_id = _user_id_for_token(c, token)
+
+        c.execute(
+            "SELECT filename, content, upload_timestamp FROM documents WHERE id = %s AND user_id = %s",
+            (document_id, user_id),
+        )
+        doc = c.fetchone()
+        if not doc:
+            raise HTTPException(404, "Document not found")
+        return {"id": document_id, "filename": doc[0], "content": doc[1] or "", "upload_timestamp": doc[2]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[get_document_content] failed: {type(e).__name__}: {e}")
+        raise HTTPException(500, "Could not load the document")
+    finally:
+        conn.close()
+
+
+@app.delete("/me/documents/{document_id}")
+async def delete_my_document(document_id: int, authorization: Optional[str] = Header(None)):
+    """Delete one of the caller's own documents, by id.
+
+    Replaces the old unauthenticated ``DELETE /documents/delete`` (filename in
+    the body), which let anyone delete any user's document by knowing or
+    guessing its filename, and picked an arbitrary row when filenames were
+    duplicated. Here the caller comes from the Authorization header, and the
+    delete is scoped ``WHERE id = ... AND user_id = ...`` in one transaction, so
+    a document that doesn't exist and one that belongs to someone else are
+    indistinguishable (both 404) and nothing is touched in either case.
+
+    The document's chunks are removed in the same transaction. Its
+    document_insights row goes with it via ON DELETE CASCADE. knowledge_base
+    entries are not linked to a document and are deliberately left alone.
+    """
+    token = _bearer_token(authorization)
+    conn = _open_db()
+    try:
+        c = conn.cursor()
+        user_id = _user_id_for_token(c, token)
+
+        c.execute(
+            """
+            DELETE FROM document_chunks
+            WHERE document_id IN (SELECT id FROM documents WHERE id = %s AND user_id = %s)
+            """,
+            (document_id, user_id),
+        )
+        chunks_deleted = c.rowcount
+        c.execute(
+            "DELETE FROM documents WHERE id = %s AND user_id = %s RETURNING id, filename",
+            (document_id, user_id),
+        )
+        row = c.fetchone()
+        if not row:
+            conn.rollback()
+            raise HTTPException(404, "Document not found")
+        conn.commit()
+        return {"deleted_id": row[0], "filename": row[1], "chunks_deleted": chunks_deleted}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        print(f"[delete_my_document] failed: {type(e).__name__}: {e}")
+        raise HTTPException(500, "Could not delete the document")
+    finally:
+        conn.close()
 
 
 @app.put("/put_ratings")

@@ -30,7 +30,11 @@ from citation_generation import (
     ABSENCE_RULE_COMPLETE_DOCUMENT,
     ABSENCE_RULE_PARTIAL_EVIDENCE,
     CITATION_MARKER_PATTERN,
+    CITATION_RULES,
+    MODEL_REASONING_NO_EVIDENCE_INSTRUCTION,
     PASSAGE_LOCATION_LABEL,
+    STRUCTURED_NO_EVIDENCE_INSTRUCTION,
+    AnswerMode,
     CitationLimits,
     CitationRegistry,
     ClaimReason,
@@ -42,6 +46,9 @@ from citation_generation import (
     bounded_excerpt,
     build_evidence_blocks,
     build_generation_prompt,
+    build_mode_prompt,
+    citations_without_claims,
+    evidence_scope_statement,
     extract_claims,
     generate_citations,
     normalize_locator,
@@ -1075,3 +1082,63 @@ def test_a_hybrid_negative_finding_is_scoped_to_the_retrieved_passages():
     assert "the document does not address it" not in prompt, (
         "only a complete document can be said to be silent as a whole"
     )
+
+
+# --- answer modes: prompts for ungraded output ------------------------------
+
+
+_UNGRADED_MODES = (AnswerMode.STRUCTURED_JSON, AnswerMode.MODEL_REASONING)
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected", "forbidden"),
+    [
+        (EvidenceMode.COMPLETE_DOCUMENT, "complete text of the document", None),
+        (EvidenceMode.HYBRID_RETRIEVAL, "not their complete text", "complete text of the document"),
+        (EvidenceMode.SELECTED_TEXT, "text the user selected", "complete text of the document"),
+    ],
+)
+def test_the_scope_statement_never_overstates_coverage(mode, expected, forbidden):
+    statement = evidence_scope_statement(mode)
+    assert expected in statement
+    if forbidden:
+        assert forbidden not in statement
+
+
+@pytest.mark.parametrize("mode", _UNGRADED_MODES)
+def test_ungraded_prompts_carry_the_evidence_and_its_true_scope(mode):
+    registry = CitationRegistry.from_bundle(_bundle(_item("The term is three years.")))
+    prompt = build_mode_prompt(mode, "Summarize the term.", registry, extra_context="<kb>note</kb>")
+
+    assert "The term is three years." in prompt, "the same evidence the planner chose"
+    assert "not their complete text" in prompt, "retrieved passages are never called complete"
+    assert "<kb>note</kb>" in prompt
+    assert CITATION_RULES not in prompt
+
+
+@pytest.mark.parametrize(
+    ("mode", "instruction"),
+    [
+        (AnswerMode.STRUCTURED_JSON, STRUCTURED_NO_EVIDENCE_INSTRUCTION),
+        (AnswerMode.MODEL_REASONING, MODEL_REASONING_NO_EVIDENCE_INSTRUCTION),
+    ],
+)
+def test_ungraded_prompts_without_evidence_forbid_inventing_document_content(mode, instruction):
+    prompt = build_mode_prompt(mode, "Summarize the term.", CitationRegistry())
+    assert instruction in prompt
+    assert "<evidence>" not in prompt
+
+
+def test_document_qa_prompts_are_not_built_by_the_mode_builder():
+    registry = CitationRegistry.from_bundle(_bundle(_item("text")))
+    with pytest.raises(ValueError):
+        build_mode_prompt(AnswerMode.DOCUMENT_QA, "q", registry)
+
+
+def test_citations_without_claims_reports_usage_but_grades_nothing():
+    registry = CitationRegistry.from_bundle(_bundle(_item("first"), _item("second", chunk_id="1-1", chunk_index=1)))
+    result = citations_without_claims("Uses the second [C2] and a stray [C9].", registry)
+
+    assert result.claims == ()
+    assert result.used_citation_ids == ("C2",)
+    assert result.invalid_citation_ids == ("C9",)

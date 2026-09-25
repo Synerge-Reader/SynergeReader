@@ -23,8 +23,10 @@ a safe error followed by an explicit non-success done, an uncommitted history
 write is rolled back and every opened connection closed, the local-only
 generation policy survives the transport change, the claim verifier sends its
 temperature as an Ollama option and accepts only a reply that is exactly one
-status, and the route composes the evidence planner and citation registry
-instead of re-deciding evidence priority itself.
+status, only document_qa answers are graded while structured_json and
+model_reasoning answers skip verification under the same authorization, and the
+route composes the evidence planner and citation registry instead of
+re-deciding evidence priority itself.
 
 What these do NOT prove: Starlette/ASGI streaming, Ollama protocol
 behaviour, SQL validity, or anything about the frontend.
@@ -65,10 +67,16 @@ from ask_stream import (
     verification_event,
 )
 from citation_generation import (
+    CITATION_RULES,
+    MODEL_REASONING_RULES,
+    STRUCTURED_OUTPUT_RULES,
+    AnswerMode,
     CitationGenerationResult,
     CitationLimits,
     CitationRegistry,
     build_generation_prompt,
+    build_mode_prompt,
+    citations_without_claims,
     generate_citations,
     safe_error,
 )
@@ -274,8 +282,12 @@ def _evidence_bundle():
 
 def _route_harness(main_tree, connection, verifier_reply="supported"):
     """The route's real code, with every collaborator an in-memory stub."""
-    calls = SimpleNamespace(ollama=[], auto_saved=threading.Event())
+    calls = SimpleNamespace(ollama=[], scopes=[], auto_saved=threading.Event())
     planning = EvidencePlanningResult(bundle=_evidence_bundle())
+
+    def resolve_authorized_scope(auth_token):
+        calls.scopes.append(auth_token)
+        return "authorized-scope"
 
     def post_ollama(endpoint, payload, *, stream=False, timeout=60):
         calls.ollama.append(
@@ -298,7 +310,7 @@ def _route_harness(main_tree, connection, verifier_reply="supported"):
         "datetime": datetime,
         "post_ollama": post_ollama,
         "connect_to_postgres": lambda: connection,
-        "_resolve_authorized_scope": lambda auth_token: "authorized-scope",
+        "_resolve_authorized_scope": resolve_authorized_scope,
         "_build_answer_evidence_planner": lambda scope: SimpleNamespace(
             plan=lambda request, scope: planning
         ),
@@ -307,9 +319,12 @@ def _route_harness(main_tree, connection, verifier_reply="supported"):
         "increment_kb_usage": lambda ids: None,
         "auto_save_to_kb": lambda *args: calls.auto_saved.set(),
         "CitationRegistry": CitationRegistry,
+        "AnswerMode": AnswerMode,
         "CitationGenerationResult": CitationGenerationResult,
         "_CITATION_LIMITS": CitationLimits(max_claims_verified=2),
         "build_generation_prompt": build_generation_prompt,
+        "build_mode_prompt": build_mode_prompt,
+        "citations_without_claims": citations_without_claims,
         "generate_citations": generate_citations,
         "safe_error": safe_error,
         "evidence_event": evidence_event,
@@ -333,13 +348,16 @@ def _call_without_event_loop(coroutine):
     raise AssertionError("ask_question suspended; this harness runs no event loop")
 
 
-def _stream_ask(main_tree, connection, *, auth_token=None, verifier_reply="supported"):
+def _stream_ask(
+    main_tree, connection, *, auth_token=None, verifier_reply="supported", mode="document_qa"
+):
     namespace, calls = _route_harness(main_tree, connection, verifier_reply)
     request = SimpleNamespace(
         question="How long is the agreement term?",
         selected_text="",
         auth_token=auth_token,
         model="local-test-model",
+        mode=mode,
     )
     response = _call_without_event_loop(namespace["ask_question"](request))
     assert response.media_type == STREAM_MEDIA_TYPE
@@ -904,6 +922,79 @@ def test_a_negative_ambiguous_or_malformed_reply_never_yields_a_supported_claim(
     assert [(claim["status"], claim["reason"]) for claim in claims] == [
         ("unverified", "verifier_malformed")
     ]
+
+
+# --- answer modes: what the caller renders decides what is graded -----------
+
+
+def _generation_prompt(calls):
+    [generation] = [call for call in calls.ollama if call.stream]
+    return generation.payload["prompt"]
+
+
+def _verifier_calls(calls):
+    return [call for call in calls.ollama if not call.stream]
+
+
+def test_document_qa_still_grades_claims_under_the_citation_rules(main_tree):
+    _, events, calls = _stream_ask(main_tree, _FakeConnection(), mode="document_qa")
+
+    assert CITATION_RULES in _generation_prompt(calls)
+    assert len(_verifier_calls(calls)) == 1, "one cited claim, one verifier call"
+    [verification] = [event for event in events if event["type"] == "verification"]
+    assert [claim["status"] for claim in verification["claims"]] == ["supported"]
+
+
+@pytest.mark.parametrize(
+    ("mode", "rules"),
+    [("structured_json", STRUCTURED_OUTPUT_RULES), ("model_reasoning", MODEL_REASONING_RULES)],
+)
+def test_ungraded_modes_skip_verification_and_the_citation_rules(main_tree, mode, rules):
+    _, events, calls = _stream_ask(main_tree, _FakeConnection(), mode=mode)
+
+    assert not _verifier_calls(calls), "no verifier call is spent on output nobody sees graded"
+    prompt = _generation_prompt(calls)
+    assert rules in prompt
+    assert CITATION_RULES not in prompt
+    [verification] = [event for event in events if event["type"] == "verification"]
+    assert verification["claims"] == [], "an ungraded answer can carry no supported claim"
+    assert verification["used_citation_ids"] == ["C1"], "which evidence was used still survives"
+    assert [event["type"] for event in events] == _SUCCESS_EVENT_TYPES, (
+        "every mode keeps the same stream shape, including history persistence"
+    )
+
+
+def test_structured_json_mode_permits_json_only_output(main_tree):
+    _, _, calls = _stream_ask(main_tree, _FakeConnection(), mode="structured_json")
+    prompt = _generation_prompt(calls)
+
+    assert "output only that JSON" in prompt
+    assert "Do not output internal tags, metadata, or JSON." not in prompt, (
+        "a JSON tool must not be told never to output JSON"
+    )
+
+
+def test_model_reasoning_mode_is_framed_as_unverified_analysis(main_tree):
+    _, _, calls = _stream_ask(main_tree, _FakeConnection(), mode="model_reasoning")
+    prompt = _generation_prompt(calls)
+
+    assert "AI analysis, not a lookup of verified sources" in prompt
+    assert "never present a case, statute, or citation as confirmed" in prompt
+
+
+def test_every_mode_resolves_the_same_authorization_and_evidence(main_tree):
+    evidence = {}
+    for mode in AnswerMode:
+        _, events, calls = _stream_ask(
+            main_tree, _FakeConnection(), auth_token="user-token", mode=mode.value
+        )
+        assert calls.scopes == ["user-token"], f"{mode.value} must not change who the caller is"
+        [evidence[mode]] = [event for event in events if event["type"] == "evidence"]
+    assert (
+        evidence[AnswerMode.DOCUMENT_QA]
+        == evidence[AnswerMode.STRUCTURED_JSON]
+        == evidence[AnswerMode.MODEL_REASONING]
+    ), "the mode decides grading, never which evidence is supplied"
 
 
 # --- route composition: priority belongs to the planner --------------------
