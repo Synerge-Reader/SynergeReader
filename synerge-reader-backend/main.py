@@ -714,39 +714,56 @@ async def hash_password(password: str) -> str:
 def _resolve_uploader_id(auth_token: Optional[str]):
     """Resolve an upload's owner from the existing users.token column.
 
-    Unchanged auth semantics for this slice: a token that matches a row gives
-    that user's id, anything else gives None (an anonymous upload), exactly as
-    before. The only behavioural change is hygiene -- the lookup cursor is now
-    closed as well as the connection, and a lookup failure is logged by
-    exception class name only, never with the token, the SQL, or the raw
-    exception text.
+    No token is an anonymous upload, unchanged. A supplied token is a claim of
+    identity, so it must resolve before anything is ingested -- it can never
+    degrade into an ownerless document:
+
+    * a token that matches a user gives that user's id;
+    * a token that matches no user is refused with 401;
+    * a lookup that cannot complete -- no connection, or a connection, cursor
+      or query failure -- is refused with a generic 503.
+
+    Both refusals carry fixed messages and are raised outside any ``except``
+    block, so neither the token, the SQL, nor the database exception reaches
+    the response, even by exception chaining. A lookup failure is logged by
+    exception class name only, and the cursor and connection are closed on
+    every path.
     """
     if not auth_token:
         return None
 
-    lookup_conn = connect_to_postgres()
-    if lookup_conn is None:
-        return None
-
-    lookup_cursor = None
+    lookup_row = None
+    lookup_failed = False
     try:
-        lookup_cursor = lookup_conn.cursor()
-        lookup_cursor.execute("SELECT id FROM users WHERE token = %s", (auth_token,))
-        lookup_row = lookup_cursor.fetchone()
-        return lookup_row[0] if lookup_row else None
+        lookup_conn = connect_to_postgres()
+        if lookup_conn is None:
+            print("[Upload] uploader lookup failed: connection unavailable")
+            lookup_failed = True
+        else:
+            lookup_cursor = None
+            try:
+                lookup_cursor = lookup_conn.cursor()
+                lookup_cursor.execute("SELECT id FROM users WHERE token = %s", (auth_token,))
+                lookup_row = lookup_cursor.fetchone()
+            finally:
+                if lookup_cursor is not None:
+                    try:
+                        lookup_cursor.close()
+                    except Exception:
+                        pass
+                try:
+                    lookup_conn.close()
+                except Exception:
+                    pass
     except Exception as exc:
         print(f"[Upload] uploader lookup failed: {type(exc).__name__}")
-        return None
-    finally:
-        if lookup_cursor is not None:
-            try:
-                lookup_cursor.close()
-            except Exception:
-                pass
-        try:
-            lookup_conn.close()
-        except Exception:
-            pass
+        lookup_failed = True
+
+    if lookup_failed:
+        raise HTTPException(503, "Could not verify your session. Please try again shortly.")
+    if not lookup_row or lookup_row[0] is None:
+        raise HTTPException(401, "Invalid session")
+    return lookup_row[0]
 
 
 class _PostCommitDispatchError(RuntimeError):
@@ -864,6 +881,8 @@ async def upload_documents(
     else:
         raise HTTPException(400, "No files provided")
 
+    # Raises 401 for a supplied token that matches no user and 503 when the
+    # lookup cannot complete, so neither reaches a file read or the service.
     uploader_id = _resolve_uploader_id(auth_token)
 
     metadata = DocumentMetadata(

@@ -23,8 +23,8 @@ reaches ``psycopg2.connect``.
 NO EXTERNAL CONTACT. ``DocumentIngestionService`` is substituted with a
 recording double in every request-level test, so no parse, chunk, embed, or
 write ever runs; ``main.connect_to_postgres`` is replaced with a factory that
-fails loudly if anything tries to open a connection, and the one test that
-needs an uploader lookup replaces it with an in-memory fake. There is no
+fails loudly if anything tries to open a connection, and the tests that need
+an uploader lookup replace it with an in-memory fake. There is no
 database, Ollama, network, subprocess, container, or production access here.
 
 What these tests do NOT prove: they do not prove the ingestion service's own
@@ -373,19 +373,33 @@ def test_absent_metadata_stays_none_rather_than_empty_strings(
     assert record["uploads"][0].metadata == DocumentMetadata()
 
 
-# --- 7: the resolved uploader id reaches UploadDocument ---------------------
+# --- 7: uploader identity -- resolved, anonymous, or refused before ingestion
+
+
+# Planted in every simulated lookup failure: none of it may reach a response
+# body or the server log, which carries the exception class name only.
+_SEEDED_DB_DETAIL = "password=hunter2 host=db.internal SELECT id FROM users"
+
+
+class _LookupFailure(Exception):
+    pass
 
 
 class _FakeCursor:
-    def __init__(self, row, log):
+    def __init__(self, row, log, fail_on=None):
         self._row = row
         self._log = log
+        self._fail_on = fail_on
         self.closed = False
 
     def execute(self, sql, params=None):
         self._log.append(("execute", " ".join(sql.split()), params))
+        if self._fail_on == "execute":
+            raise _LookupFailure(_SEEDED_DB_DETAIL)
 
     def fetchone(self):
+        if self._fail_on == "fetchone":
+            raise _LookupFailure(_SEEDED_DB_DETAIL)
         return self._row
 
     def close(self):
@@ -394,14 +408,17 @@ class _FakeCursor:
 
 
 class _FakeConnection:
-    def __init__(self, row, log):
+    def __init__(self, row, log, fail_on=None):
         self._row = row
         self._log = log
+        self._fail_on = fail_on
         self.closed = False
         self.cursors = []
 
     def cursor(self):
-        cursor = _FakeCursor(self._row, self._log)
+        if self._fail_on == "cursor":
+            raise _LookupFailure(_SEEDED_DB_DETAIL)
+        cursor = _FakeCursor(self._row, self._log, self._fail_on)
         self.cursors.append(cursor)
         return cursor
 
@@ -450,13 +467,28 @@ def test_uploader_lookup_always_closes_its_cursor_and_connection(
     ), "the lookup cursor must always be closed"
 
 
-def test_unknown_token_uploads_anonymously_without_leaking_detail(
-    monkeypatch, main_module, upload_client
+def _record_followup_starts(monkeypatch, main_module):
+    started = []
+    monkeypatch.setattr(
+        main_module,
+        "_start_background_task",
+        lambda target, args: started.append(target),
+    )
+    return started
+
+
+def test_unknown_token_is_refused_with_401_before_ingestion(
+    monkeypatch, main_module, upload_client, capsys
 ):
+    """A supplied token that matches no user is a failed identity claim, not an
+    anonymous upload. Refusing it before the service is built is what keeps it
+    from ever becoming an ownerless document."""
     record = _install_service_double(monkeypatch, main_module)
+    started = _record_followup_starts(monkeypatch, main_module)
     log = []
     connection = _FakeConnection(None, log)
     monkeypatch.setattr(main_module, "connect_to_postgres", lambda: connection)
+    capsys.readouterr()
 
     response = upload_client.post(
         "/upload",
@@ -464,25 +496,114 @@ def test_unknown_token_uploads_anonymously_without_leaking_detail(
         data={"auth_token": "not-a-real-token"},
     )
 
-    assert response.status_code == 200, response.text
-    assert record["uploads"][0].uploader_id is None
-    assert "not-a-real-token" not in response.text
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid session"}
+    assert record["constructions"] == 0 and record["batches"] == 0, (
+        "an unknown token must be refused before any ingestion service is "
+        "built, so no ownerless document can be written"
+    )
+    assert started == [], "no upload follow-up may start for a refused upload"
+    assert ("execute", "SELECT id FROM users WHERE token = %s", ("not-a-real-token",)) in log
     assert connection.closed
+    assert connection.cursors and all(cursor.closed for cursor in connection.cursors)
+    assert "not-a-real-token" not in response.text
+    assert "not-a-real-token" not in "".join(capsys.readouterr())
 
 
-def test_upload_without_token_never_opens_a_lookup_connection(
-    monkeypatch, main_module, upload_client
+_LOOKUP_FAILURES = ("connect_raises", "connect_returns_none", "cursor", "execute", "fetchone")
+
+
+@pytest.mark.parametrize("failure", _LOOKUP_FAILURES)
+def test_lookup_failure_is_a_generic_503_and_never_reaches_ingestion(
+    monkeypatch, main_module, upload_client, capsys, failure
 ):
-    _install_service_double(monkeypatch, main_module)
+    """A lookup that cannot complete must not guess an owner.
+
+    The fake user row exists, so a lookup that fell through would have a real
+    owner to find; the refusal comes from the failed step alone. The response
+    and the log carry neither the token nor the database exception text.
+    """
+    record = _install_service_double(monkeypatch, main_module)
+    started = _record_followup_starts(monkeypatch, main_module)
+    connection = None
+    if failure == "connect_raises":
+        def connect():
+            raise _LookupFailure(_SEEDED_DB_DETAIL)
+    elif failure == "connect_returns_none":
+        def connect():
+            return None
+    else:
+        connection = _FakeConnection((4242,), [], fail_on=failure)
+
+        def connect():
+            return connection
+    monkeypatch.setattr(main_module, "connect_to_postgres", connect)
+    capsys.readouterr()
+
+    response = upload_client.post(
+        "/upload",
+        files=[("files", ("owned.txt", _TXT_BYTES, "text/plain"))],
+        data={"auth_token": "a-valid-token"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "Could not verify your session. Please try again shortly."
+    }
+    assert record["constructions"] == 0 and record["batches"] == 0, (
+        f"a lookup failure at {failure!r} must not reach ingest_batch"
+    )
+    assert started == [], "no upload follow-up may start for a refused upload"
+    if connection is not None:
+        assert connection.closed, "an opened lookup connection must be closed"
+        assert all(cursor.closed for cursor in connection.cursors)
+    captured = "".join(capsys.readouterr())
+    for private in ("a-valid-token", _SEEDED_DB_DETAIL):
+        assert private not in response.text
+        assert private not in captured
+
+
+@pytest.mark.parametrize(
+    ("row", "fail_on", "status"),
+    [(None, None, 401), ((4242,), "execute", 503)],
+    ids=["unknown-token", "query-failure"],
+)
+def test_refusals_carry_no_underlying_exception(
+    monkeypatch, main_module, row, fail_on, status
+):
+    connection = _FakeConnection(row, [], fail_on=fail_on)
+    monkeypatch.setattr(main_module, "connect_to_postgres", lambda: connection)
+
+    with pytest.raises(main_module.HTTPException) as refused:
+        main_module._resolve_uploader_id("a-token")
+
+    assert refused.value.status_code == status
+    assert refused.value.__cause__ is None and refused.value.__context__ is None, (
+        "the refusal must not chain the database exception"
+    )
+    assert "a-token" not in str(refused.value.detail)
+    assert _SEEDED_DB_DETAIL not in str(refused.value.detail)
+
+
+@pytest.mark.parametrize("form", [{}, {"auth_token": ""}], ids=["no-field", "empty-field"])
+def test_upload_without_token_never_opens_a_lookup_connection(
+    monkeypatch, main_module, upload_client, form
+):
+    record = _install_service_double(monkeypatch, main_module)
 
     # The fixture's connect_to_postgres raises on any call, so a 200 here is
     # itself the proof that no lookup connection was opened.
     response = upload_client.post(
         "/upload",
         files=[("files", ("anon.txt", _TXT_BYTES, "text/plain"))],
+        data=form,
     )
 
     assert response.status_code == 200, response.text
+    assert record["batches"] == 1
+    assert record["uploads"][0].uploader_id is None, (
+        "no token keeps the existing anonymous upload"
+    )
 
 
 # --- 8: the route composes the REAL service with this app's dependencies ----
