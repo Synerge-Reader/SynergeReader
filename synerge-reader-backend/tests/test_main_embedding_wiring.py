@@ -6,9 +6,9 @@ main.py, with the stdlib ``ast`` module); neither is ever imported, executed,
 or run through Docker/Compose anywhere in this file. There is no network,
 database, Ollama, container, or production access here.
 
-main.py is never imported because it unconditionally calls ``init_db(...)``
-at module scope -- importing it would attempt real database initialization
-during test collection.
+This file deliberately parses rather than imports ``main.py`` so it remains
+a source-only contract suite. Runtime import and lifespan behavior are covered
+separately by ``test_main_lifecycle.py``.
 
 What these tests prove: the legacy ``embed_chunks``/``chunk_text`` helpers
 and their fabricated zero-vector/``"/api/embeddings"`` fallbacks are gone
@@ -20,22 +20,33 @@ semantic direction (query vs. document); the composition boundary assigns
 and ``_EMBEDDING_PROVIDER`` exactly once from an appropriately-wired
 ``OllamaEmbeddingProvider(...)`` call, whose adapter forwards
 ``(endpoint, payload)`` to ``post_ollama`` with a pinned ``timeout=30``;
-``init_db(...)`` is called with the exact keyword binding
-``expected_dimension=_EMBEDDING_PROFILE.dimension``; ``EmbeddingProviderError``
+``init_db(...)`` is called exactly once through the lifespan-wired initializer
+with the exact keyword binding ``expected_dimension=_EMBEDDING_PROFILE.dimension``;
+``EmbeddingProviderError``
 propagates past (rather than being silently swallowed by) the specific
 broad-exception/fallback handlers named in the I3 spec; ``_save_kb_pairs``
 aborts its whole uncommitted batch atomically (rollback, no partial inserts,
 no post-failure row, connection always closed) rather than continuing with a
 null vector, and both of its callers (``generate_kb_from_document``,
 ``import_knowledge_from_url``) delegate to it rather than embedding directly;
-the upload route embeds and validates the embedding count before it ever
-opens the ingestion write connection (while its separate, earlier
-``lookup_conn`` auth-token lookup is permitted and unrelated to that
-ordering rule); page-aware chunking, locator persistence, and the
-page-aware retrieval helpers are wired into ``upload_documents`` and
-``get_relevant_chunks`` rather than reimplemented by hand; and the six
+the ingestion service embeds and validates the embeddings before it ever
+opens the write connection (while the upload route's separate auth-token
+lookup is permitted and unrelated to that ordering rule); page-aware
+chunking and locator persistence are wired into the ingestion service, and
+the page-aware retrieval helpers into ``get_relevant_chunks``, rather than
+reimplemented by hand; and the six
 embedding-profile environment keys are present, bare, unduped, and
 explained by a comment in ``docker-compose.yml``.
+
+E1b UPDATE. POST /upload no longer parses, chunks, embeds, or writes anything
+itself: it is a thin adapter over ``DocumentIngestionService``. The guarantees
+that used to be asserted inside ``upload_documents`` -- embed-and-validate
+before the write connection opens, page-aware chunk fields, locator
+persistence, the two INSERT column lists, and preserved uploader ownership --
+are therefore asserted here against ``document_ingestion.py``, which now owns
+them, plus the route's composition of that service. Nothing was dropped; the
+assertions moved to the module that holds the behavior. The route's separate,
+permitted auth-token lookup also moved, into ``_resolve_uploader_id``.
 
 What these tests do NOT prove: they do not prove runtime wiring (main.py is
 never executed by this file), they do not validate Ollama's successful
@@ -57,15 +68,20 @@ import yaml
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _MAIN_PY_PATH = _REPOSITORY_ROOT / "synerge-reader-backend" / "main.py"
+_INGESTION_PY_PATH = (
+    _REPOSITORY_ROOT / "synerge-reader-backend" / "document_ingestion.py"
+)
 _COMPOSE_PATH = _REPOSITORY_ROOT / "docker-compose.yml"
 
 _EMBEDDING_PROVIDER_NAME = "_EMBEDDING_PROVIDER"
 
 _QUERY_SIDE_FUNCTIONS = ["get_relevant_chunks", "get_relevant_knowledge_base"]
+# upload_documents is deliberately absent: since E1b it embeds nothing itself
+# and delegates to DocumentIngestionService, which receives _EMBEDDING_PROVIDER
+# from the route's composition (see the E1b section at the end of this file).
 _DOCUMENT_SIDE_FUNCTIONS = [
     "auto_save_to_kb",
     "_save_kb_pairs",
-    "upload_documents",
     "submit_correction",
     "add_knowledge",
     "update_knowledge",
@@ -92,6 +108,16 @@ def main_tree(main_source):
 
 
 @pytest.fixture(scope="module")
+def ingestion_source():
+    return _INGESTION_PY_PATH.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def ingestion_tree(ingestion_source):
+    return ast.parse(ingestion_source, filename=str(_INGESTION_PY_PATH))
+
+
+@pytest.fixture(scope="module")
 def compose_source():
     return _COMPOSE_PATH.read_text(encoding="utf-8")
 
@@ -114,6 +140,20 @@ def _find_function(node, name):
     for fn in _iter_functions_by_name(node, name):
         return fn
     raise AssertionError(f"function {name!r} not found")
+
+
+def _find_class(node, name):
+    """Locate one class definition by name.
+
+    _find_function above walks only FunctionDef/AsyncFunctionDef, so it can
+    never find DocumentIngestionService, which is an ast.ClassDef. This is the
+    narrow counterpart, used to read the ingestion service's
+    injected-dependency defaults.
+    """
+    for candidate in ast.walk(node):
+        if isinstance(candidate, ast.ClassDef) and candidate.name == name:
+            return candidate
+    raise AssertionError(f"class {name!r} not found")
 
 
 def _function_source_segment(source, fn_node):
@@ -243,14 +283,15 @@ def test_no_legacy_chunk_text_call(main_tree):
             assert func.id != "chunk_text"
 
 
-def test_chunk_text_column_name_still_used_in_sql(main_tree):
-    # A plain `"chunk_text" in main_source` substring check would also be
-    # satisfied by the unrelated Python variable `chunk_texts`, so this
-    # proves the real thing: the `chunk_text` *SQL column* is still present,
-    # in order, in the `document_chunks` INSERT statement's column list.
+def test_chunk_text_column_name_still_used_in_sql(ingestion_tree):
+    # A plain `"chunk_text" in source` substring check would also be satisfied
+    # by the unrelated Python variable `chunk_texts`, so this proves the real
+    # thing: the `chunk_text` *SQL column* is still present, in order, in the
+    # `document_chunks` INSERT statement's column list. Since E1b that INSERT
+    # lives in document_ingestion.py, not in the route.
     matches = [
         node
-        for node in ast.walk(main_tree)
+        for node in ast.walk(ingestion_tree)
         if isinstance(node, ast.Constant)
         and isinstance(node.value, str)
         and "INSERT INTO document_chunks" in node.value
@@ -262,6 +303,16 @@ def test_chunk_text_column_name_still_used_in_sql(main_tree):
         "(document_id, chunk_text, chunk_index, embedding, page_start, page_end, locator_json)"
         in normalized
     )
+
+
+def test_upload_route_holds_no_document_chunk_sql(main_tree):
+    """The companion to the test above: the INSERT moved, it was not copied."""
+    for node in ast.walk(main_tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            assert "INSERT INTO document_chunks" not in node.value, (
+                "main.py must not keep a second copy of the chunk INSERT -- "
+                "persistence belongs to DocumentIngestionService"
+            )
 
 
 def test_no_legacy_api_embeddings_string(main_tree):
@@ -307,32 +358,61 @@ def test_no_direct_embeddingprofile_construction(main_tree):
                 )
 
 
-def test_imports_come_from_the_expected_modules(main_tree):
+def _imports_by_name(tree, modules):
     imported_from = {}
-    for node in ast.walk(main_tree):
-        if isinstance(node, ast.ImportFrom) and node.module in (
-            "ollama_embedding_provider",
-            "rag_model_profiles",
-            "document_chunker",
-            "document_retrieval",
-        ):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in modules:
             for alias in node.names:
                 imported_from[alias.name] = node.module
+    return imported_from
+
+
+def test_imports_come_from_the_expected_modules(main_tree):
+    imported_from = _imports_by_name(
+        main_tree,
+        (
+            "ollama_embedding_provider",
+            "rag_model_profiles",
+            "document_ingestion",
+            "document_retrieval",
+        ),
+    )
     assert imported_from.get("resolve_embedding_profile") == "rag_model_profiles"
     assert imported_from.get("OllamaEmbeddingProvider") == "ollama_embedding_provider"
     assert imported_from.get("EmbeddingProviderError") == "ollama_embedding_provider"
-    assert imported_from.get("chunk_document") == "document_chunker"
-    assert imported_from.get("build_chunk_locator") == "document_chunker"
     assert imported_from.get("build_relevant_chunks_query") == "document_retrieval"
     assert imported_from.get("retrieved_chunk_from_row") == "document_retrieval"
+    # E1b: the chunking/persistence imports moved with the behavior. main.py now
+    # imports the ingestion contract instead of the chunker primitives.
+    for name in ("DocumentIngestionService", "UploadDocument", "DocumentMetadata", "CommittedDocument"):
+        assert imported_from.get(name) == "document_ingestion", (
+            f"main.py must import {name} from document_ingestion"
+        )
 
 
-def test_json_imported_from_psycopg2_extras(main_tree):
-    for node in ast.walk(main_tree):
-        if isinstance(node, ast.ImportFrom) and node.module == "psycopg2.extras":
-            if any(alias.name == "Json" for alias in node.names):
-                return
-    raise AssertionError("expected `from psycopg2.extras import Json`")
+def test_main_no_longer_imports_the_ingestion_primitives(main_tree):
+    """Delegation, not duplication: the route cannot reach the low-level parse,
+    chunk, locator, or JSON-adaptation primitives at all any more."""
+    leaked = _imports_by_name(main_tree, ("document_chunker", "psycopg2.extras"))
+    assert leaked == {}, (
+        f"main.py must no longer import ingestion primitives: {sorted(leaked)}"
+    )
+    parser_imports = _imports_by_name(main_tree, ("document_parser",))
+    assert set(parser_imports) == {"sanitize_filename"}, (
+        "main.py should keep only sanitize_filename from document_parser (used by "
+        f"the DOCX conversion route); found {sorted(parser_imports)}"
+    )
+
+
+def test_ingestion_module_owns_the_chunker_and_json_imports(ingestion_tree):
+    imported_from = _imports_by_name(
+        ingestion_tree, ("document_chunker", "document_parser", "psycopg2.extras")
+    )
+    assert imported_from.get("chunk_document") == "document_chunker"
+    assert imported_from.get("build_chunk_locator") == "document_chunker"
+    assert imported_from.get("extract_text_from_upload") == "document_parser"
+    assert imported_from.get("sanitize_filename") == "document_parser"
+    assert imported_from.get("Json") == "psycopg2.extras"
 
 
 def test_embedding_profile_assigned_once_from_resolve_call_with_os_environ(main_tree):
@@ -413,18 +493,30 @@ def test_post_embedding_request_adapter_forwards_and_pins_timeout(main_tree):
 
 
 def test_init_db_called_with_expected_dimension_from_embedding_profile(main_tree):
-    module_level_calls = [
-        node.value
-        for node in main_tree.body
-        if isinstance(node, ast.Expr)
-        and isinstance(node.value, ast.Call)
-        and isinstance(node.value.func, ast.Name)
-        and node.value.func.id == "init_db"
-    ]
-    assert len(module_level_calls) == 1, (
-        f"expected exactly one module-level init_db(...) call, found {len(module_level_calls)}"
+    # Every module-body statement that is not a function or class definition
+    # runs at import time, so each one is walked in full -- not just bare
+    # `init_db(...)` expression statements, which would miss an assignment,
+    # or a call nested inside a module-level if/try/with.
+    for statement in main_tree.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        assert not _calls_to_name(statement, "init_db"), (
+            "init_db(...) must not run at module import; found a call in the "
+            f"module-level statement starting at line {statement.lineno}"
+        )
+        assert not _calls_to_name(statement, "_initialize_application"), (
+            "_initialize_application() must not run at module import; found a "
+            f"call in the module-level statement starting at line {statement.lineno}"
+        )
+
+    initializer = _find_function(main_tree, "_initialize_application")
+    initializer_calls = _calls_to_name(initializer, "init_db")
+    assert len(initializer_calls) == 1, (
+        "_initialize_application() must call init_db(...) exactly once; "
+        f"found {len(initializer_calls)} call(s)"
     )
-    call = module_level_calls[0]
+
+    call = initializer_calls[0]
     assert not call.args, "init_db must be called with no positional arguments"
 
     kwargs = {kw.arg: kw.value for kw in call.keywords}
@@ -437,6 +529,50 @@ def test_init_db_called_with_expected_dimension_from_embedding_profile(main_tree
         "not a literal, so a future edit can't silently reintroduce the 768 default"
     )
     assert isinstance(value.value, ast.Name) and value.value.id == "_EMBEDDING_PROFILE"
+
+    fastapi_calls = _calls_to_name(main_tree, "FastAPI")
+    assert len(fastapi_calls) == 1, (
+        f"expected exactly one FastAPI(...) application construction, found {len(fastapi_calls)}"
+    )
+    app_kwargs = {kw.arg: kw.value for kw in fastapi_calls[0].keywords}
+    assert "lifespan" in app_kwargs, "FastAPI(...) must receive lifespan=..."
+    lifespan_value = app_kwargs["lifespan"]
+    assert isinstance(lifespan_value, ast.Name), "lifespan= must reference a named function"
+
+    lifespan_fn = _find_function(main_tree, lifespan_value.id)
+    assert isinstance(lifespan_fn, ast.AsyncFunctionDef), (
+        f"the lifespan {lifespan_value.id!r} must be an async function"
+    )
+    assert len(lifespan_fn.decorator_list) == 1, (
+        "the lifespan must carry exactly one decorator, @asynccontextmanager; "
+        f"found {len(lifespan_fn.decorator_list)}"
+    )
+    decorator = lifespan_fn.decorator_list[0]
+    assert (
+        isinstance(decorator, ast.Name) and decorator.id == "asynccontextmanager"
+    ) or (
+        isinstance(decorator, ast.Attribute) and decorator.attr == "asynccontextmanager"
+    ), (
+        "the lifespan must be decorated with @asynccontextmanager (bare or "
+        "attribute-qualified); without it the async generator is never turned "
+        "into the context manager the ASGI server enters at startup"
+    )
+
+    lifecycle_calls = _calls_to_name(lifespan_fn, "_initialize_application")
+    assert len(lifecycle_calls) == 1, (
+        "the FastAPI lifespan must call _initialize_application() exactly once; "
+        f"found {len(lifecycle_calls)} call(s)"
+    )
+    yields = [node for node in ast.walk(lifespan_fn) if isinstance(node, ast.Yield)]
+    assert len(yields) == 1, f"the FastAPI lifespan must yield exactly once; found {len(yields)}"
+    # A source-order check, kept for readability of the contract. It is not
+    # treated as proof of control flow: test_main_lifecycle.py's
+    # test_configured_lifespan_initializes_once_before_yield actually drives
+    # the configured lifespan and asserts initialization has already happened
+    # while it sits suspended at this yield.
+    assert lifecycle_calls[0].lineno < yields[0].lineno, (
+        "_initialize_application() must appear before the lifespan yields control"
+    )
 
 
 # --- 6/7: the eight call sites use the exact _EMBEDDING_PROVIDER receiver, exclusively ---
@@ -651,34 +787,54 @@ def test_sync_endpoint_embedding_failure_raises_sanitized_service_unavailable(ma
         )
 
 
-def test_upload_embedding_failure_appends_sanitized_error(main_tree):
+def test_upload_route_reports_embedding_failures_through_the_service(main_tree):
+    """E1b: the route no longer catches EmbeddingProviderError per file.
+
+    An embedding failure is now classified by DocumentIngestionService as the
+    infrastructure-scope ``embedding_unavailable`` category, returned as that
+    file's own result with a fixed safe message, and aggregated into the batch
+    status -- so a sanitized per-file error still reaches the client without
+    the route holding a second copy of the handling. This asserts the route
+    does not reintroduce its own handler or its own error string.
+    """
     fn = _find_function(main_tree, "upload_documents")
-    handler = None
     for try_node in ast.walk(fn):
         if not isinstance(try_node, ast.Try):
             continue
-        type_names = [_handler_type_name(h) for h in try_node.handlers]
-        if "EmbeddingProviderError" in type_names:
-            handler = try_node.handlers[type_names.index("EmbeddingProviderError")]
-            break
-    assert handler is not None, "expected an except EmbeddingProviderError clause in upload_documents"
-
-    append_calls = _attr_calls_on_name(handler, "results", "append")
-    assert append_calls, "the handler must append a per-file error entry to results"
-    for call in append_calls:
-        assert len(call.args) == 1 and isinstance(call.args[0], ast.Dict)
-        error_dict = call.args[0]
-        for key_node, value_node in zip(error_dict.keys, error_dict.values):
-            if isinstance(key_node, ast.Constant) and key_node.value == "error":
-                assert isinstance(value_node, ast.Constant) and isinstance(value_node.value, str), (
-                    "the per-file 'error' value must be a plain string literal, not an "
-                    "f-string referencing the raw exception"
-                )
-
-    assert any(isinstance(n, ast.Continue) for n in ast.walk(handler)), (
-        "upload_documents must continue to the next file after an embedding failure, "
-        "not abort the whole multi-file request"
+        assert "EmbeddingProviderError" not in [
+            _handler_type_name(h) for h in try_node.handlers
+        ], (
+            "upload_documents must not re-handle embedding failures; the "
+            "ingestion service owns that classification"
+        )
+    assert not _calls_to_embedding_provider_method(fn, "embed_documents"), (
+        "upload_documents must not embed anything itself"
     )
+    assert not _calls_to_embedding_provider_method(fn, "embed_query")
+
+
+def test_ingestion_service_returns_a_safe_embedding_failure_message(ingestion_tree):
+    """The sanitized message the route used to build now lives in the service's
+    fixed message table, as plain string literals that cannot interpolate a raw
+    exception."""
+    table = None
+    for node in ast.walk(ingestion_tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "_SAFE_ERROR_MESSAGES"
+        ):
+            table = node.value
+    assert isinstance(table, ast.Dict), "expected a _SAFE_ERROR_MESSAGES dict"
+    for value_node in table.values:
+        assert isinstance(value_node, ast.Constant) and isinstance(value_node.value, str), (
+            "every safe error message must be a plain string literal, never an "
+            "f-string that could interpolate the raw exception"
+        )
+    categories = {key.attr for key in table.keys if isinstance(key, ast.Attribute)}
+    assert "EMBEDDING_UNAVAILABLE" in categories
+    assert "EMBEDDING_INVALID" in categories
 
 
 # --- 12/13: _save_kb_pairs fails closed: rollback, abort, no NULL vector, always closes ---
@@ -738,14 +894,17 @@ def test_save_kb_pairs_aborts_batch_atomically_on_embedding_failure(main_tree):
     )
 
 
-# --- 14/15: upload embeds and validates the count before opening the ingestion ---
-# --- write connection; the earlier auth lookup connection is a separate, permitted case ---
+# --- 14/15: the embed-before-connect ordering, now owned by the ingestion ---
+# --- service; the route keeps only its separate, permitted auth lookup     ---
 
 
 def test_upload_has_permitted_auth_lookup_connection(main_tree):
-    fn = _find_function(main_tree, "upload_documents")
+    # E1b: the lookup moved out of the route body into _resolve_uploader_id,
+    # which upload_documents calls. It is still the only connection the route
+    # side opens, and it is still opened via connect_to_postgres().
+    fn = _find_function(main_tree, "_resolve_uploader_id")
     lookup_assignments = _assignments_to_name(fn, "lookup_conn")
-    assert lookup_assignments, "upload_documents must retain its lookup_conn auth-lookup connection"
+    assert lookup_assignments, "the auth lookup must retain its lookup_conn connection"
     value = lookup_assignments[0].value
     assert (
         isinstance(value, ast.Call)
@@ -753,76 +912,130 @@ def test_upload_has_permitted_auth_lookup_connection(main_tree):
         and value.func.id == "connect_to_postgres"
     ), "lookup_conn must be opened via connect_to_postgres()"
 
-
-def test_upload_embeds_then_validates_count_then_opens_ingestion_write_connection(main_tree, main_source):
-    fn = _find_function(main_tree, "upload_documents")
-    segment = _function_source_segment(main_source, fn)
-
-    embed_pos = segment.find("_EMBEDDING_PROVIDER.embed_documents(")
-    count_check_pos = segment.find("len(embeddings) != len(chunks)")
-    # Leading space is deliberate: it anchors on the bare `conn` identifier
-    # and excludes the earlier, unrelated `lookup_conn = connect_to_postgres()`
-    # auth lookup, whose own assignment would otherwise also match a plain
-    # "conn = connect_to_postgres()" substring search (since "lookup_conn"
-    # ends in "conn").
-    write_conn_pos = segment.find(" conn = connect_to_postgres()")
-
-    assert embed_pos != -1, "expected the embed_documents call in upload_documents"
-    assert count_check_pos != -1, "expected an explicit len(embeddings) != len(chunks) guard"
-    assert write_conn_pos != -1, "expected the ingestion write connection assignment"
-    assert embed_pos < count_check_pos < write_conn_pos, (
-        "upload_documents must embed, then validate the count, then open the ingestion "
-        "write connection -- strictly in that order -- so neither an embedding failure "
-        "nor a count mismatch ever touches the database"
+    route = _find_function(main_tree, "upload_documents")
+    assert len(_calls_to_name(route, "_resolve_uploader_id")) == 1, (
+        "upload_documents must resolve the uploader through that one helper"
     )
 
 
-def test_upload_ingestion_write_connection_is_distinct_from_lookup_connection(main_tree):
-    fn = _find_function(main_tree, "upload_documents")
-    embed_calls = _calls_to_embedding_provider_method(fn, "embed_documents")
-    assert len(embed_calls) == 1
-    embed_lineno = embed_calls[0].lineno
+def test_ingestion_embeds_then_validates_then_opens_the_write_connection(
+    ingestion_source, ingestion_tree
+):
+    # The ordering rule is unchanged; it is asserted where the code now lives.
+    fn = _find_function(ingestion_tree, "ingest")
+    segment = _function_source_segment(ingestion_source, fn)
 
-    write_conn_assignments = [
-        a
-        for a in _assignments_to_name(fn, "conn")
-        if isinstance(a.value, ast.Call)
-        and isinstance(a.value.func, ast.Name)
-        and a.value.func.id == "connect_to_postgres"
-    ]
-    assert write_conn_assignments, "upload_documents must open an ingestion write connection assigned to `conn`"
-    assert all(a.lineno > embed_lineno for a in write_conn_assignments), (
-        "the ingestion write connection (`conn`) must be opened only after the embedding "
-        "call -- unlike the separate, earlier `lookup_conn` auth lookup, which is permitted "
-        "to precede it"
+    embed_pos = segment.find("self.embedding_provider.embed_documents(")
+    validate_pos = segment.find("_validate_embeddings(")
+    connect_pos = segment.find("self.connection_factory()")
+
+    assert embed_pos != -1, "expected the embed_documents call in ingest()"
+    assert validate_pos != -1, "expected an explicit embedding validation step"
+    assert connect_pos != -1, "expected the write connection to come from the factory"
+    assert embed_pos < validate_pos < connect_pos, (
+        "ingest() must embed, then validate the embeddings, then open the write "
+        "connection -- strictly in that order -- so neither an embedding failure "
+        "nor an invalid embedding set ever touches the database"
     )
 
 
-# --- 16/17/18: page-aware chunking, locator persistence, and preserved ownership ---
+def test_upload_route_opens_no_write_connection_of_its_own(main_tree):
+    fn = _find_function(main_tree, "upload_documents")
+    assert not _calls_to_name(fn, "connect_to_postgres"), (
+        "the ingestion write connection must come from the service's connection "
+        "factory, not from a second connection opened inside the route"
+    )
 
 
-def test_upload_uses_chunk_document_and_page_aware_chunk_fields(main_tree, main_source):
+def test_route_passes_connect_to_postgres_as_the_connection_factory(main_tree):
+    """pgvector precondition: connect_to_postgres is the only factory in this
+    codebase that applies register_vector() to the connection it returns, and
+    the service inserts each embedding as a plain list[float]. Passing anything
+    else would fail at chunk insertion at runtime."""
+    fn = _find_function(main_tree, "_build_ingestion_service")
+    calls = _calls_to_name(fn, "DocumentIngestionService")
+    assert len(calls) == 1
+    kwargs = {kw.arg: kw.value for kw in calls[0].keywords}
+    factory = kwargs.get("connection_factory")
+    assert isinstance(factory, ast.Name) and factory.id == "connect_to_postgres", (
+        "connection_factory= must be the bare name connect_to_postgres"
+    )
+    assert not _calls_to_name(main_tree, "register_vector"), (
+        "main.py must not build a second, unregistered connection path"
+    )
+
+
+def test_route_passes_the_resolved_provider_and_profile_to_the_service(main_tree):
+    fn = _find_function(main_tree, "_build_ingestion_service")
+    calls = _calls_to_name(fn, "DocumentIngestionService")
+    kwargs = {kw.arg: kw.value for kw in calls[0].keywords}
+    provider = kwargs.get("embedding_provider")
+    profile = kwargs.get("embedding_profile")
+    assert isinstance(provider, ast.Name) and provider.id == _EMBEDDING_PROVIDER_NAME, (
+        "the service must embed through the application's already-resolved provider"
+    )
+    assert isinstance(profile, ast.Name) and profile.id == "_EMBEDDING_PROFILE", (
+        "the service must validate against the already-resolved profile"
+    )
+
+
+def test_route_returns_the_services_batch_status_as_the_http_status(
+    main_tree, main_source
+):
     fn = _find_function(main_tree, "upload_documents")
     segment = _function_source_segment(main_source, fn)
-    assert "chunk_document(result)" in segment, "upload_documents must call chunk_document(result)"
+    assert "status_code=batch.http_status" in segment, (
+        "the service's aggregated 200/207/422/503 must become the real HTTP "
+        "status, not a field buried inside a 200 body"
+    )
+    assert "batch.to_dict()" in segment, (
+        "the complete batch envelope must be returned as-is"
+    )
+
+
+# --- 16/17/18: page-aware chunking, locator persistence, and preserved ---
+# --- ownership -- all now asserted against document_ingestion.py         ---
+
+
+def _service_header(ingestion_source, ingestion_tree):
+    """The DocumentIngestionService class body down to its first method, where
+    the injected parse/chunk/locator/JSON defaults are bound."""
+    service = _find_class(ingestion_tree, "DocumentIngestionService")
+    return _function_source_segment(ingestion_source, service).split("def ingest")[0]
+
+
+def test_ingestion_uses_chunk_document_and_page_aware_chunk_fields(
+    ingestion_source, ingestion_tree
+):
+    fn = _find_function(ingestion_tree, "ingest")
+    segment = _function_source_segment(ingestion_source, fn)
+    assert "self.chunker(parsed)" in segment, "ingest() must chunk through its chunker"
+    assert "= chunk_document" in _service_header(ingestion_source, ingestion_tree), (
+        "the chunker must default to document_chunker.chunk_document"
+    )
     for attr in ("chunk.text", "chunk.chunk_index", "chunk.page_start", "chunk.page_end"):
         assert attr in segment, f"expected {attr} to be used when inserting a chunk row"
 
 
-def test_upload_builds_and_wraps_locator_json(main_tree, main_source):
-    fn = _find_function(main_tree, "upload_documents")
-    segment = _function_source_segment(main_source, fn)
-    assert "build_chunk_locator(chunk, result.document_type)" in segment, (
-        "upload_documents must build each chunk's locator via build_chunk_locator(chunk, result.document_type)"
+def test_ingestion_builds_and_wraps_locator_json(ingestion_source, ingestion_tree):
+    fn = _find_function(ingestion_tree, "ingest")
+    segment = _function_source_segment(ingestion_source, fn)
+    assert "self.locator_builder(chunk, parsed.document_type)" in segment, (
+        "each chunk's locator must be built from the chunk and its document type"
     )
-    assert "Json(locator_json)" in segment, (
-        "the locator dict must be wrapped in psycopg2.extras.Json before insertion"
+    assert "self.json_adapter(locator)" in segment, (
+        "the locator dict must be wrapped by the JSON adapter before insertion"
     )
+    header = _service_header(ingestion_source, ingestion_tree)
+    assert "= build_chunk_locator" in header, (
+        "locator_builder must default to document_chunker.build_chunk_locator"
+    )
+    assert "= Json" in header, "json_adapter must default to psycopg2.extras.Json"
 
 
-def test_upload_chunk_insert_names_required_columns(main_tree, main_source):
-    fn = _find_function(main_tree, "upload_documents")
-    segment = _function_source_segment(main_source, fn)
+def test_ingestion_chunk_insert_names_required_columns(ingestion_source, ingestion_tree):
+    fn = _find_function(ingestion_tree, "ingest")
+    segment = _function_source_segment(ingestion_source, fn)
     assert "INSERT INTO document_chunks" in segment
     for column in (
         "document_id",
@@ -833,15 +1046,32 @@ def test_upload_chunk_insert_names_required_columns(main_tree, main_source):
         "page_end",
         "locator_json",
     ):
-        assert column in segment, f"expected the document_chunks insert to name column {column!r}"
+        assert column in segment, (
+            f"expected the document_chunks insert to name column {column!r}"
+        )
 
 
-def test_upload_preserves_uploader_id_in_document_insert(main_tree, main_source):
-    fn = _find_function(main_tree, "upload_documents")
-    segment = _function_source_segment(main_source, fn)
+def test_ingestion_preserves_uploader_id_in_document_insert(
+    ingestion_source, ingestion_tree
+):
+    fn = _find_function(ingestion_tree, "ingest")
+    segment = _function_source_segment(ingestion_source, fn)
     assert "INSERT INTO documents" in segment
     assert "user_id" in segment, "the documents insert must still name the user_id column"
-    assert "uploader_id" in segment, "the documents insert must still pass uploader_id as its value"
+    assert "upload.uploader_id" in segment, (
+        "the documents insert must still pass the upload's uploader_id as its value"
+    )
+
+
+def test_route_forwards_the_resolved_uploader_id_into_the_upload_contract(
+    main_tree, main_source
+):
+    fn = _find_function(main_tree, "upload_documents")
+    segment = _function_source_segment(main_source, fn)
+    assert "uploader_id=uploader_id" in segment, (
+        "ownership is preserved by handing the resolved uploader_id to "
+        "UploadDocument; the service writes it to documents.user_id"
+    )
 
 
 def test_get_relevant_chunks_delegates_to_page_aware_retrieval_helpers(main_tree, main_source):

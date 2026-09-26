@@ -1,0 +1,22 @@
+# Test-only dependencies for the backend suite.
+#
+# Runtime dependencies are declared in requiredInstall.txt and must be
+# installed separately. This file deliberately does not include it: that
+# pin set downgrades the environment the E1a-1 results were produced in,
+# and it pins uvloop, which has no Windows wheel.
+#
+# Environment that produced the E1a-1 and E1a-G1 baselines and results:
+#   Python 3.11.9, FastAPI 0.135.3, Starlette 1.0.0, anyio 4.13.0
+# requiredInstall.txt declares FastAPI 0.116.2 / Starlette 0.48.0 /
+# anyio 4.10.0. No declared-runtime validation has been performed.
+#
+# httpx is required, and must be declared here rather than inherited:
+# fastapi.testclient.TestClient is built on httpx (it subclasses
+# httpx.Client), and tests/test_main_route_harness.py uses it. Neither
+# FastAPI nor Starlette declares httpx as a core dependency -- FastAPI
+# lists it only under the "standard" extras and Starlette only under
+# "full" -- so a clean install resolved from core requirements alone
+# would not provide it. Its presence in the current local environment is
+# incidental extras resolution, not a guarantee.
+httpx==0.28.1
+pytest==9.0.3

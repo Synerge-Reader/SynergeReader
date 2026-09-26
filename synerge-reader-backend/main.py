@@ -1,9 +1,53 @@
+from contextlib import asynccontextmanager
+import sys
+
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Header
-from document_parser import extract_text_from_upload, ExtractionError, sanitize_filename
-from document_chunker import chunk_document, build_chunk_locator
-from document_retrieval import build_relevant_chunks_query, retrieved_chunk_from_row
+from document_parser import sanitize_filename
+from document_ingestion import (
+    CommittedDocument,
+    DocumentIngestionService,
+    DocumentMetadata,
+    UploadDocument,
+)
+from document_retrieval import (
+    build_authorized_lexical_query,
+    build_authorized_semantic_query,
+    build_relevant_chunks_query,
+    lexical_chunk_from_row,
+    reciprocal_rank_fusion,
+    retrieved_chunk_from_row,
+)
+from answer_evidence import (
+    AnswerEvidencePlanner,
+    AuthorizedDocument,
+    AuthorizedScope,
+    EvidenceItem,
+    EvidenceLimits,
+    EvidenceRequest,
+    SelectedTextInput,
+)
+from citation_generation import (
+    AnswerMode,
+    CitationGenerationResult,
+    CitationLimits,
+    CitationRegistry,
+    build_generation_prompt,
+    build_mode_prompt,
+    citations_without_claims,
+    generate_citations,
+    safe_error,
+)
+from ask_stream import (
+    STREAM_MEDIA_TYPE,
+    delta_event,
+    done_event,
+    entry_id_event,
+    error_event,
+    evidence_event,
+    verification_event,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from schemas import AskRequest, AskResponse, CorrectionRequest, RatingRequest,GoogleLoginRequest,LoginRequest,RegisterRequest,ResetPasswordRequest,ResendVerificationRequest
 from schemas import HistoryItem,HistoryRequest, KnowledgeItem,KnowledgeInsertRequest,ForgotPasswordRequest,KnowledgeUrlImportRequest
 import os
@@ -11,8 +55,7 @@ import string
 import datetime
 import re
 from typing import List, Optional
-from dbSetup import init_db,connect_to_postgres,test_postgres_connection
-from psycopg2.extras import Json
+from dbSetup import VectorSchemaError,init_db,connect_to_postgres,test_postgres_connection
 from rag_model_profiles import resolve_embedding_profile
 from ollama_embedding_provider import EmbeddingProviderError, OllamaEmbeddingProvider
 import requests
@@ -37,7 +80,24 @@ from fastapi.responses import Response
 
 load_dotenv()
 
-app = FastAPI(title="SynergeReader API", version="2.0.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Initialize required database state before accepting requests."""
+    try:
+        _initialize_application()
+    except VectorSchemaError as exc:
+        message = " ".join(str(exc).splitlines())
+        print(
+            f"Application startup blocked by vector schema validation: {message}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise
+    yield
+
+
+app = FastAPI(title="SynergeReader API", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -138,6 +198,11 @@ def post_ollama(endpoint: str, payload: dict, *, stream: bool = False, timeout: 
 _EMBEDDING_PROFILE = resolve_embedding_profile(os.environ)
 
 
+def _initialize_application() -> None:
+    """Initialize database state using the resolved embedding dimension."""
+    init_db(expected_dimension=_EMBEDDING_PROFILE.dimension)
+
+
 def _post_embedding_request(endpoint: str, payload: dict):
     """Adapter binding OllamaEmbeddingProvider's transport to post_ollama,
     with the embedding request timeout pinned to 30s regardless of the
@@ -179,53 +244,6 @@ def get_relevant_chunks(
     finally:
         if conn is not None:
             conn.close()
-
-
-def get_documents_by_filenames(document_names: List[str]) -> List[dict]:
-    if not document_names:
-        return []
-
-    conn = None
-    try:
-        conn = connect_to_postgres()
-        if conn is None:
-            return []
-        c = conn.cursor()
-        c.execute(
-            """
-            SELECT filename, title, content
-            FROM documents
-            WHERE filename = ANY(%s)
-            """,
-            (document_names,),
-        )
-        rows = c.fetchall()
-        return [
-            {"filename": r[0], "title": r[1], "content": r[2]}
-            for r in rows
-        ]
-    except Exception as e:
-        print(f"Error retrieving documents by filename: {e}")
-        return []
-    finally:
-        if conn is not None:
-            conn.close()
-
-
-def is_summary_question(question: str) -> bool:
-    normalized = question.lower()
-    summary_markers = [
-        "summary",
-        "summarize",
-        "summarise",
-        "overview",
-        "briefly",
-        "in short",
-        "1-2 sentences",
-        "one or two sentences",
-        "write the summary",
-    ]
-    return any(marker in normalized for marker in summary_markers)
 
 
 def get_relevant_history(
@@ -693,6 +711,143 @@ async def hash_password(password: str) -> str:
 
 
 
+def _resolve_uploader_id(auth_token: Optional[str]):
+    """Resolve an upload's owner from the existing users.token column.
+
+    No token is an anonymous upload, unchanged. A supplied token is a claim of
+    identity, so it must resolve before anything is ingested -- it can never
+    degrade into an ownerless document:
+
+    * a token that matches a user gives that user's id;
+    * a token that matches no user is refused with 401;
+    * a lookup that cannot complete -- no connection, or a connection, cursor
+      or query failure -- is refused with a generic 503.
+
+    Both refusals carry fixed messages and are raised outside any ``except``
+    block, so neither the token, the SQL, nor the database exception reaches
+    the response, even by exception chaining. A lookup failure is logged by
+    exception class name only, and the cursor and connection are closed on
+    every path.
+    """
+    if not auth_token:
+        return None
+
+    lookup_row = None
+    lookup_failed = False
+    try:
+        lookup_conn = connect_to_postgres()
+        if lookup_conn is None:
+            print("[Upload] uploader lookup failed: connection unavailable")
+            lookup_failed = True
+        else:
+            lookup_cursor = None
+            try:
+                lookup_cursor = lookup_conn.cursor()
+                lookup_cursor.execute("SELECT id FROM users WHERE token = %s", (auth_token,))
+                lookup_row = lookup_cursor.fetchone()
+            finally:
+                if lookup_cursor is not None:
+                    try:
+                        lookup_cursor.close()
+                    except Exception:
+                        pass
+                try:
+                    lookup_conn.close()
+                except Exception:
+                    pass
+    except Exception as exc:
+        print(f"[Upload] uploader lookup failed: {type(exc).__name__}")
+        lookup_failed = True
+
+    if lookup_failed:
+        raise HTTPException(503, "Could not verify your session. Please try again shortly.")
+    if not lookup_row or lookup_row[0] is None:
+        raise HTTPException(401, "Invalid session")
+    return lookup_row[0]
+
+
+class _PostCommitDispatchError(RuntimeError):
+    """At least one post-commit follow-up could not be started.
+
+    Raised with a fixed message and nothing else: no exception text, no
+    document or chunk content, no filename, no auth token, no SQL, and no
+    connection detail. DocumentIngestionService catches it and converts it into
+    its existing fixed warning on an already-indexed result.
+    """
+
+
+def _start_background_task(target, args) -> None:
+    """Construct and start one daemon follow-up thread.
+
+    Deliberately does NOT suppress a construction or start failure. A follow-up
+    that never began is something the caller has to know about, so that the
+    ingestion service can record its fixed post-commit warning; swallowing it
+    here would report a clean ingestion for work that never ran.
+
+    Isolated as its own module-level function so the post-commit dispatcher can
+    be exercised without spawning real threads.
+    """
+    from threading import Thread
+    Thread(target=target, args=args, daemon=True).start()
+
+
+def _dispatch_upload_followups(committed: CommittedDocument) -> None:
+    """Post-commit work for one ingested document.
+
+    DocumentIngestionService calls this only after the document's transaction
+    has committed and its connection has been closed, and treats any failure
+    here as a warning on an already-indexed result -- so neither follow-up can
+    turn a committed document into a reported ingestion failure. Both existing
+    follow-ups are preserved and receive the committed document id, the
+    service-sanitized filename, and the server-extracted text.
+
+    Both follow-ups are attempted even if the first one cannot be started, and
+    only the FACT of a failed start is recorded -- never the exception, its
+    text, or anything about the document. If either start failed, one generic
+    _PostCommitDispatchError is raised after both attempts.
+
+    Scope of what this can detect: only a failure to START a thread. Once a
+    follow-up thread is running, it owns its own errors (both targets already
+    swallow and log their own failures), and nothing that happens inside it
+    afterwards can be observed synchronously here or turned into a warning on
+    the ingestion result.
+    """
+    payload = (committed.document_id, committed.filename, committed.text)
+    failed_starts = 0
+    for follow_up in (generate_kb_from_document, _extract_document_insights):
+        try:
+            _start_background_task(follow_up, payload)
+        except Exception:
+            # Only the count is kept. The exception object is never bound,
+            # logged, re-raised, or attached to anything that leaves here.
+            failed_starts += 1
+
+    if failed_starts:
+        # Raised outside the except block on purpose: with no active exception
+        # context there is no implicit chaining, so the original error cannot
+        # ride along on __context__ into any caller's log.
+        print(f"[Upload] post-commit follow-ups not started: {failed_starts}")
+        raise _PostCommitDispatchError("post-commit follow-up could not be started")
+
+
+def _build_ingestion_service() -> DocumentIngestionService:
+    """Compose the verified ingestion service with this application's parts.
+
+    connect_to_postgres is passed as the connection factory specifically
+    because it already applies pgvector's register_vector() to every
+    connection it returns; the service inserts each embedding as a plain
+    list[float], which psycopg2 can only adapt to the `vector` type on a
+    registered connection. No second, unregistered psycopg2 connection path
+    is introduced anywhere in the upload flow.
+    """
+    return DocumentIngestionService(
+        connection_factory=connect_to_postgres,
+        embedding_provider=_EMBEDDING_PROVIDER,
+        embedding_profile=_EMBEDDING_PROFILE,
+        dispatch_after_commit=_dispatch_upload_followups,
+    )
+
+
 @app.post("/upload")
 async def upload_documents(
     file: UploadFile = File(None),
@@ -704,19 +859,19 @@ async def upload_documents(
     doi_url: Optional[str] = Form(None),
     auth_token: Optional[str] = Form(None),
 ):
-    uploader_id = None
-    if auth_token:
-        lookup_conn = connect_to_postgres()
-        if lookup_conn is not None:
-            try:
-                lookup_c = lookup_conn.cursor()
-                lookup_c.execute("SELECT id FROM users WHERE token = %s", (auth_token,))
-                lookup_row = lookup_c.fetchone()
-                if lookup_row:
-                    uploader_id = lookup_row[0]
-            finally:
-                lookup_conn.close()
+    """Thin transport adapter over DocumentIngestionService.
 
+    This route no longer parses, chunks, embeds, or writes anything itself. It
+    reads each uploaded file's ORIGINAL bytes exactly once, maps the form
+    fields onto the ingestion contract, hands the batch to the service in the
+    order the client sent it, and returns the service's batch envelope under
+    the service's own aggregated HTTP status (200 / 207 / 422 / 503). Each
+    document owns a separate transaction inside the service, so one file's
+    failure can never erase a sibling that already committed.
+    """
+    # The empty-request check comes first on purpose: a request with no files
+    # has nothing to ingest, so it must not open a database connection or run
+    # an uploader lookup even when an auth_token field was supplied.
     if file and files:
         upload_list = [file] + files
     elif files:
@@ -726,262 +881,476 @@ async def upload_documents(
     else:
         raise HTTPException(400, "No files provided")
 
-    results = []
-    for f in upload_list:
+    # Raises 401 for a supplied token that matches no user and 503 when the
+    # lookup cannot complete, so neither reaches a file read or the service.
+    uploader_id = _resolve_uploader_id(auth_token)
+
+    metadata = DocumentMetadata(
+        author=author,
+        title=title,
+        publication_date=publication_date,
+        source=source,
+        doi_url=doi_url,
+    )
+
+    uploads = []
+    for upload_file in upload_list:
         try:
-            content = await f.read()
-            safe_filename = sanitize_filename(f.filename)
-            try:
-                result = extract_text_from_upload(safe_filename, content)
-                text = result.text
-            except ExtractionError as e:
-                raise HTTPException(status_code=e.http_status, detail=e.user_message)
+            # Read once: an UploadFile's stream cannot be replayed, and these
+            # are the original PDF/DOCX/TXT bytes the service must parse.
+            content = await upload_file.read()
+        except Exception as exc:
+            print(f"[Upload] could not read an uploaded file: {type(exc).__name__}")
+            # A non-bytes payload is rejected per-file by the service as an
+            # invalid upload, which keeps the rest of the batch intact.
+            content = None
+        uploads.append(
+            UploadDocument(
+                filename=upload_file.filename,
+                content=content,
+                metadata=metadata,
+                uploader_id=uploader_id,
+            )
+        )
 
-            if not text.strip():
-                results.append({"error": "Empty file", "filename": safe_filename})
-                continue
+    batch = _build_ingestion_service().ingest_batch(uploads)
+    return JSONResponse(status_code=batch.http_status, content=batch.to_dict())
 
-            chunks = chunk_document(result)
-            chunk_texts = [chunk.text for chunk in chunks]
 
-            try:
-                embeddings = _EMBEDDING_PROVIDER.embed_documents(chunk_texts)
-            except EmbeddingProviderError as exc:
-                print(f"[Upload] Embedding failed for {safe_filename}: {type(exc).__name__}")
-                results.append({"error": "Embedding service is temporarily unavailable", "filename": safe_filename})
-                continue
 
-            if len(embeddings) != len(chunks):
-                print(
-                    f"[Upload] Embedding count mismatch for {safe_filename}: "
-                    f"{len(embeddings)} embeddings for {len(chunks)} chunks"
-                )
-                results.append({"error": "Embedding service returned an unexpected result", "filename": safe_filename})
-                continue
+# --- E2: answer evidence, citations, and the /ask event stream --------------
+#
+# Composition only. The decisions live in the route-independent modules:
+# answer_evidence.py owns the selected-text / complete-document / hybrid-
+# retrieval priority, citation_generation.py owns registration, prompting,
+# marker validation and claim status, and ask_stream.py owns the wire format.
 
-            # Embedding and count validation are already complete above —
-            # the ingestion write connection only opens once both have
-            # succeeded, so an embedding failure never touches the database.
-            conn = connect_to_postgres()
-            if conn is None:
-                raise HTTPException(500, "Failed to connect to PostgreSQL")
-            try:
-                c = conn.cursor()
-                c.execute(
-                    """
-                    INSERT INTO documents
-                    (filename, upload_timestamp, content, author, title, publication_date, source, doi_url, user_id)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                    """,
-                    (
-                        f.filename,
-                        datetime.datetime.now().isoformat(),
-                        text,
-                        author,
-                        title,
-                        publication_date,
-                        source,
-                        doi_url,
-                        uploader_id,
-                    ),
-                )
+_EVIDENCE_LIMITS = EvidenceLimits()
+# Verification is one local model call per claim, serialised, so an answer with
+# many cited claims would add that latency to every question. This route caps it
+# at two claims; the remainder are reported as `unverified`, which is the honest
+# label and never an upgrade to `supported`. The module default is left alone so
+# other callers and the unit tests keep their own budget.
+_CITATION_LIMITS = CitationLimits(max_claims_verified=2)
 
-                doc_id = c.fetchone()[0]
+# Candidates pulled from each ranker before fusion. Larger than the final
+# evidence budget on purpose: fusion needs room to promote a chunk that both
+# rankers found.
+_HYBRID_CANDIDATES_PER_RANKER = 12
 
-                for chunk, embedding in zip(chunks, embeddings):
-                    locator_json = build_chunk_locator(chunk, result.document_type)
-                    c.execute(
-                        """
-                        INSERT INTO document_chunks
-                        (document_id, chunk_text, chunk_index, embedding, page_start, page_end, locator_json)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        (
-                            doc_id,
-                            chunk.text,
-                            chunk.chunk_index,
-                            embedding,
-                            chunk.page_start,
-                            chunk.page_end,
-                            Json(locator_json),
-                        ),
-                    )
 
-                conn.commit()
-            finally:
-                conn.close()
+def _resolve_authorized_scope(auth_token: Optional[str]) -> AuthorizedScope:
+    """Every document this caller may be shown -- or an unresolved scope.
 
-            results.append(
-                {
-                    "message": "Uploaded",
-                    "filename": safe_filename,
-                    "document_id": doc_id,
-                    "chunks_count": len(chunks),
-                }
+    Fails closed. If the connection cannot be opened, the lookup raises, or a
+    token is supplied that matches no user, the caller gets an unresolved scope
+    and therefore no server-loaded evidence at all.
+
+    A caller with no token keeps the established anonymous behaviour: the
+    documents that were uploaded without an owner. That is deliberately
+    narrower than the previous /ask behaviour, which searched every document in
+    the database regardless of who uploaded it.
+    """
+    connection = connect_to_postgres()
+    if connection is None:
+        return AuthorizedScope.unresolved()
+
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        user_id = None
+        if auth_token:
+            cursor.execute("SELECT id FROM users WHERE token = %s", (auth_token,))
+            row = cursor.fetchone()
+            if not row:
+                # A token that resolves to nobody must not quietly degrade into
+                # the anonymous corpus.
+                return AuthorizedScope.unresolved()
+            user_id = row[0]
+
+        if user_id is None:
+            cursor.execute(
+                """
+                SELECT id, filename, title, length(content)
+                FROM documents
+                WHERE user_id IS NULL
+                ORDER BY id
+                """
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT id, filename, title, length(content)
+                FROM documents
+                WHERE user_id = %s
+                ORDER BY id
+                """,
+                (user_id,),
             )
 
-            # Auto-generate KB entries from this document in the background
+        documents = []
+        for document_id, filename, title, char_length in cursor.fetchall():
+            if not filename:
+                # A citation must name a file. A row with no filename cannot be
+                # cited truthfully, so it is not offered as evidence.
+                continue
+            documents.append(
+                AuthorizedDocument(
+                    document_id=document_id,
+                    filename=filename,
+                    title=title,
+                    char_length=char_length,
+                )
+            )
+        return AuthorizedScope(
+            documents=tuple(documents),
+            established=True,
+            user_id=user_id,
+            anonymous=user_id is None,
+        )
+    except Exception as exc:
+        print(f"[Ask] authorization scope lookup failed: {type(exc).__name__}")
+        return AuthorizedScope.unresolved()
+    finally:
+        if cursor is not None:
             try:
-                from threading import Thread
-                Thread(
-                    target=generate_kb_from_document,
-                    args=(doc_id, safe_filename, text),
-                    daemon=True
-                ).start()
+                cursor.close()
+            except Exception:
+                pass
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
+def _load_authorized_document_text(scope: AuthorizedScope, document_id) -> Optional[str]:
+    """One authorized document's stored text, or None.
+
+    Scoped twice on purpose: the id must already be in the in-memory authorized
+    scope, and the SELECT is scoped to the same owner again, so a bug in the
+    caller cannot turn into a cross-user read.
+    """
+    if not scope.authorizes(document_id):
+        return None
+
+    connection = connect_to_postgres()
+    if connection is None:
+        return None
+
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        if scope.user_id is None:
+            cursor.execute(
+                "SELECT content FROM documents WHERE id = %s AND user_id IS NULL",
+                (document_id,),
+            )
+        else:
+            cursor.execute(
+                "SELECT content FROM documents WHERE id = %s AND user_id = %s",
+                (document_id, scope.user_id),
+            )
+        row = cursor.fetchone()
+        return row[0] if row else None
+    except Exception as exc:
+        print(f"[Ask] document load failed: {type(exc).__name__}")
+        return None
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
+def _evidence_item_from_chunk(chunk: dict) -> EvidenceItem:
+    """One fused retrieval row as evidence, with its locator metadata intact."""
+    return EvidenceItem(
+        text=chunk.get("text") or "",
+        source_type="document_chunk",
+        document_id=chunk.get("document_id"),
+        filename=chunk.get("document_name"),
+        chunk_id=chunk.get("chunk_id"),
+        chunk_index=chunk.get("chunk_index"),
+        page_start=chunk.get("page_start"),
+        page_end=chunk.get("page_end"),
+        locator_json=chunk.get("locator"),
+        semantic_score=chunk.get("similarity"),
+        lexical_score=chunk.get("lexical_rank"),
+        combined_score=chunk.get("fusion_score"),
+    )
+
+
+def _hybrid_retrieve_evidence(question: str, document_ids, top_k: int) -> List[EvidenceItem]:
+    """Authorized hybrid retrieval: semantic + lexical, fused deterministically.
+
+    The query embedding is produced before the database is touched, so an
+    embedding outage propagates as EmbeddingProviderError rather than silently
+    degrading into "no relevant evidence". Both queries are scoped to the
+    caller's authorized document ids; there is no global search path.
+    """
+    if not document_ids:
+        return []
+
+    question_embedding = _EMBEDDING_PROVIDER.embed_query(question)
+
+    connection = connect_to_postgres()
+    if connection is None:
+        raise RuntimeError("document search is unavailable")
+
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        semantic_query, semantic_params = build_authorized_semantic_query(
+            question_embedding, _HYBRID_CANDIDATES_PER_RANKER, document_ids
+        )
+        cursor.execute(semantic_query, semantic_params)
+        semantic_chunks = [retrieved_chunk_from_row(row) for row in cursor.fetchall()]
+
+        lexical_chunks = []
+        try:
+            lexical_query, lexical_params = build_authorized_lexical_query(
+                question, _HYBRID_CANDIDATES_PER_RANKER, document_ids
+            )
+            cursor.execute(lexical_query, lexical_params)
+            lexical_chunks = [lexical_chunk_from_row(row) for row in cursor.fetchall()]
+        except Exception as exc:
+            # Lexical ranking is an enhancement, not a precondition: if
+            # full-text search is unavailable the answer is still built from
+            # the semantic evidence rather than failing outright.
+            print(f"[Ask] lexical retrieval unavailable: {type(exc).__name__}")
+            try:
+                connection.rollback()
             except Exception:
                 pass
 
-            # Auto-extract facts/keywords/entities for the admin Insights tab
+        fused = reciprocal_rank_fusion(semantic_chunks, lexical_chunks, top_k=top_k)
+        return [_evidence_item_from_chunk(chunk) for chunk in fused]
+    finally:
+        if cursor is not None:
             try:
-                from threading import Thread
-                Thread(
-                    target=_extract_document_insights,
-                    args=(doc_id, safe_filename, text),
-                    daemon=True
-                ).start()
+                cursor.close()
             except Exception:
                 pass
+        try:
+            connection.close()
+        except Exception:
+            pass
 
-        except HTTPException:
-            raise
-        except Exception as e:
-            results.append({"error": str(e), "filename": safe_filename})
 
-    return results
+def _build_answer_evidence_planner(scope: AuthorizedScope) -> AnswerEvidencePlanner:
+    """The planner, bound to one caller's authorized scope."""
+    return AnswerEvidencePlanner(
+        load_document_text=lambda document_id: _load_authorized_document_text(
+            scope, document_id
+        ),
+        retrieve=_hybrid_retrieve_evidence,
+        limits=_EVIDENCE_LIMITS,
+        propagate_exceptions=(EmbeddingProviderError,),
+    )
 
+
+def _evidence_request_from_ask(request: AskRequest, scope: AuthorizedScope) -> EvidenceRequest:
+    """Map the wire request onto the planner's input.
+
+    Document scope is taken from backend ids. ``active_document_name`` is still
+    honoured for older clients, but only by looking the name up INSIDE the
+    already-authorized scope -- a filename never grants access to anything.
+    """
+    selections = []
+    for index, selection in enumerate(request.selections or []):
+        text = (selection.text or "").strip()
+        if not text:
+            continue
+        selections.append(
+            SelectedTextInput(
+                text=text,
+                selection_id=selection.id or f"selection-{index + 1}",
+                document_id=selection.document_id,
+                filename=selection.document_name or None,
+                locator_json=selection.locator,
+                page_start=selection.page_start,
+                page_end=selection.page_end,
+            )
+        )
+
+    requested: List[int] = []
+    if request.active_document_id is not None:
+        requested.append(request.active_document_id)
+    for document_id in list(request.document_ids or []):
+        if document_id not in requested:
+            requested.append(document_id)
+
+    if not requested and request.active_document_name:
+        for document in scope.documents:
+            if document.filename == request.active_document_name:
+                requested.append(document.document_id)
+                break
+
+    return EvidenceRequest(
+        question=request.question,
+        selected_text=request.selected_text or "",
+        selections=tuple(selections),
+        requested_document_ids=tuple(requested),
+        top_k=_EVIDENCE_LIMITS.max_evidence_items,
+    )
+
+
+_CLAIM_VERIFIER_PROMPT = (
+    "You check whether a claim is supported by evidence excerpts.\n"
+    "Answer with exactly one word: supported, partially_supported, or unsupported.\n"
+    "\n"
+    "Rules:\n"
+    "- Answer supported ONLY if the evidence states every part of the claim.\n"
+    "- Being about the same topic is NOT support. If the evidence discusses "
+    "the subject but does not state what the claim says, answer unsupported.\n"
+    "- Every number, model name, dataset name, and section identifier in the "
+    "claim must appear in the evidence with the same value. If any differs or "
+    "is absent, the claim is not supported.\n"
+    "- If the claim makes several assertions and the evidence states only "
+    "some of them, answer partially_supported.\n"
+    "- If you are unsure, answer unsupported. Do not guess in favour of the "
+    "claim.\n"
+    "\n"
+    "Evidence:\n{evidence}\n\n"
+    "Claim:\n{claim}\n\n"
+    "One word:"
+)
+
+_CLAIM_VERIFIER_WORDS = ("supported", "partially_supported", "unsupported")
+
+
+def _claim_verifier_status(reply: object) -> Optional[str]:
+    """The one status a verifier reply consists of, or None.
+
+    The whole reply must BE a status, not merely contain one: "not supported"
+    contains "supported", and prose naming several statuses has chosen none.
+    Only surrounding whitespace, quotes, markdown emphasis and trailing
+    punctuation are ignored, and a space or hyphen may stand in for the
+    underscore in partially_supported. Anything else is ambiguous or malformed
+    and returns None, which citation_generation records as ``unverified``.
+    """
+    if not isinstance(reply, str):
+        return None
+    word = reply.strip().strip("\"'`*_.!:;,").strip().lower()
+    word = re.sub(r"[\s-]+", "_", word)
+    return word if word in _CLAIM_VERIFIER_WORDS else None
+
+
+def _ollama_claim_verifier(claim: str, records, model: str) -> Optional[str]:
+    """Local-only claim verification against the cited evidence.
+
+    Reads each record's INTERNAL ``evidence_text`` -- the same text the answer
+    model saw -- not the bounded public excerpt. Judging against the excerpt
+    would mark a claim unsupported whenever its support happens to sit past the
+    excerpt bound, which is exactly what a long selection or a complete short
+    document looks like. The verifier's own result stays public-safe: it
+    returns one status word, and the claim payload carries only citation ids.
+
+    Runs through the same local Ollama transport as generation and nothing
+    else. A transport or model failure raises, and a reply that is not exactly
+    one status returns None; citation_generation turns either into
+    ``unverified`` -- it can never become ``supported``.
+    """
+    evidence = "\n\n".join(
+        f"[{record.citation_id}] {record.evidence_text}" for record in records
+    )
+    prompt = _CLAIM_VERIFIER_PROMPT.format(evidence=evidence, claim=claim.strip())
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.0},
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+    }
+    response = post_ollama("/api/generate", payload, timeout=30)
+    response.raise_for_status()
+    return _claim_verifier_status(response.json().get("response"))
+
+
+def _resolve_citations(
+    answer_text: str, registry, verifier=None, *, mode: AnswerMode = AnswerMode.DOCUMENT_QA
+) -> CitationGenerationResult:
+    """Parse one answer for its mode, never raising into the response stream.
+
+    document_qa: claims are extracted and verified, and the used and invalid
+    citation ids are reported -- the only graded, source-linked answers.
+    structured_json: only the used ids are parsed; no claim, no verifier call.
+    model_reasoning: nothing. Ungraded AI analysis links to no source, so the
+    client can never render a navigable source card for an unchecked claim.
+    """
+    try:
+        if mode is AnswerMode.MODEL_REASONING:
+            return CitationGenerationResult(registry=registry)
+        if mode is AnswerMode.STRUCTURED_JSON:
+            return citations_without_claims(answer_text, registry)
+        return generate_citations(answer_text, registry, verifier, _CITATION_LIMITS)
+    except Exception as exc:
+        print(f"[Ask] citation resolution failed: {type(exc).__name__}")
+        return CitationGenerationResult(registry=registry)
 
 
 @app.post("/ask")
 async def ask_question(request: AskRequest):
     answer_parts = []
     entry_id = None
-    selected_items = list(request.selections or [])
-    raw_selected_text = (request.selected_text or "").strip()
-    selected_document_names = []
+    # Decides the prompt rules and whether claims are graded; evidence
+    # planning and authorization below are the same in every mode.
+    answer_mode = AnswerMode(request.mode)
 
-    for selection in selected_items:
-        if selection.document_name and selection.document_name not in selected_document_names:
-            selected_document_names.append(selection.document_name)
+    def verify_claim(claim, records):
+        return _ollama_claim_verifier(claim, records, request.model)
 
-    if request.active_document_name and request.active_document_name not in selected_document_names:
-        selected_document_names.append(request.active_document_name)
-
-    def build_context() -> tuple[str, List[dict], float, str]:
-        if selected_items:
-            prompt_text = "\n\n---\n\n".join(
-                f"[Selection {index + 1} from: {selection.document_name}]\n{selection.text}"
-                for index, selection in enumerate(selected_items)
-            )
-            return prompt_text, [{"text": prompt_text, "similarity": 1.0}], 1.0, "selected_text"
-
-        if raw_selected_text:
-            return raw_selected_text, [{"text": raw_selected_text, "similarity": 1.0}], 1.0, "selected_text"
-
-        if request.active_document_name:
-            documents = get_documents_by_filenames([request.active_document_name])
-            if documents:
-                document = documents[0]
-                document_text = document["content"] or ""
-                if len(document_text) > 14000:
-                    document_text = (
-                        document_text[:14000]
-                        + "\n\n[Truncated to keep the prompt responsive.]"
-                    )
-                display_name = document["title"] or document["filename"]
-                prompt_text = (
-                    f"Document title: {display_name}\n"
-                    f"Document file: {document['filename']}\n\n"
-                    f"{document_text}"
-                )
-                return prompt_text, [{"text": prompt_text, "similarity": 1.0}], 1.0, "active_document"
-
-        scoped_names = [
-            name for name in selected_document_names if name and name != request.active_document_name
-        ]
-        if request.active_document_name and request.active_document_name not in scoped_names:
-            scoped_names.insert(0, request.active_document_name)
-
-        if scoped_names and is_summary_question(request.question):
-            scoped_documents = get_documents_by_filenames(scoped_names)
-            if scoped_documents:
-                parts = []
-                for document in scoped_documents:
-                    document_text = document["content"] or ""
-                    if len(document_text) > 12000:
-                        document_text = (
-                            document_text[:12000]
-                            + "\n\n[Truncated to keep the prompt responsive.]"
-                        )
-                    display_name = document["title"] or document["filename"]
-                    parts.append(
-                        f"Document title: {display_name}\n"
-                        f"Document file: {document['filename']}\n\n"
-                        f"{document_text}"
-                    )
-                prompt_text = "\n\n---\n\n".join(parts)
-                return prompt_text, [{"text": part, "similarity": 1.0} for part in parts], 1.0, "summary_document"
-
-        if scoped_names:
-            context_chunks = get_relevant_chunks(
-                request.question, top_k=4, document_names=scoped_names
-            )
-        else:
-            context_chunks = get_relevant_chunks(request.question, top_k=4)
-
-        prompt_text = ""
-        for chunk_data in context_chunks:
-            prompt_text += f"\n\n{chunk_data['text']}"
-
-        best_similarity = max(
-            (chunk["similarity"] for chunk in context_chunks), default=0.0
-        )
-        return prompt_text, context_chunks, best_similarity, "retrieval"
-
-    def build_prompt(prompt_text: str) -> str:
-        return f"""<context>
-{prompt_text}
-</context>
-
-<question>
-{request.question}
-</question>
-
-Answer using only the provided context when it contains relevant information.
-If the context is insufficient, say what is missing instead of guessing.
-Do not include internal tags, metadata, JSON, or the words CONTEXT/QUESTION in the answer.
-If a specific document or highlighted excerpt was provided, treat it as the primary source and do not mix in unrelated documents.
-Keep the answer concise, structured, and directly responsive to the question."""
+    def build_evidence():
+        """Plan the evidence and register its citations. Authorization-scoped."""
+        scope = _resolve_authorized_scope(request.auth_token)
+        planner = _build_answer_evidence_planner(scope)
+        planning = planner.plan(_evidence_request_from_ask(request, scope), scope)
+        registry = CitationRegistry.from_bundle(planning.bundle, _CITATION_LIMITS)
+        return planning, registry
 
     def stream_generate():
         nonlocal answer_parts, entry_id
-        yield "__SEARCHING__\n"
+        yield '{"type": "delta", "text": ""}\n'
 
         stream_error = None
+        kb_ids_fired = []
         try:
-            prompt_text, context_chunks, best_similarity, context_source = build_context()
+            planning, registry = build_evidence()
 
             # ── Knowledge Base injection ──────────────────────────────────
-            kb_entries = get_relevant_knowledge_base(request.question, limit=3)
-            kb_ids_fired = [e["id"] for e in kb_entries]
-            if kb_entries:
-                kb_block = "\n\n<knowledge_base_corrections>\n"
-                for e in kb_entries:
-                    kb_block += f"Q: {e['question']}\nA: {e['answer']}\n---\n"
-                kb_block += "</knowledge_base_corrections>"
-                prompt_text = prompt_text + kb_block
+            # Only document_qa reads the knowledge base. Tool JSON and AI
+            # analysis are neither steered by saved answers nor count as a
+            # use of them. This narrows which answers read the KB; it does
+            # not change that the KB itself is shared across users.
+            kb_block = ""
+            if answer_mode is AnswerMode.DOCUMENT_QA:
+                kb_entries = get_relevant_knowledge_base(request.question, limit=3)
+                kb_ids_fired = [e["id"] for e in kb_entries]
+                if kb_entries:
+                    kb_block = "<knowledge_base_corrections>\n"
+                    for e in kb_entries:
+                        kb_block += f"Q: {e['question']}\nA: {e['answer']}\n---\n"
+                    kb_block += "</knowledge_base_corrections>"
             # ─────────────────────────────────────────────────────────────
 
-            prompt = build_prompt(prompt_text)
-            context_data = {
-                "context_chunks": [chunk_data["text"] for chunk_data in context_chunks],
-                "similarity_score": best_similarity,
-                "context_source": context_source,
-                "active_document_name": request.active_document_name,
-            }
+            if answer_mode is AnswerMode.DOCUMENT_QA:
+                prompt = build_generation_prompt(
+                    request.question, registry, extra_context=kb_block
+                )
+            else:
+                prompt = build_mode_prompt(answer_mode, request.question, registry)
 
-            yield f"__CONTEXT__{json.dumps(context_data)}__\n\n"
-            yield "__READY__\n"
+            yield evidence_event(
+                registry.to_dict()["citations"],
+                mode=planning.mode.value,
+                truncated=planning.bundle.truncated,
+                warnings=planning.warnings,
+            )
 
             payload = {
                 "model": request.model,
@@ -992,17 +1361,19 @@ Keep the answer concise, structured, and directly responsive to the question."""
                 "keep_alive": OLLAMA_KEEP_ALIVE,
             }
         except EmbeddingProviderError:
-            yield "__ERROR__Search is temporarily unavailable. Please try again shortly.__"
+            yield '{"type": "error", "code": "search_unavailable", "message": "Search is temporarily unavailable. Please try again shortly."}\n'
+            yield '{"type": "done", "ok": false}\n'
             return
-        except Exception as e:
-            yield f"__ERROR__Failed to build document context: {e}__"
+        except Exception as exc:
+            print(f"[Ask] evidence planning failed: {type(exc).__name__}")
+            yield '{"type": "error", "code": "evidence_unavailable", "message": "Document evidence is temporarily unavailable."}\n'
+            yield '{"type": "done", "ok": false}\n'
             return
 
         try:
             with post_ollama("/api/generate", payload, stream=True, timeout=60) as r:
                 r.raise_for_status()
                 buffer = ""
-                token_count = 0
                 for chunk in r.iter_content(decode_unicode=True, chunk_size=32):
                     if chunk:
                         if isinstance(chunk, bytes):
@@ -1016,11 +1387,9 @@ Keep the answer concise, structured, and directly responsive to the question."""
                                     data = json.loads(line)
                                     token = data.get("response", "")
                                     if token:
-                                        token_count += 1
                                         answer_parts.append(token)
-                                        yield token
-                                except Exception as e:
-                                    print(f"DEBUG: JSON parse error: {e}")
+                                        yield delta_event(token)
+                                except Exception:
                                     continue
                 # Handle any remaining buffered data
                 if buffer:
@@ -1028,28 +1397,41 @@ Keep the answer concise, structured, and directly responsive to the question."""
                         data = json.loads(buffer)
                         token = data.get("response", "")
                         if token:
-                            token_count += 1
                             answer_parts.append(token)
-                            yield token
+                            yield delta_event(token)
                     except Exception:
                         pass
-                print(f"DEBUG: Streaming complete. Total tokens: {token_count}")
         except Exception as e:
             stream_error = True
             response = getattr(e, "response", None)
             if response is not None:
-                yield f"__ERROR__LLM request failed with HTTP {response.status_code}. Check that model '{request.model}' is installed in Ollama.__"
+                yield '{"type": "error", "code": "generation_http_error", "message": "The local model request failed. Check that the requested model is installed in Ollama."}\n'
             else:
-                yield "__ERROR__The local LLM server is not reachable. Start Ollama or update OLLAMA_BASE_URL / OLLAMA_PORT in .env.__"
+                yield '{"type": "error", "code": "generation_unreachable", "message": "The local LLM server is not reachable. Start Ollama or update OLLAMA_BASE_URL / OLLAMA_PORT in .env."}\n'
 
         # Increment KB usage counts for entries that fired this query
         if kb_ids_fired:
             increment_kb_usage(kb_ids_fired)
 
         if stream_error or not answer_parts:
+            # An interrupted or empty generation must never terminate as a
+            # success: done carries ok=false and no entry id is written.
+            yield done_event(ok=False)
             return
 
         full_answer = "".join(answer_parts)
+
+        citation_result = _resolve_citations(
+            full_answer, registry, verify_claim, mode=answer_mode
+        )
+        yield verification_event(
+            [claim.to_dict() for claim in citation_result.claims],
+            invalid_citation_ids=citation_result.invalid_citation_ids,
+            used_citation_ids=citation_result.used_citation_ids,
+        )
+
+        conn = None
+        committed = False
         try:
             conn = connect_to_postgres()
             c = conn.cursor()
@@ -1078,11 +1460,36 @@ Keep the answer concise, structured, and directly responsive to the question."""
 
             entry_id = c.fetchone()[0]
             conn.commit()
-            conn.close()
+            committed = True
+        except Exception as exc:
+            print(f"[Ask] chat history persistence failed: {type(exc).__name__}")
+            # Reached only before the commit completed, so nothing is durable:
+            # roll it back. A failed rollback must not replace the safe error.
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception as cleanup_exc:
+                    print(f"[Ask] chat history rollback failed: {type(cleanup_exc).__name__}")
+        finally:
+            # Closed on every path. After a commit the row is durable, so a
+            # failed close is logged and the answer still succeeds.
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception as cleanup_exc:
+                    print(f"[Ask] chat history close failed: {type(cleanup_exc).__name__}")
 
-            yield f"\n\n__ENTRY_ID__{entry_id}__"
+        if not committed:
+            yield error_event(**safe_error("internal_error"))
+            yield done_event(ok=False)
+            return
 
-            # Auto-save this Q&A to the Knowledge Base in the background
+        yield entry_id_event(entry_id)
+
+        # Auto-save this Q&A to the Knowledge Base in the background. Only a
+        # committed document_qa answer qualifies: tool JSON and ungraded AI
+        # analysis are not answers that belong in the KB.
+        if answer_mode is AnswerMode.DOCUMENT_QA:
             try:
                 from threading import Thread
                 Thread(
@@ -1093,12 +1500,11 @@ Keep the answer concise, structured, and directly responsive to the question."""
             except Exception:
                 pass
 
-        except Exception:
-            yield "__ERROR__Database error__"
+        yield done_event(ok=True)
 
     return StreamingResponse(
         stream_generate(),
-        media_type="text/plain",
+        media_type=STREAM_MEDIA_TYPE,
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no"
@@ -3121,7 +3527,6 @@ async def convert_docx_to_pdf(file: UploadFile = File(...)):
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-init_db(expected_dimension=_EMBEDDING_PROFILE.dimension)
 if __name__ == "__main__":
     import uvicorn
 

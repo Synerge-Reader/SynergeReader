@@ -98,20 +98,43 @@ def test_summary_prompt_no_longer_forces_an_entry_from_every_document(src):
     assert "never infer or invent" in prompt
     assert "adds nothing there" in prompt
     assert "file name in parentheses" in prompt  # every item is attributable
-    assert "only the opening portion of each document is provided" in prompt
+    # E2 integration: the server now supplies either a complete document or
+    # retrieved passages, never a client-cut opening portion, so the prompt
+    # says exactly that and no longer promises that every document was read.
+    assert "only the opening portion" not in prompt
+    assert "either the complete text of a document or passages retrieved from the documents" in prompt
+    assert "it may not include every document or every part of one" in prompt
+    assert "reflect all" not in prompt
 
 
 def test_summary_tells_the_user_how_much_of_each_document_was_read(src):
-    assert "function combinedPerDocLimit" in src
-    assert src.count("combinedPerDocLimit(docs.length)") >= 3  # chat, tool and summary agree
-    assert "built from roughly the first" in src
+    # E2 integration: coverage comes from the backend's evidence event -- the
+    # only record of what the server actually supplied -- instead of a
+    # client-side per-document character limit that no longer exists.
+    summary = _between(src, "const runSummaryTool = useCallback", "const runPrecedentsTool")
+    assert "runToolQuery(prompt, undefined, event => { evidence = event; })" in summary
+    assert "describeEvidenceCoverage(evidence," in summary
+    helper = _between(src, "function describeEvidenceCoverage", "function SummaryToolView")
+    assert "Built from the complete text of" in helper
+    assert "not the complete text, so anything outside those passages isn't reflected" in helper
+    assert "No document text was available" in helper
+    assert "combinedPerDocLimit" not in src
+    assert "built from roughly the first" not in src
 
 
 # ---- context priority ---------------------------------------------------------
 
 
-def test_an_explicit_selection_beats_the_combined_document_bundle(src):
-    assert "const combinedSelections = isAllScope && !askedContext?.text" in src
+def test_an_explicit_selection_is_the_selected_evidence_and_scope_travels_as_ids(src):
+    # E2 integration: the highlight still wins, now because it is the only
+    # selected evidence sent (attributed by document id) while document scope
+    # travels as backend ids -- no client text bundle exists to displace it.
+    send = _between(src, "const sendMessage = useCallback", "// ── task-mode tools")
+    assert "const explicitSelections = askedContext?.text" in send
+    assert "document_id:   Number.isInteger(askedContext.docId) ? askedContext.docId : null," in send
+    assert "selections:           explicitSelections," in send
+    assert "document_ids:         isAllScope ? scopeDocumentIds : []," in send
+    assert "combinedSelections" not in src
 
 
 # ---- "Sources" is analysis, not retrieval ------------------------------------
