@@ -186,7 +186,9 @@ def test_done_ok_false_is_evaluated_before_the_completion_decisions(send_message
     ok_check = send_message_block.index("if (event.ok === false) failed = true;")
     incomplete = send_message_block.index("incomplete: !finished || failed,")
     navigation = send_message_block.index("if (!failed && citations.length) handleCitation(")
-    kb_count = send_message_block.index("if (!failed) setKbCount(")
+    kb_count = send_message_block.index(
+        'if (finished && !failed && answerMode === "document_qa") setKbCount('
+    )
 
     assert ok_check < incomplete < navigation < kb_count, (
         "done(ok:false) must be evaluated before the incomplete flag, the "
@@ -201,8 +203,15 @@ def test_the_three_completion_decisions_all_key_off_failed(send_message_block):
     assert "if (!failed && citations.length) handleCitation(citations[0]);" in send_message_block, (
         "a failed stream must not auto-navigate to a citation"
     )
-    assert "if (!failed) setKbCount(k => k + 1);" in send_message_block, (
-        "a failed stream must not increment the knowledge-base counter"
+    # PR #54: only a committed document_qa answer is auto-saved to the
+    # knowledge base, so AI analysis no longer grows the counter either, and a
+    # stream cut off before done cannot show a commit, so it counts nothing.
+    assert (
+        'if (finished && !failed && answerMode === "document_qa") setKbCount(k => k + 1);'
+        in send_message_block
+    ), (
+        "a failed stream, a stream that ended without done, or an answer that "
+        "is never auto-saved must not increment the knowledge-base counter"
     )
     assert "msg.incomplete && !msg.streaming" in _GRID_APP_PATH.read_text(encoding="utf-8"), (
         "the existing incomplete banner is what surfaces the warning"

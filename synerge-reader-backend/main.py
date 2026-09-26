@@ -1254,16 +1254,20 @@ def _ollama_claim_verifier(claim: str, records, model: str) -> Optional[str]:
 
 
 def _resolve_citations(
-    answer_text: str, registry, verifier=None, *, check_claims: bool = True
+    answer_text: str, registry, verifier=None, *, mode: AnswerMode = AnswerMode.DOCUMENT_QA
 ) -> CitationGenerationResult:
-    """Parse one answer, never raising into the response stream.
+    """Parse one answer for its mode, never raising into the response stream.
 
-    Claims are extracted and verified only when they will be shown graded
-    (document_qa). Otherwise only the used citation ids are parsed: no verifier
-    call is spent, and no claim can be labelled supported.
+    document_qa: claims are extracted and verified, and the used and invalid
+    citation ids are reported -- the only graded, source-linked answers.
+    structured_json: only the used ids are parsed; no claim, no verifier call.
+    model_reasoning: nothing. Ungraded AI analysis links to no source, so the
+    client can never render a navigable source card for an unchecked claim.
     """
     try:
-        if not check_claims:
+        if mode is AnswerMode.MODEL_REASONING:
+            return CitationGenerationResult(registry=registry)
+        if mode is AnswerMode.STRUCTURED_JSON:
             return citations_without_claims(answer_text, registry)
         return generate_citations(answer_text, registry, verifier, _CITATION_LIMITS)
     except Exception as exc:
@@ -1300,14 +1304,19 @@ async def ask_question(request: AskRequest):
             planning, registry = build_evidence()
 
             # ── Knowledge Base injection ──────────────────────────────────
-            kb_entries = get_relevant_knowledge_base(request.question, limit=3)
-            kb_ids_fired = [e["id"] for e in kb_entries]
+            # Only document_qa reads the knowledge base. Tool JSON and AI
+            # analysis are neither steered by saved answers nor count as a
+            # use of them. This narrows which answers read the KB; it does
+            # not change that the KB itself is shared across users.
             kb_block = ""
-            if kb_entries:
-                kb_block = "<knowledge_base_corrections>\n"
-                for e in kb_entries:
-                    kb_block += f"Q: {e['question']}\nA: {e['answer']}\n---\n"
-                kb_block += "</knowledge_base_corrections>"
+            if answer_mode is AnswerMode.DOCUMENT_QA:
+                kb_entries = get_relevant_knowledge_base(request.question, limit=3)
+                kb_ids_fired = [e["id"] for e in kb_entries]
+                if kb_entries:
+                    kb_block = "<knowledge_base_corrections>\n"
+                    for e in kb_entries:
+                        kb_block += f"Q: {e['question']}\nA: {e['answer']}\n---\n"
+                    kb_block += "</knowledge_base_corrections>"
             # ─────────────────────────────────────────────────────────────
 
             if answer_mode is AnswerMode.DOCUMENT_QA:
@@ -1315,9 +1324,7 @@ async def ask_question(request: AskRequest):
                     request.question, registry, extra_context=kb_block
                 )
             else:
-                prompt = build_mode_prompt(
-                    answer_mode, request.question, registry, extra_context=kb_block
-                )
+                prompt = build_mode_prompt(answer_mode, request.question, registry)
 
             yield evidence_event(
                 registry.to_dict()["citations"],
@@ -1396,10 +1403,7 @@ async def ask_question(request: AskRequest):
         full_answer = "".join(answer_parts)
 
         citation_result = _resolve_citations(
-            full_answer,
-            registry,
-            verify_claim,
-            check_claims=answer_mode is AnswerMode.DOCUMENT_QA,
+            full_answer, registry, verify_claim, mode=answer_mode
         )
         yield verification_event(
             [claim.to_dict() for claim in citation_result.claims],
@@ -1463,16 +1467,19 @@ async def ask_question(request: AskRequest):
 
         yield entry_id_event(entry_id)
 
-        # Auto-save this Q&A to the Knowledge Base in the background
-        try:
-            from threading import Thread
-            Thread(
-                target=auto_save_to_kb,
-                args=(request.question, full_answer, "auto-query"),
-                daemon=True
-            ).start()
-        except Exception:
-            pass
+        # Auto-save this Q&A to the Knowledge Base in the background. Only a
+        # committed document_qa answer qualifies: tool JSON and ungraded AI
+        # analysis are not answers that belong in the KB.
+        if answer_mode is AnswerMode.DOCUMENT_QA:
+            try:
+                from threading import Thread
+                Thread(
+                    target=auto_save_to_kb,
+                    args=(request.question, full_answer, "auto-query"),
+                    daemon=True
+                ).start()
+            except Exception:
+                pass
 
         yield done_event(ok=True)
 

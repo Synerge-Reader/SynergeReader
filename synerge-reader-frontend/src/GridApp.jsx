@@ -234,6 +234,14 @@ function createEventDecoder() {
   };
 }
 
+// Ungraded AI analysis (model_reasoning) links to no source: the backend sends
+// it no citation ids, so any [Cn] marker the model still wrote is removed
+// rather than shown as a chip a reader could follow or mistake for evidence.
+// Chat and the Compare explanation share this one rule.
+function stripCitationMarkers(text) {
+  return (text || "").replace(/\s*\[C\d+\]/g, "");
+}
+
 // ── citation text matching (TXT) ──────────────────────────────────────────
 // TXT evidence has no page, so navigation is done by finding the citation's
 // PUBLIC excerpt inside the document the browser already holds. The excerpt is
@@ -401,7 +409,8 @@ function InlineCitation({ citation, token, pending, onOpen }) {
 
 // The answer, with every exact [Cn] token that resolves to a used source
 // replaced by its display number. Nothing else in the text is touched.
-function AnswerText({ text, citations, pending, onOpen }) {
+function AnswerText({ text, citations, pending, onOpen, linkCitations = true }) {
+  if (!linkCitations) return <>{stripCitationMarkers(text)}</>;
   const body = text || "";
   const byId = {};
   (citations || []).forEach(c => { byId[c.citation_id] = c; });
@@ -3513,10 +3522,15 @@ export default function GridApp() {
           // the backend reports — never the candidate array's position.
           const byId = {};
           candidates.forEach(c => { byId[c.citation_id] = c; });
-          citations = (event.used_citation_ids || [])
-            .map(id => byId[id])
-            .filter(Boolean)
-            .map((record, index) => ({ ...record, displayNumber: index + 1 }));
+          // Only a graded document answer links to sources. The backend sends
+          // AI analysis no citation ids; this holds the same line here, so no
+          // navigable source card can come from an ungraded answer.
+          citations = answerMode === "document_qa"
+            ? (event.used_citation_ids || [])
+              .map(id => byId[id])
+              .filter(Boolean)
+              .map((record, index) => ({ ...record, displayNumber: index + 1 }))
+            : [];
           setMessages(prev => prev.map(msg => msg.id === msgId
             ? {
                 ...msg,
@@ -3566,7 +3580,11 @@ export default function GridApp() {
           }
         : msg));
       if (!failed && citations.length) handleCitation(citations[0]);
-      if (!failed) setKbCount(k => k + 1);
+      // Only a committed document_qa answer is auto-saved to the knowledge
+      // base, so only that answer can grow the count; AI analysis never does.
+      // "finished" means a done event arrived: a stream cut off before it
+      // cannot show that anything was committed, so it counts nothing.
+      if (finished && !failed && answerMode === "document_qa") setKbCount(k => k + 1);
 
     } catch (err) {
       if (err.name !== "AbortError") {
@@ -3727,7 +3745,7 @@ export default function GridApp() {
     if (!finished) throw new Error("The explanation ended before it finished.");
     // The modal already shows both passages, so a stray [Cn] marker adds
     // nothing a reader could follow.
-    return full.replace(/\s*\[C\d+\]/g, "").trim();
+    return stripCitationMarkers(full).trim();
   }, [authToken]);
 
   const runArgumentTool = useCallback(async (claim) => {
@@ -4717,7 +4735,7 @@ export default function GridApp() {
                               fontSize: "14.5px", color: "#1e293b", lineHeight: "1.7",
                               whiteSpace: "pre-wrap",
                             }}>
-                              <AnswerText text={msg.text} citations={msg.citations} pending={msg.streaming || msg.sourcesPending} onOpen={handleCitation} />
+                              <AnswerText text={msg.text} citations={msg.citations} pending={msg.streaming || msg.sourcesPending} onOpen={handleCitation} linkCitations={!msg.unverified} />
                               {msg.streaming && <span style={{ opacity: .5, animation: "blink 1s infinite" }}>▊</span>}
                             </div>
                             {msg.incomplete && !msg.streaming && (
@@ -4741,7 +4759,7 @@ export default function GridApp() {
                                 AI analysis only — any cases or citations above are not verified against a source.
                               </div>
                             )}
-                            {msg.citations?.length > 0 && (
+                            {!msg.unverified && msg.citations?.length > 0 && (
                               <div style={{ marginTop: "8px", display: "flex", flexDirection: "column", gap: "6px" }}>
                                 <div style={{ fontSize: "10.5px", color: "#6b7280", fontWeight: 700, letterSpacing: ".04em" }}>
                                   {msg.citations.length === 1 ? "SOURCE" : "SOURCES"}

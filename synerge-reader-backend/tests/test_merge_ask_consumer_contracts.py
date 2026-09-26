@@ -11,8 +11,10 @@ event is treated as incomplete; the Compare explanation no longer sniffs
 sentinels or renders raw frames and keeps each passage's document id; the
 selection actions main added keep document provenance; suggestions are scoped to
 the uploaded document under the caller's token; AI-analysis answers never show
-a document-support headline; and a newly indexed document carries its backend
-id and a persisted flag.
+a document-support headline, a source card, or a citation chip, and chat and
+Compare strip markers by one shared rule; chat failure stays sticky after an
+error; and a newly indexed document carries its backend id and a persisted
+flag.
 
 What these do NOT prove: runtime rendering, network behaviour, or that the
 model follows its prompt.
@@ -115,6 +117,57 @@ def test_failure_is_sticky_and_a_missing_done_is_incomplete(src, name):
         "the result is checked for failure only after the whole stream was read"
     )
     assert "!finished" in after_stream
+
+
+def test_chat_failure_is_sticky_once_an_error_arrives(src):
+    """PR #54: pins the chat consumer's existing rule. An error event records
+    failure, the done handler can only add failure, and nothing clears it -- so
+    an error followed by done(ok:true) still ends failed."""
+    send = _send_message(src)
+    error_branch = _between(send, 'else if (event.type === "error")', 'else if (event.type === "done")')
+    assert "failed = true;" in error_branch
+    done_branch = _between(send, 'else if (event.type === "done")', "while (true)")
+    assert "if (event.ok === false) failed = true;" in done_branch
+    assert not re.search(r"\bfailed\s*=\s*(false|!|event\.ok)", done_branch), (
+        "done(ok:true) must never clear a failure recorded earlier"
+    )
+    assert len(re.findall(r"\bfailed\s*=\s*false\b", send)) == 1, (
+        "failed is only initialised to false"
+    )
+    after_stream = send[send.index("decoder.close().forEach(applyEvent)"):]
+    assert "incomplete: !finished || failed," in after_stream
+    assert "if (!failed && citations.length) handleCitation(citations[0]);" in after_stream
+
+
+# --- AI analysis links to no source (PR #54) -----------------------------------
+
+
+def test_ai_analysis_builds_no_source_citations_whatever_ids_arrive(src):
+    verification = _between(
+        _send_message(src), 'if (event.type === "verification")', 'else if (event.type === "entry_id")'
+    )
+    assert 'citations = answerMode === "document_qa"' in verification
+    assert re.search(r"\.map\(\(record, index\) => \(\{ \.\.\.record, displayNumber: index \+ 1 \}\)\)\s*: \[\];", verification), (
+        "anything other than a graded document answer gets no citations"
+    )
+
+
+def test_ai_analysis_renders_no_source_cards_or_citation_chips(src):
+    assert (
+        "<AnswerText text={msg.text} citations={msg.citations} pending={msg.streaming || msg.sourcesPending} "
+        "onOpen={handleCitation} linkCitations={!msg.unverified} />"
+    ) in src
+    assert "{!msg.unverified && msg.citations?.length > 0 && (" in src
+    answer = _between(src, "function AnswerText(", "const body = text")
+    assert "linkCitations = true" in answer
+    assert "if (!linkCitations) return <>{stripCitationMarkers(text)}</>;" in answer
+
+
+def test_chat_and_compare_share_one_marker_stripping_rule(src):
+    helper = _between(src, "function stripCitationMarkers(text)", "// ── citation text matching")
+    assert 'return (text || "").replace(/\\s*\\[C\\d+\\]/g, "");' in helper
+    assert "return stripCitationMarkers(full).trim();" in _explain_diff_pair(src)
+    assert src.count("\\[C\\d+\\]/g") == 1, "one stripping rule, not a second copy drifting apart"
 
 
 def test_the_compare_explanation_is_never_raw_stream_text(src):

@@ -24,7 +24,9 @@ write is rolled back and every opened connection closed, the local-only
 generation policy survives the transport change, the claim verifier sends its
 temperature as an Ollama option and accepts only a reply that is exactly one
 status, only document_qa answers are graded while structured_json and
-model_reasoning answers skip verification under the same authorization, and the
+model_reasoning answers skip verification under the same authorization, only
+document_qa reads the knowledge base or is auto-saved to it after a commit,
+model_reasoning answers carry no citation links, and the
 route composes the evidence planner and citation registry instead of
 re-deciding evidence priority itself.
 
@@ -280,10 +282,16 @@ def _evidence_bundle():
     )
 
 
-def _route_harness(main_tree, connection, verifier_reply="supported"):
+def _route_harness(main_tree, connection, verifier_reply="supported", kb_entries=()):
     """The route's real code, with every collaborator an in-memory stub."""
-    calls = SimpleNamespace(ollama=[], scopes=[], auto_saved=threading.Event())
+    calls = SimpleNamespace(
+        ollama=[], scopes=[], kb_queries=[], kb_used=[], auto_saved=threading.Event()
+    )
     planning = EvidencePlanningResult(bundle=_evidence_bundle())
+
+    def get_relevant_knowledge_base(question, limit=3):
+        calls.kb_queries.append(question)
+        return [dict(entry) for entry in kb_entries]
 
     def resolve_authorized_scope(auth_token):
         calls.scopes.append(auth_token)
@@ -315,8 +323,8 @@ def _route_harness(main_tree, connection, verifier_reply="supported"):
             plan=lambda request, scope: planning
         ),
         "_evidence_request_from_ask": lambda request, scope: request,
-        "get_relevant_knowledge_base": lambda question, limit=3: [],
-        "increment_kb_usage": lambda ids: None,
+        "get_relevant_knowledge_base": get_relevant_knowledge_base,
+        "increment_kb_usage": lambda ids: calls.kb_used.append(list(ids)),
         "auto_save_to_kb": lambda *args: calls.auto_saved.set(),
         "CitationRegistry": CitationRegistry,
         "AnswerMode": AnswerMode,
@@ -349,9 +357,15 @@ def _call_without_event_loop(coroutine):
 
 
 def _stream_ask(
-    main_tree, connection, *, auth_token=None, verifier_reply="supported", mode="document_qa"
+    main_tree,
+    connection,
+    *,
+    auth_token=None,
+    verifier_reply="supported",
+    mode="document_qa",
+    kb_entries=(),
 ):
-    namespace, calls = _route_harness(main_tree, connection, verifier_reply)
+    namespace, calls = _route_harness(main_tree, connection, verifier_reply, kb_entries)
     request = SimpleNamespace(
         question="How long is the agreement term?",
         selected_text="",
@@ -958,9 +972,66 @@ def test_ungraded_modes_skip_verification_and_the_citation_rules(main_tree, mode
     assert CITATION_RULES not in prompt
     [verification] = [event for event in events if event["type"] == "verification"]
     assert verification["claims"] == [], "an ungraded answer can carry no supported claim"
-    assert verification["used_citation_ids"] == ["C1"], "which evidence was used still survives"
     assert [event["type"] for event in events] == _SUCCESS_EVENT_TYPES, (
         "every mode keeps the same stream shape, including history persistence"
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "used"),
+    [("document_qa", ["C1"]), ("structured_json", ["C1"]), ("model_reasoning", [])],
+)
+def test_only_ai_analysis_is_denied_citation_links(main_tree, mode, used):
+    """The answer cites [C1] in every mode. Graded answers and tool output keep
+    the link; ungraded AI analysis gets none, so no client can turn it into a
+    navigable source card for a claim nobody checked."""
+    _, events, _ = _stream_ask(main_tree, _FakeConnection(), mode=mode)
+    [verification] = [event for event in events if event["type"] == "verification"]
+
+    assert verification["used_citation_ids"] == used
+    if mode == "model_reasoning":
+        assert verification["invalid_citation_ids"] == []
+
+
+# --- answer modes: the knowledge base -----------------------------------------
+#
+# Only document_qa reads or feeds the knowledge base. These pin which answers
+# touch it; they say nothing about the KB being shared across users, which is
+# unchanged here and remains a separate release blocker.
+
+_KB_ENTRY = {"id": 71, "question": "Saved question?", "answer": "Saved corrected answer."}
+
+
+def test_document_qa_reads_the_knowledge_base_and_saves_its_committed_answer(main_tree):
+    _, events, calls = _stream_ask(
+        main_tree, _FakeConnection(), mode="document_qa", kb_entries=(_KB_ENTRY,)
+    )
+
+    assert calls.kb_queries == ["How long is the agreement term?"]
+    prompt = _generation_prompt(calls)
+    assert "<knowledge_base_corrections>" in prompt
+    assert "A: Saved corrected answer." in prompt
+    assert calls.kb_used == [[71]], "a KB entry that fired is counted as used"
+    assert events[-1] == {"type": "done", "ok": True}
+    assert calls.auto_saved.wait(timeout=5), "a committed document answer is auto-saved"
+
+
+@pytest.mark.parametrize("mode", ["structured_json", "model_reasoning"])
+def test_ungraded_modes_neither_read_nor_feed_the_knowledge_base(main_tree, mode):
+    _, events, calls = _stream_ask(
+        main_tree, _FakeConnection(), mode=mode, kb_entries=(_KB_ENTRY,)
+    )
+
+    assert calls.kb_queries == [], f"{mode} must not retrieve knowledge-base entries"
+    prompt = _generation_prompt(calls)
+    assert "knowledge_base_corrections" not in prompt
+    assert "Saved corrected answer." not in prompt
+    assert calls.kb_used == []
+    assert [event["type"] for event in events] == _SUCCESS_EVENT_TYPES, (
+        "the answer itself still commits to history"
+    )
+    assert not calls.auto_saved.wait(timeout=0.5), (
+        f"a committed {mode} answer must not be auto-saved to the knowledge base"
     )
 
 
