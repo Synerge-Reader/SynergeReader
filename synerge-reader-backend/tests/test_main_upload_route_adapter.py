@@ -5,8 +5,10 @@ verified ``DocumentIngestionService`` from E1a-2: it reads each uploaded file's
 ORIGINAL bytes exactly once, maps the form fields onto the ingestion contract,
 preserves input order, composes the service with this application's real
 dependencies, returns the service's batch envelope under the service's own
-aggregated HTTP status, and dispatches the two pre-existing follow-ups only
-through the service's post-commit hook.
+aggregated HTTP status, and dispatches its post-commit follow-up only through
+the service's post-commit hook. Since the PR #54 containment that follow-up is
+document insights alone: generating knowledge-base Q&A from the uploaded text
+is no longer dispatched, because the knowledge base is shared by every user.
 
 REQUIRES THE SOCKETPAIR-AWARE SIBLING GUARD, for exactly the reason
 ``tests/test_main_route_harness.py`` documents: every test here that enters a
@@ -896,9 +898,7 @@ def test_complete_batch_envelope_is_returned_without_raw_exception_detail(
 # --- 11: post-commit follow-ups -------------------------------------------
 
 
-def test_dispatcher_forwards_committed_identity_to_both_followups(
-    monkeypatch, main_module
-):
+def test_dispatcher_starts_only_the_insights_followup(monkeypatch, main_module):
     started = []
     monkeypatch.setattr(
         main_module,
@@ -916,26 +916,112 @@ def test_dispatcher_forwards_committed_identity_to_both_followups(
     main_module._dispatch_upload_followups(committed)
 
     assert [target for target, _ in started] == [
-        main_module.generate_kb_from_document,
         main_module._extract_document_insights,
-    ], "both pre-existing follow-ups must be preserved"
+    ], (
+        "PR #54 containment: only document insights may follow a commit; "
+        "generate_kb_from_document writes the uploaded text's Q&A into the "
+        "shared knowledge base and must not be dispatched"
+    )
     for _, args in started:
         assert args == (77, "sanitized_name.pdf", "server-extracted text"), (
-            "each follow-up must receive the committed document id, the "
+            "the follow-up must receive the committed document id, the "
             "service-sanitized filename, and the server-extracted text"
         )
 
 
-def test_failed_follow_up_starts_surface_after_both_attempts(
+class _RecordingWriteCursor:
+    def __init__(self, connection):
+        self._connection = connection
+        self._row = None
+
+    def execute(self, sql, params=None):
+        normalized = " ".join(sql.split())
+        self._connection.statements.append(normalized)
+        self._row = (501,) if normalized.startswith("INSERT INTO documents") else None
+
+    def fetchone(self):
+        return self._row
+
+    def close(self):
+        pass
+
+
+class _RecordingWriteConnection:
+    """Just enough of a registered psycopg2 connection for the ingestion service."""
+
+    def __init__(self):
+        self.statements = []
+        self.committed = False
+        self.closed = False
+
+    def cursor(self):
+        return _RecordingWriteCursor(self)
+
+    def commit(self):
+        self.committed = True
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _FixedEmbeddingProvider:
+    def __init__(self, dimension):
+        self._dimension = dimension
+
+    def embed_documents(self, texts):
+        return [[0.25] * self._dimension for _ in texts]
+
+
+def test_an_indexed_upload_adds_nothing_to_the_knowledge_base(
+    monkeypatch, main_module, upload_client
+):
+    """End to end through the REAL DocumentIngestionService and the real
+    post-commit dispatcher: the document commits and is indexed, document
+    insights are started, and no knowledge-base follow-up or statement occurs.
+    Only the embedding provider and the connection are in-memory doubles."""
+    started = []
+    monkeypatch.setattr(
+        main_module,
+        "_start_background_task",
+        lambda target, args: started.append(target),
+    )
+    connection = _RecordingWriteConnection()
+    monkeypatch.setattr(main_module, "connect_to_postgres", lambda: connection)
+    monkeypatch.setattr(
+        main_module,
+        "_EMBEDDING_PROVIDER",
+        _FixedEmbeddingProvider(main_module._EMBEDDING_PROFILE.dimension),
+    )
+
+    response = upload_client.post(
+        "/upload",
+        files=[("files", ("indexed.txt", _TXT_BYTES, "text/plain"))],
+    )
+
+    assert response.status_code == 200, response.text
+    result = response.json()["results"][0]
+    assert result["status"] == "indexed" and result["document_id"] == 501
+    assert connection.committed and connection.closed
+    assert any(sql.startswith("INSERT INTO documents") for sql in connection.statements)
+    assert started == [main_module._extract_document_insights], (
+        "a committed upload must start document insights only"
+    )
+    assert not [sql for sql in connection.statements if "knowledge_base" in sql]
+
+
+def test_a_failed_follow_up_start_surfaces_as_one_generic_error(
     monkeypatch, main_module, capsys
 ):
     """A follow-up that never started must be visible to the service.
 
     _start_background_task must let a Thread construction/start failure
-    propagate, and the dispatcher must still attempt BOTH follow-ups before
-    raising one generic error carrying none of the underlying detail. The
-    service then converts that error into its fixed post-commit warning while
-    keeping the result indexed -- proven separately by
+    propagate, and the dispatcher must attempt every follow-up before raising
+    one generic error carrying none of the underlying detail. The service then
+    converts that error into its fixed post-commit warning while keeping the
+    result indexed -- proven separately by
     test_dispatch_failure_warns_but_does_not_falsify_committed_state in
     tests/test_document_ingestion.py, which this test does not duplicate.
 
@@ -968,23 +1054,15 @@ def test_failed_follow_up_starts_surface_after_both_attempts(
         embedding_profile_id="profile-1",
     )
 
-    # 2/3: both follow-ups are attempted, and the raise comes only afterwards.
+    # 2/3: the follow-up is attempted, and the raise comes only afterwards.
     with pytest.raises(main_module._PostCommitDispatchError) as excinfo:
         main_module._dispatch_upload_followups(committed)
 
     assert [target for target, _ in attempts] == [
-        main_module.generate_kb_from_document,
         main_module._extract_document_insights,
-    ], (
-        "the second follow-up must still be attempted when the first one "
-        "cannot be started, and both must keep their committed arguments"
-    )
+    ], "the insights follow-up must be attempted with its committed arguments"
     for _, args in attempts:
         assert args == (77, "sanitized_name.pdf", "server-extracted text")
-    assert len(attempts) == 2, (
-        "the dispatcher must raise only after both attempts, not on the first "
-        f"failure; recorded {len(attempts)} attempt(s)"
-    )
 
     # 4: none of the seeded private detail escapes, by message or by chaining.
     assert seeded_private_detail not in str(excinfo.value)
@@ -1010,9 +1088,13 @@ def test_route_never_calls_the_followups_directly(main_tree):
             f"through the service's post-commit hook, but it references {name!r}"
         )
     dispatcher = _find_function(main_tree, "_dispatch_upload_followups")
-    dispatch_dump = ast.dump(dispatcher)
-    assert "generate_kb_from_document" in dispatch_dump
-    assert "_extract_document_insights" in dispatch_dump
+    # Name references only: the docstring explains why the KB follow-up is
+    # absent, so a text search of the whole function would match it.
+    referenced = {node.id for node in ast.walk(dispatcher) if isinstance(node, ast.Name)}
+    assert "generate_kb_from_document" not in referenced, (
+        "PR #54 containment: knowledge-base generation must not be dispatched"
+    )
+    assert "_extract_document_insights" in referenced
 
 
 def test_no_followup_is_started_when_the_service_reports_a_failure(

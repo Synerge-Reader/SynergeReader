@@ -12,8 +12,10 @@ separately by ``test_main_lifecycle.py``.
 
 What these tests prove: the legacy ``embed_chunks``/``chunk_text`` helpers
 and their fabricated zero-vector/``"/api/embeddings"`` fallbacks are gone
-(while the unrelated ``chunk_text`` *column* name is untouched); the eight
-call sites named in the I3 spec route through the exact
+(while the unrelated ``chunk_text`` *column* name is untouched); the call
+sites named in the I3 spec -- less ``submit_correction``, which no longer
+embeds since the PR #54 containment removed its knowledge-base write -- route
+through the exact
 ``_EMBEDDING_PROVIDER.embed_query``/``embed_documents`` receiver for their
 semantic direction (query vs. document); the composition boundary assigns
 ``_EMBEDDING_PROFILE`` exactly once from ``resolve_embedding_profile(os.environ)``
@@ -79,10 +81,11 @@ _QUERY_SIDE_FUNCTIONS = ["get_relevant_chunks", "get_relevant_knowledge_base"]
 # upload_documents is deliberately absent: since E1b it embeds nothing itself
 # and delegates to DocumentIngestionService, which receives _EMBEDDING_PROVIDER
 # from the route's composition (see the E1b section at the end of this file).
+# submit_correction is absent since the PR #54 containment: it no longer writes
+# to the knowledge base, so it embeds nothing (asserted separately below).
 _DOCUMENT_SIDE_FUNCTIONS = [
     "auto_save_to_kb",
     "_save_kb_pairs",
-    "submit_correction",
     "add_knowledge",
     "update_knowledge",
 ]
@@ -575,7 +578,7 @@ def test_init_db_called_with_expected_dimension_from_embedding_profile(main_tree
     )
 
 
-# --- 6/7: the eight call sites use the exact _EMBEDDING_PROVIDER receiver, exclusively ---
+# --- 6/7: the named call sites use the exact _EMBEDDING_PROVIDER receiver, exclusively ---
 
 
 @pytest.mark.parametrize("name", _QUERY_SIDE_FUNCTIONS)
@@ -729,7 +732,16 @@ def test_background_function_logs_embedding_provider_error(main_tree, name):
     assert logged, f"{name} must observably log an EmbeddingProviderError, not swallow it silently"
 
 
-@pytest.mark.parametrize("name", ["submit_correction", "add_knowledge", "update_knowledge"])
+def test_submit_correction_no_longer_embeds(main_tree):
+    """PR #54 containment: a correction is written to the caller's own history
+    only, never to the shared knowledge base, so it has nothing to embed. The
+    route-level behavior is proven in tests/test_kb_containment_routes.py."""
+    fn = _find_function(main_tree, "submit_correction")
+    assert not _calls_to_embedding_provider_method(fn, "embed_documents")
+    assert not _calls_to_embedding_provider_method(fn, "embed_query")
+
+
+@pytest.mark.parametrize("name", ["add_knowledge", "update_knowledge"])
 def test_sync_endpoint_embedding_failure_raises_sanitized_service_unavailable(main_tree, name):
     fn = _find_function(main_tree, name)
     handler = None
@@ -761,29 +773,6 @@ def test_sync_endpoint_embedding_failure_raises_sanitized_service_unavailable(ma
         assert isinstance(detail, ast.Constant) and isinstance(detail.value, str), (
             "the HTTPException detail must be a plain string literal, not an f-string or "
             "anything else that could interpolate the raw exception"
-        )
-
-    if name == "submit_correction":
-        # submit_correction's outer `except HTTPException: raise` (unlike
-        # add_knowledge/update_knowledge's) does not close conn on this path,
-        # so the inner EmbeddingProviderError handler itself must close it --
-        # proven here structurally, in rollback -> close -> raise line order,
-        # rather than by a substring/count check that a reorder could still
-        # satisfy.
-        rollback_calls = _attr_calls_on_name(handler, "conn", "rollback")
-        close_calls = _attr_calls_on_name(handler, "conn", "close")
-        assert rollback_calls, "submit_correction's EmbeddingProviderError handler must call conn.rollback()"
-        assert close_calls, (
-            "submit_correction's EmbeddingProviderError handler must call conn.close() -- "
-            "the outer `except HTTPException: raise` in submit_correction does not close it"
-        )
-        rollback_line = min(c.lineno for c in rollback_calls)
-        close_line = min(c.lineno for c in close_calls)
-        raise_line = min(r.lineno for r in http_raises)
-        assert rollback_line < close_line < raise_line, (
-            "submit_correction must rollback, then close, then raise, in that order, "
-            "on embedding failure -- got rollback@%d close@%d raise@%d"
-            % (rollback_line, close_line, raise_line)
         )
 
 

@@ -24,8 +24,8 @@ write is rolled back and every opened connection closed, the local-only
 generation policy survives the transport change, the claim verifier sends its
 temperature as an Ollama option and accepts only a reply that is exactly one
 status, only document_qa answers are graded while structured_json and
-model_reasoning answers skip verification under the same authorization, only
-document_qa reads the knowledge base or is auto-saved to it after a commit,
+model_reasoning answers skip verification under the same authorization, no
+answer mode reads the knowledge base or auto-saves to it (PR #54 containment),
 model_reasoning answers carry no citation links, and the
 route composes the evidence planner and citation registry instead of
 re-deciding evidence priority itself.
@@ -187,6 +187,7 @@ class _FakeCursor:
         self._row = None
 
     def execute(self, sql, params=()):
+        self._connection.statements.append(" ".join(sql.split()))
         if "INSERT INTO chat_history" in sql:
             self._connection._step("insert")
             self._row = (self._connection.entry_id,)
@@ -209,6 +210,7 @@ class _FakeConnection:
         self.entry_id = entry_id
         self.failures = failures
         self.steps = []
+        self.statements = []
 
     def _step(self, name):
         self.steps.append(name)
@@ -711,7 +713,9 @@ def test_a_persisted_answer_streams_its_entry_id_then_a_successful_done(main_tre
     assert connection.steps == ["insert", "commit", "close"], (
         "a persisted answer commits and closes, and is never rolled back"
     )
-    assert calls.auto_saved.wait(timeout=5), "the persisted answer must still reach the KB"
+    assert not calls.auto_saved.wait(timeout=0.5), (
+        "PR #54 containment: a persisted answer is never auto-saved to the shared KB"
+    )
 
 
 @pytest.mark.parametrize(
@@ -771,7 +775,7 @@ def test_a_close_failure_after_commit_keeps_the_committed_answer_successful(
     )
     assert events[-2] == {"type": "entry_id", "entry_id": 4242}
     assert events[-1] == {"type": "done", "ok": True}
-    assert calls.auto_saved.wait(timeout=5)
+    assert not calls.auto_saved.wait(timeout=0.5)
     _assert_no_database_detail(payload, capsys.readouterr().out)
 
 
@@ -995,43 +999,36 @@ def test_only_ai_analysis_is_denied_citation_links(main_tree, mode, used):
 
 # --- answer modes: the knowledge base -----------------------------------------
 #
-# Only document_qa reads or feeds the knowledge base. These pin which answers
-# touch it; they say nothing about the KB being shared across users, which is
-# unchanged here and remains a separate release blocker.
+# Since the PR #54 containment no answer mode reads the knowledge base, injects
+# it into the prompt, counts a use of it, or feeds it. The harness offers a KB
+# entry anyway, so a regression would surface its text in the prompt. The
+# per-identity route behavior (authenticated, anonymous, invalid token) is
+# proven against the real app in tests/test_kb_containment_routes.py.
 
 _KB_ENTRY = {"id": 71, "question": "Saved question?", "answer": "Saved corrected answer."}
 
 
-def test_document_qa_reads_the_knowledge_base_and_saves_its_committed_answer(main_tree):
+@pytest.mark.parametrize("mode", [mode.value for mode in AnswerMode])
+def test_no_answer_mode_reads_or_feeds_the_knowledge_base(main_tree, mode):
+    connection = _FakeConnection()
     _, events, calls = _stream_ask(
-        main_tree, _FakeConnection(), mode="document_qa", kb_entries=(_KB_ENTRY,)
-    )
-
-    assert calls.kb_queries == ["How long is the agreement term?"]
-    prompt = _generation_prompt(calls)
-    assert "<knowledge_base_corrections>" in prompt
-    assert "A: Saved corrected answer." in prompt
-    assert calls.kb_used == [[71]], "a KB entry that fired is counted as used"
-    assert events[-1] == {"type": "done", "ok": True}
-    assert calls.auto_saved.wait(timeout=5), "a committed document answer is auto-saved"
-
-
-@pytest.mark.parametrize("mode", ["structured_json", "model_reasoning"])
-def test_ungraded_modes_neither_read_nor_feed_the_knowledge_base(main_tree, mode):
-    _, events, calls = _stream_ask(
-        main_tree, _FakeConnection(), mode=mode, kb_entries=(_KB_ENTRY,)
+        main_tree, connection, mode=mode, kb_entries=(_KB_ENTRY,)
     )
 
     assert calls.kb_queries == [], f"{mode} must not retrieve knowledge-base entries"
     prompt = _generation_prompt(calls)
     assert "knowledge_base_corrections" not in prompt
-    assert "Saved corrected answer." not in prompt
-    assert calls.kb_used == []
+    assert "Saved question?" not in prompt and "Saved corrected answer." not in prompt
+    assert calls.kb_used == [], "no knowledge-base use may be counted"
     assert [event["type"] for event in events] == _SUCCESS_EVENT_TYPES, (
-        "the answer itself still commits to history"
+        "the answer still streams, commits to history, and ends successfully"
     )
+    assert connection.steps == ["insert", "commit", "close"]
     assert not calls.auto_saved.wait(timeout=0.5), (
         f"a committed {mode} answer must not be auto-saved to the knowledge base"
+    )
+    assert not [sql for sql in connection.statements if "knowledge_base" in sql], (
+        "the /ask route itself must issue no knowledge-base statement"
     )
 
 

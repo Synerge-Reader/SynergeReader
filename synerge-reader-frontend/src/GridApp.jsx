@@ -2687,14 +2687,6 @@ export default function GridApp() {
     }
   }, [messages, typing]);
 
-  // KB count on mount
-  useEffect(() => {
-    fetch(`${BACKEND}/knowledge_base`)
-      .then(r => r.json())
-      .then(data => { if (Array.isArray(data)) { setKbCount(data.length); setKbEntries(data); } })
-      .catch(() => {});
-  }, []);
-
   // Restore session from a stored auth token on mount
   useEffect(() => {
     if (!authToken) return;
@@ -2731,7 +2723,7 @@ export default function GridApp() {
     localStorage.removeItem("authToken");
     setAuthToken(null);
     setCurrentUser(null);
-    if (mainView === "admin") setMainView("chat");
+    if (mainView === "admin" || mainView === "kb") setMainView("chat");
   }, [mainView]);
 
   const fetchMeStats = useCallback(() => {
@@ -2926,11 +2918,14 @@ export default function GridApp() {
     }
   }, [authToken]);
 
-  // Fetch KB entries when tab opened
+  // Fetch KB entries when tab opened. The knowledge base is admin-only while
+  // it is shared across users (it holds answers derived from private
+  // documents), so only an admin session asks for it.
   const fetchKbEntries = useCallback(() => {
+    if (!authToken || !currentUser?.is_admin) return;
     setKbLoading(true);
-    fetch(`${BACKEND}/knowledge_base`)
-      .then(r => r.json())
+    fetch(`${BACKEND}/knowledge_base`, { headers: { Authorization: `Bearer ${authToken}` } })
+      .then(r => (r.ok ? r.json() : null))
       .then(data => {
         if (Array.isArray(data)) {
           setKbEntries(data);
@@ -2939,7 +2934,18 @@ export default function GridApp() {
       })
       .catch(() => {})
       .finally(() => setKbLoading(false));
-  }, []);
+  }, [authToken, currentUser]);
+
+  // An admin session loads the KB once it is known to be an admin; any other
+  // session holds no entries and a zero count.
+  useEffect(() => {
+    if (currentUser?.is_admin) {
+      fetchKbEntries();
+    } else {
+      setKbEntries([]);
+      setKbCount(0);
+    }
+  }, [currentUser, fetchKbEntries]);
 
   // Delete KB entry
   const deleteKbEntry = useCallback((id) => {
@@ -3121,17 +3127,22 @@ export default function GridApp() {
 
   // Thumbs up/down on an assistant reply — persists to chat_history.rating via the
   // existing (previously unwired) /put_ratings endpoint, feeding the admin dashboard's
-  // average-rating stat.
+  // average-rating stat. The backend only lets a signed-in user rate their own
+  // answers, so an unsaved rating is rolled back rather than shown as saved.
   const submitRating = useCallback((msgId, entryId, rating) => {
+    if (!authToken) return;
     setMessages(prev => prev.map(m => m.id === msgId ? { ...m, userRating: rating } : m));
     fetch(`${BACKEND}/put_ratings`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
       body: JSON.stringify({ id: entryId, rating, comment: "" }),
-    }).catch(() => {
-      setMessages(prev => prev.map(m => m.id === msgId ? { ...m, userRating: null } : m));
-    });
-  }, []);
+    })
+      .then(res => { if (!res.ok) throw new Error(`${res.status}`); })
+      .catch(() => {
+        setMessages(prev => prev.map(m => m.id === msgId ? { ...m, userRating: null } : m));
+        setNotification("Could not save rating");
+      });
+  }, [authToken]);
 
   // Same /put_ratings call, but for a chat row shown on "My Dashboard" (not
   // part of the live chat thread) — updates the local meStats snapshot
@@ -3144,10 +3155,16 @@ export default function GridApp() {
     } : prev);
     fetch(`${BACKEND}/put_ratings`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken || ""}` },
       body: JSON.stringify({ id: chatId, rating, comment: "" }),
-    }).catch(() => setNotification("Could not save rating"));
-  }, []);
+    })
+      .then(res => { if (!res.ok) throw new Error(`${res.status}`); })
+      .catch(() => {
+        setNotification("Could not save rating");
+        // Undo the optimistic update by reloading the saved snapshot.
+        fetchMeStats();
+      });
+  }, [authToken, fetchMeStats]);
 
   // ── upload ────────────────────────────────────────────────────────────────
   const processFiles = useCallback(async (files) => {
@@ -3580,11 +3597,6 @@ export default function GridApp() {
           }
         : msg));
       if (!failed && citations.length) handleCitation(citations[0]);
-      // Only a committed document_qa answer is auto-saved to the knowledge
-      // base, so only that answer can grow the count; AI analysis never does.
-      // "finished" means a done event arrived: a stream cut off before it
-      // cannot show that anything was committed, so it counts nothing.
-      if (finished && !failed && answerMode === "document_qa") setKbCount(k => k + 1);
 
     } catch (err) {
       if (err.name !== "AbortError") {
@@ -4130,7 +4142,9 @@ export default function GridApp() {
                 : []),
               { id: "chat",       label: "Chat",                          icon: IconFile,    onClick: () => setMainView("chat") },
               { id: "precedents", label: "Case Library",                  icon: IconBook,    onClick: () => setMainView("precedents") },
-              { id: "kb",         label: `Knowledge Base · ${kbCount}`,   icon: IconDatabase, onClick: () => { setMainView("kb"); fetchKbEntries(); } },
+              ...(currentUser?.is_admin
+                ? [{ id: "kb", label: `Knowledge Base · ${kbCount}`, icon: IconDatabase, onClick: () => { setMainView("kb"); fetchKbEntries(); } }]
+                : []),
             ].map(item => {
               const active = mainView === item.id;
               const Icon = item.icon;
@@ -4774,7 +4788,7 @@ export default function GridApp() {
                             {!msg.unverified && (
                               <ClaimSupportSummary claims={msg.claims} citations={msg.citations} onOpen={handleCitation} />
                             )}
-                            {!msg.streaming && msg.entryId && (
+                            {!msg.streaming && msg.entryId && authToken && (
                               <div style={{ display: "flex", alignItems: "center", gap: "4px", marginTop: "8px" }}>
                                 <button
                                   onClick={() => submitRating(msg.id, msg.entryId, 5)}
@@ -4965,8 +4979,13 @@ export default function GridApp() {
           </div>
         )}
 
-        {/* ── KNOWLEDGE BASE VIEW ── */}
-        {mainView === "kb" && (() => {
+        {/* ── KNOWLEDGE BASE VIEW ── admin-only while the KB is shared across users */}
+        {mainView === "kb" && !currentUser?.is_admin && (
+          <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "#9ca3af", fontSize: "13px" }}>
+            Admin access required.
+          </div>
+        )}
+        {mainView === "kb" && currentUser?.is_admin && (() => {
           const categoryCounts = {
             all: kbEntries.length,
             document: kbEntries.filter(e => (e.source_type || "document") === "document").length,
@@ -5486,11 +5505,10 @@ export default function GridApp() {
 
                 {/* quick actions — this is what differentiates a personal dashboard
                     from the admin one: it's a launchpad, not a control panel */}
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "12px", marginBottom: "20px" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px", marginBottom: "20px" }}>
                   {[
                     { label: "Upload a Document", desc: "Add a new file to chat with.", icon: IconUpload, gradient: "linear-gradient(135deg,#2563eb,#1d4ed8)", onClick: () => fileInputRef.current?.click() },
                     { label: "Ask a Question", desc: "Jump back into Research & Q&A.", icon: IconFile, gradient: "linear-gradient(135deg,#059669,#047857)", onClick: () => { setActiveTask("research"); setMainView("chat"); } },
-                    { label: "Browse Knowledge Base", desc: `${meStats?.kb_total ?? kbCount} verified answers firm-wide.`, icon: IconDatabase, gradient: "linear-gradient(135deg,#7c3aed,#6d28d9)", onClick: () => { setMainView("kb"); fetchKbEntries(); } },
                   ].map(a => (
                     <button key={a.label} onClick={a.onClick} style={{
                       textAlign: "left", border: "none", borderRadius: "16px", padding: "16px",

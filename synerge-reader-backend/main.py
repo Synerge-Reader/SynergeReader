@@ -796,25 +796,32 @@ def _dispatch_upload_followups(committed: CommittedDocument) -> None:
 
     DocumentIngestionService calls this only after the document's transaction
     has committed and its connection has been closed, and treats any failure
-    here as a warning on an already-indexed result -- so neither follow-up can
-    turn a committed document into a reported ingestion failure. Both existing
-    follow-ups are preserved and receive the committed document id, the
-    service-sanitized filename, and the server-extracted text.
+    here as a warning on an already-indexed result -- so a follow-up can never
+    turn a committed document into a reported ingestion failure. Each
+    follow-up receives the committed document id, the service-sanitized
+    filename, and the server-extracted text.
 
-    Both follow-ups are attempted even if the first one cannot be started, and
+    Security containment (PR #54): generate_kb_from_document is deliberately
+    NOT dispatched. It writes Q&A pairs derived from the uploaded text into
+    the knowledge base, which has no owner column and is shared by every
+    user, so a private document's content would reach other users. It stays
+    disabled until the knowledge base is user-owned. Document insights are a
+    per-document row and are unaffected.
+
+    Every follow-up is attempted even if an earlier one cannot be started, and
     only the FACT of a failed start is recorded -- never the exception, its
-    text, or anything about the document. If either start failed, one generic
-    _PostCommitDispatchError is raised after both attempts.
+    text, or anything about the document. If any start failed, one generic
+    _PostCommitDispatchError is raised after all attempts.
 
     Scope of what this can detect: only a failure to START a thread. Once a
-    follow-up thread is running, it owns its own errors (both targets already
-    swallow and log their own failures), and nothing that happens inside it
+    follow-up thread is running, it owns its own errors (its target already
+    swallows and logs its own failures), and nothing that happens inside it
     afterwards can be observed synchronously here or turned into a warning on
     the ingestion result.
     """
     payload = (committed.document_id, committed.filename, committed.text)
     failed_starts = 0
-    for follow_up in (generate_kb_from_document, _extract_document_insights):
+    for follow_up in (_extract_document_insights,):
         try:
             _start_background_task(follow_up, payload)
         except Exception:
@@ -1318,30 +1325,17 @@ async def ask_question(request: AskRequest):
         yield '{"type": "delta", "text": ""}\n'
 
         stream_error = None
-        kb_ids_fired = []
         try:
             planning, registry = build_evidence()
 
-            # ── Knowledge Base injection ──────────────────────────────────
-            # Only document_qa reads the knowledge base. Tool JSON and AI
-            # analysis are neither steered by saved answers nor count as a
-            # use of them. This narrows which answers read the KB; it does
-            # not change that the KB itself is shared across users.
-            kb_block = ""
+            # Security containment (PR #54): no answer mode reads the
+            # knowledge base or injects it into the prompt, for any caller.
+            # Its rows have no owner column and include answers and Q&A
+            # derived from users' private documents, so neither a valid login
+            # nor admin status gives a reliable boundary for serving them.
+            # The prompt is built from the caller's authorized evidence only.
             if answer_mode is AnswerMode.DOCUMENT_QA:
-                kb_entries = get_relevant_knowledge_base(request.question, limit=3)
-                kb_ids_fired = [e["id"] for e in kb_entries]
-                if kb_entries:
-                    kb_block = "<knowledge_base_corrections>\n"
-                    for e in kb_entries:
-                        kb_block += f"Q: {e['question']}\nA: {e['answer']}\n---\n"
-                    kb_block += "</knowledge_base_corrections>"
-            # ─────────────────────────────────────────────────────────────
-
-            if answer_mode is AnswerMode.DOCUMENT_QA:
-                prompt = build_generation_prompt(
-                    request.question, registry, extra_context=kb_block
-                )
+                prompt = build_generation_prompt(request.question, registry)
             else:
                 prompt = build_mode_prompt(answer_mode, request.question, registry)
 
@@ -1408,10 +1402,6 @@ async def ask_question(request: AskRequest):
                 yield '{"type": "error", "code": "generation_http_error", "message": "The local model request failed. Check that the requested model is installed in Ollama."}\n'
             else:
                 yield '{"type": "error", "code": "generation_unreachable", "message": "The local LLM server is not reachable. Start Ollama or update OLLAMA_BASE_URL / OLLAMA_PORT in .env."}\n'
-
-        # Increment KB usage counts for entries that fired this query
-        if kb_ids_fired:
-            increment_kb_usage(kb_ids_fired)
 
         if stream_error or not answer_parts:
             # An interrupted or empty generation must never terminate as a
@@ -1486,19 +1476,11 @@ async def ask_question(request: AskRequest):
 
         yield entry_id_event(entry_id)
 
-        # Auto-save this Q&A to the Knowledge Base in the background. Only a
-        # committed document_qa answer qualifies: tool JSON and ungraded AI
-        # analysis are not answers that belong in the KB.
-        if answer_mode is AnswerMode.DOCUMENT_QA:
-            try:
-                from threading import Thread
-                Thread(
-                    target=auto_save_to_kb,
-                    args=(request.question, full_answer, "auto-query"),
-                    daemon=True
-                ).start()
-            except Exception:
-                pass
+        # Security containment (PR #54): the committed answer is NOT
+        # auto-saved to the knowledge base. That table has no owner column and
+        # is shared by every user, so an answer built from one user's private
+        # documents would be served to others. auto_save_to_kb stays disabled
+        # until the knowledge base is user-owned.
 
         yield done_event(ok=True)
 
@@ -1757,16 +1739,37 @@ async def delete_my_document(document_id: int, authorization: Optional[str] = He
 
 
 @app.put("/put_ratings")
-async def put_ratings(request: RatingRequest):
+async def put_ratings(request: RatingRequest, authorization: Optional[str] = Header(None)):
+    """Rate one of the caller's own answers.
+
+    The caller comes from the Authorization header, and the UPDATE is scoped
+    ``WHERE id = ... AND user_id = ...``, so a missing or invalid token is a
+    401 and another user's (or an ownerless) history row is indistinguishable
+    from a missing one (404) -- nothing is written in any of those cases.
+    """
+    token = _bearer_token(authorization)
+    conn = _open_db()
     try:
-        conn = connect_to_postgres()
         c = conn.cursor()
-        c.execute("UPDATE chat_history SET rating = %s, comment = %s WHERE id = %s", (request.rating, request.comment, request.id))
+        user_id = _user_id_for_token(c, token)
+        c.execute(
+            "UPDATE chat_history SET rating = %s, comment = %s WHERE id = %s AND user_id = %s RETURNING id",
+            (request.rating, request.comment, request.id, user_id),
+        )
+        if not c.fetchone():
+            conn.rollback()
+            raise HTTPException(404, "Chat ID not found")
         conn.commit()
-        conn.close()
         return {"message": "Rating updated", "id": request.id}
+    except HTTPException:
+        conn.rollback()
+        raise
     except Exception as e:
-        raise HTTPException(500, str(e))
+        conn.rollback()
+        print(f"[put_ratings] failed: {type(e).__name__}")
+        raise HTTPException(500, "Could not save the rating")
+    finally:
+        conn.close()
 
 
 @app.post("/register")
@@ -2093,63 +2096,79 @@ async def google_login(request: GoogleLoginRequest):
         raise HTTPException(500, f"Google login error: {str(e)}")
 
 @app.post("/submit_correction")
-async def submit_correction(request: CorrectionRequest):
+async def submit_correction(request: CorrectionRequest, authorization: Optional[str] = Header(None)):
+    """Correct one of the caller's own answers, in the caller's own history.
+
+    The caller comes from the Authorization header, and both the SELECT and
+    the UPDATE are scoped ``WHERE id = ... AND user_id = ...``, so a missing
+    or invalid token is a 401 and another user's (or an ownerless) history row
+    is indistinguishable from a missing one (404) -- nothing is written in any
+    of those cases.
+
+    Security containment (PR #54): the correction is no longer copied into
+    the knowledge base, for any caller. That table has no owner column and is
+    shared by every user, so the question and original answer -- built from
+    the caller's private documents -- would be served to others. Admins curate
+    the knowledge base through its explicit admin endpoints instead.
+    """
+    token = _bearer_token(authorization)
+    conn = _open_db()
     try:
-        conn = connect_to_postgres()
         c = conn.cursor()
-
-        # Get original question and answer
-        c.execute("SELECT question, answer FROM chat_history WHERE id = %s", (request.chat_id,))
-        row = c.fetchone()
-        if not row:
-            conn.close()
-            raise HTTPException(404, "Chat ID not found")
-
-        question, original_answer = row
-
-        # Update chat history
-        c.execute("UPDATE chat_history SET answer = %s, comment = %s WHERE id = %s", (request.corrected_answer, request.comment, request.chat_id))
-
-        # Insert into knowledge base
-        # Embed the question for semantic matching. A failure here rolls
-        # back the chat_history update above too, rather than persisting a
-        # NULL-embedding KB row that can never be found by semantic search.
-        try:
-            q_vec = _EMBEDDING_PROVIDER.embed_documents([question])[0]
-        except EmbeddingProviderError as exc:
-            conn.rollback()
-            conn.close()
-            print(f"[Correction] Embedding failed for chat_id={request.chat_id}: {type(exc).__name__}")
-            raise HTTPException(503, "Could not save correction: embedding service is temporarily unavailable")
-
+        user_id = _user_id_for_token(c, token)
         c.execute(
-            "INSERT INTO knowledge_base (question, original_answer, corrected_answer, created_at, chat_history_id, corrected_by, usage_count, embedding) VALUES (%s, %s, %s, %s, %s, %s, 0, %s)",
-            (question, original_answer, request.corrected_answer, datetime.datetime.now().isoformat(), request.chat_id, getattr(request, 'corrected_by', 'User'), q_vec)
+            "SELECT id FROM chat_history WHERE id = %s AND user_id = %s",
+            (request.chat_id, user_id),
         )
-
+        if not c.fetchone():
+            conn.rollback()
+            raise HTTPException(404, "Chat ID not found")
+        c.execute(
+            "UPDATE chat_history SET answer = %s, comment = %s WHERE id = %s AND user_id = %s RETURNING id",
+            (request.corrected_answer, request.comment, request.chat_id, user_id),
+        )
+        if not c.fetchone():
+            conn.rollback()
+            raise HTTPException(404, "Chat ID not found")
         conn.commit()
-        conn.close()
         return {
-            "message": "Correction submitted and saved to KB",
+            "message": "Correction saved to your history",
             "chat_id": request.chat_id,
         }
     except HTTPException:
+        conn.rollback()
         raise
     except Exception as e:
-        raise HTTPException(500, str(e))
+        conn.rollback()
+        print(f"[submit_correction] failed: {type(e).__name__}")
+        raise HTTPException(500, "Could not save the correction")
+    finally:
+        conn.close()
 
 
 @app.get("/knowledge_base")
-async def knowledge_base():
+async def knowledge_base(authorization: Optional[str] = Header(None)):
+    """Every knowledge-base entry, for the admin knowledge-base page.
+
+    Security containment (PR #54): admin-only, like the knowledge base's write
+    endpoints. The table has no owner column and holds answers and Q&A derived
+    from users' private documents, so it must not be readable by every signed-
+    in user. The token comes from an ``Authorization: Bearer <token>`` header,
+    not a ``?token=`` query parameter that would land in browser history and
+    access logs. The admin check runs before any knowledge-base query: a
+    missing or malformed header is a 401 and an invalid or non-admin token a
+    403, with no row read.
+    """
+    token = _bearer_token(authorization)
+    conn = _open_db()
     try:
-        conn = connect_to_postgres()
         c = conn.cursor()
+        _require_admin(c, token)
         c.execute("""SELECT id, question, original_answer, corrected_answer, created_at,
                             chat_history_id, corrected_by, COALESCE(usage_count,0), context_text,
                             COALESCE(source_type, 'document')
                      FROM knowledge_base ORDER BY COALESCE(usage_count,0) DESC, id DESC""")
         rows = c.fetchall()
-        conn.close()
         return [
             {
                 "id": r[0],
@@ -2165,8 +2184,13 @@ async def knowledge_base():
             }
             for r in rows
         ]
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(500, str(e))
+        print(f"[knowledge_base] failed: {type(e).__name__}")
+        raise HTTPException(500, "Could not load the knowledge base")
+    finally:
+        conn.close()
 
 
 @app.post("/knowledge_base")
