@@ -5,6 +5,10 @@ import { GoogleLogin } from "@react-oauth/google";
 // Google Sign-In is only shown when a real OAuth client ID is configured —
 // see the note where this is used below for why.
 const GOOGLE_CLIENT_ID = process.env.REACT_APP_GOOGLE_CLIENT_ID || "";
+// Google Sign-In is switched off for this release: the backend refuses it
+// until accounts are bound to a verified Google identity, so the button is
+// hidden rather than offered and then rejected. Username/password is unchanged.
+const GOOGLE_SIGN_IN_ENABLED = false;
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "http://localhost:5000";
 
 function LogoMark() {
@@ -299,7 +303,7 @@ export default function UserAuth({ setOpenAuth, setAuthToken, setNotification, s
                 error, so showing the button at all would just be broken. Once
                 REACT_APP_GOOGLE_CLIENT_ID is set (see backend .env for the
                 matching GOOGLE_CLIENT_ID), this reappears automatically. */}
-            {GOOGLE_CLIENT_ID && (
+            {GOOGLE_SIGN_IN_ENABLED && GOOGLE_CLIENT_ID && (
               <>
                 <div className="auth-divider"><span>Or continue with</span></div>
                 <div className="auth-google">

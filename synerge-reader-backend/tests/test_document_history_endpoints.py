@@ -28,6 +28,9 @@ _WANTED = {
     "get_document_content",
     "delete_my_document",
 }
+# Module-level lookups the helpers above execute (the active-account token
+# checks); lifted alongside the functions so they run exactly as in main.py.
+_WANTED_CONSTANTS = {"_ACTIVE_USER_ID_BY_TOKEN", "_ACTIVE_ADMIN_FLAG_BY_TOKEN"}
 
 
 class FakeDB:
@@ -117,10 +120,16 @@ def env():
     tree = ast.parse(_MAIN_PATH.read_text(encoding="utf-8"), filename=str(_MAIN_PATH))
     funcs = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in _WANTED]
     assert {f.name for f in funcs} == _WANTED, "expected every endpoint/helper under test to exist in main.py"
+    constants = [
+        n for n in tree.body
+        if isinstance(n, ast.Assign) and len(n.targets) == 1
+        and isinstance(n.targets[0], ast.Name) and n.targets[0].id in _WANTED_CONSTANTS
+    ]
+    assert {c.targets[0].id for c in constants} == _WANTED_CONSTANTS
     # Decorators are stripped: the routes are exercised as plain functions.
     for f in funcs:
         f.decorator_list = []
-    module = ast.Module(body=funcs, type_ignores=[])
+    module = ast.Module(body=constants + funcs, type_ignores=[])
     ast.fix_missing_locations(module)
     db = FakeDB()
     ns = {

@@ -14,11 +14,12 @@ modes; and main's owner-scoped helpers and E2's authorized evidence scope
 identify the same user from the same token, while an invalid token fails
 closed on both.
 
-What these do NOT prove: production security. In particular, E2's no-token
-/ask scope still reads every ownerless document, the knowledge base is still
-global, and /history still maps an invalid token to ownerless history. Those
-are recorded here as current behaviour, not endorsed, and remain release
-blockers on a separate track.
+A missing token now fails closed on both paths too: there is no anonymous
+/ask scope, so ownerless (legacy) documents are served to no one. Route-level
+identity behaviour for /ask, /history, /documents, and /upload is proven in
+tests/test_kb_containment_routes.py and tests/test_main_upload_route_adapter.py.
+
+What these do NOT prove: production security.
 """
 
 import importlib
@@ -162,11 +163,11 @@ class _FakeCursor:
 
     def execute(self, sql, params=()):
         norm = " ".join(sql.split())
-        if norm == "SELECT id FROM users WHERE token = %s":
+        # Both identity paths must use the active-account lookup, so a token
+        # issued before a suspension stops identifying anyone.
+        if norm == "SELECT id FROM users WHERE token = %s AND COALESCE(is_active, 1) <> 0":
             owner = _TOKENS.get(params[0])
             self._rows = [(owner,)] if owner else []
-        elif "FROM documents" in norm and "WHERE user_id IS NULL" in norm:
-            self._rows = [row[:4] for row in _DOCUMENTS if row[4] is None]
         elif "FROM documents" in norm and "WHERE user_id = %s" in norm:
             self._rows = [row[:4] for row in _DOCUMENTS if row[4] == params[0]]
         else:
@@ -263,24 +264,19 @@ def test_an_invalid_token_fails_closed_on_both_paths(main_module, monkeypatch, t
     )
 
 
-def test_a_missing_token_is_refused_by_owner_routes_but_ask_keeps_its_anonymous_scope(
-    main_module, monkeypatch
-):
-    """Records current behaviour; it is not a security endorsement.
-
-    Owner-scoped document routes refuse a request with no token. /ask keeps
-    E2's anonymous scope -- every ownerless document -- which this integration
-    deliberately does not change. Whether anonymous /ask should exist at all is
-    an open release decision on the security track.
-    """
-    monkeypatch.setattr(main_module, "connect_to_postgres", lambda: _FakeConnection())
+def test_a_missing_token_fails_closed_on_both_paths(main_module, monkeypatch):
+    """Owner-scoped document routes refuse a request with no token, and the
+    /ask evidence scope no longer has an anonymous branch: a missing token is
+    unresolved, so the ownerless document (id 3) reaches no one."""
+    opened = []
+    monkeypatch.setattr(
+        main_module, "connect_to_postgres", lambda: opened.append(1) or _FakeConnection()
+    )
 
     with pytest.raises(HTTPException) as denied:
         main_module._user_id_for_token(_FakeCursor(), None)
     assert denied.value.status_code == 401
 
     scope = main_module._resolve_authorized_scope(None)
-    assert scope.established and scope.anonymous and scope.user_id is None
-    assert [document.document_id for document in scope.documents] == [3], (
-        "no owned document is ever part of the anonymous scope"
-    )
+    assert not scope.established and scope.documents == ()
+    assert opened == [], "a missing token must not even open a scope connection"

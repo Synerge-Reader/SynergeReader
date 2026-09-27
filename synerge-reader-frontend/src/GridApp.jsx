@@ -10,6 +10,9 @@ GlobalWorkerOptions.workerSrc = new URL(
 ).toString();
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || "http://localhost:5000";
+// Uploading and asking both create records that belong to a signed-in user;
+// the backend refuses them without a valid session.
+const SIGN_IN_TO_USE_DOCUMENTS = "Sign in to upload documents and ask questions about them.";
 
 // UI font stack — used for chrome/chat. Document content panes keep their own serif styling.
 const UI_FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
@@ -3168,6 +3171,11 @@ export default function GridApp() {
 
   // ── upload ────────────────────────────────────────────────────────────────
   const processFiles = useCallback(async (files) => {
+    if (!authToken) {
+      setUploadErr(SIGN_IN_TO_USE_DOCUMENTS);
+      setShowAuthModal(true);
+      return;
+    }
     const allowed = [
       "application/pdf",
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -3442,6 +3450,11 @@ export default function GridApp() {
   // so an explicit override sidesteps that instead of relying on state timing.
   const sendMessage = useCallback(async (text, taskOverride, contextOverride, flags) => {
     if (!text.trim() || typing) return;
+    if (!authToken) {
+      setNotification(SIGN_IN_TO_USE_DOCUMENTS);
+      setShowAuthModal(true);
+      return;
+    }
 
     if (abortRef.current) abortRef.current.abort();
     const ctrl = new AbortController();
@@ -3507,6 +3520,7 @@ export default function GridApp() {
           auth_token:           authToken || null,
         }),
       });
+      if (res.status === 401) throw Object.assign(new Error(SIGN_IN_TO_USE_DOCUMENTS), { name: "AuthError" });
       if (!res.ok) throw new Error(`${res.status}`);
 
       const reader   = res.body.getReader();
@@ -3600,9 +3614,12 @@ export default function GridApp() {
 
     } catch (err) {
       if (err.name !== "AbortError") {
+        const failureText = err.name === "AuthError"
+          ? err.message
+          : `Could not reach backend (${err.message}). Is the server running at ${BACKEND}?`;
         setMessages(prev => prev.map(msg =>
           msg.id === msgId
-            ? { ...msg, text: `Could not reach backend (${err.message}). Is the server running at ${BACKEND}?`, streaming: false }
+            ? { ...msg, text: failureText, streaming: false }
             : msg
         ));
       }
@@ -3649,6 +3666,7 @@ export default function GridApp() {
   // actually supplied (a complete document, retrieved passages, or nothing),
   // so a tool can describe its own coverage truthfully.
   const runToolQuery = useCallback(async (promptText, modelOverride, onEvidence) => {
+    if (!authToken) throw new Error(SIGN_IN_TO_USE_DOCUMENTS);
     // Same scope rule as chat: backend document ids, never a concatenated
     // client-side document dump posing as a selection.
     const scopeDocumentIds = docs.map(d => d.id).filter(id => Number.isInteger(id));
@@ -3669,6 +3687,7 @@ export default function GridApp() {
         auth_token:           authToken || null,
       }),
     });
+    if (res.status === 401) throw new Error(SIGN_IN_TO_USE_DOCUMENTS);
     if (!res.ok) throw new Error(`Server error (${res.status})`);
     const reader  = res.body.getReader();
     const dec     = new TextDecoder();
@@ -3704,6 +3723,7 @@ export default function GridApp() {
   // explain the substance of the difference — legal effect, who it favors,
   // what risk it shifts — not just restate which words moved.
   const explainDiffPair = useCallback(async (baseline, candidate) => {
+    if (!authToken) throw new Error(SIGN_IN_TO_USE_DOCUMENTS);
     const res = await fetch(`${BACKEND}/ask`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -3730,6 +3750,7 @@ export default function GridApp() {
         auth_token: authToken || null,
       }),
     });
+    if (res.status === 401) throw new Error(SIGN_IN_TO_USE_DOCUMENTS);
     if (!res.ok) throw new Error(`Server error (${res.status})`);
     // Same NDJSON transport as chat: answer text arrives only in delta events,
     // so a control frame can never be shown as part of the explanation.
@@ -6743,7 +6764,7 @@ export default function GridApp() {
           title={confirmAction.type === "delete" ? "Delete this account?" : (confirmAction.user.is_active ? "Suspend this account?" : "Reactivate this account?")}
           message={
             confirmAction.type === "delete"
-              ? `${confirmAction.user.username} will be permanently removed. Their past chats and documents are kept for the record but shown as unowned.`
+              ? `${confirmAction.user.username} will be permanently removed. An account that still owns documents or chats can't be deleted — suspend it instead.`
               : confirmAction.user.is_active
                 ? `${confirmAction.user.username} will not be able to sign in until reactivated.`
                 : `${confirmAction.user.username} will be able to sign in again immediately.`

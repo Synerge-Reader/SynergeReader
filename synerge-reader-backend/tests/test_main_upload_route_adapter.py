@@ -156,10 +156,32 @@ def _install_service_double(monkeypatch, main_module, batch_for_uploads=_all_ind
     return record
 
 
+# Every upload needs an identified caller. The transport tests below are not
+# about identity, so upload_client runs them as this already-resolved caller;
+# the identity tests use identity_upload_client and the real _resolve_caller_id.
+_TRANSPORT_CALLER_ID = "uploader-under-test"
+
+
 @pytest.fixture
 def upload_client(monkeypatch, main_module):
     # MANDATORY PATCHING RULE: replace the initializer BEFORE the TestClient
     # context is entered, so startup never reaches psycopg2.connect.
+    monkeypatch.setattr(main_module, "_initialize_application", lambda: None)
+    monkeypatch.setattr(
+        main_module, "connect_to_postgres", _forbidden_connection_factory
+    )
+    monkeypatch.setattr(main_module, "_resolve_caller_id", lambda token: _TRANSPORT_CALLER_ID)
+    client = TestClient(main_module.app)
+    try:
+        with client:
+            yield client
+    finally:
+        client.close()
+
+
+@pytest.fixture
+def identity_upload_client(monkeypatch, main_module):
+    """The real _resolve_caller_id, for the tests that exercise identity."""
     monkeypatch.setattr(main_module, "_initialize_application", lambda: None)
     monkeypatch.setattr(
         main_module, "connect_to_postgres", _forbidden_connection_factory
@@ -185,7 +207,7 @@ def test_no_files_supplied_is_http_400(monkeypatch, main_module, upload_client):
     record = _install_service_double(monkeypatch, main_module)
     touched = []
     monkeypatch.setattr(
-        main_module, "_resolve_uploader_id", lambda token: touched.append("lookup")
+        main_module, "_resolve_caller_id", lambda token: touched.append("lookup")
     )
     monkeypatch.setattr(
         main_module, "_build_ingestion_service", lambda: touched.append("service")
@@ -375,12 +397,16 @@ def test_absent_metadata_stays_none_rather_than_empty_strings(
     assert record["uploads"][0].metadata == DocumentMetadata()
 
 
-# --- 7: uploader identity -- resolved, anonymous, or refused before ingestion
+# --- 7: uploader identity -- resolved, or refused before ingestion ----------
 
 
 # Planted in every simulated lookup failure: none of it may reach a response
 # body or the server log, which carries the exception class name only.
 _SEEDED_DB_DETAIL = "password=hunter2 host=db.internal SELECT id FROM users"
+
+# The uploader lookup must only match an active account, so a token issued
+# before a suspension stops working (route-level proof: test_kb_containment_routes).
+_ACTIVE_LOOKUP = "SELECT id FROM users WHERE token = %s AND COALESCE(is_active, 1) <> 0"
 
 
 class _LookupFailure(Exception):
@@ -430,14 +456,14 @@ class _FakeConnection:
 
 
 def test_resolved_uploader_id_reaches_upload_document(
-    monkeypatch, main_module, upload_client
+    monkeypatch, main_module, identity_upload_client
 ):
     record = _install_service_double(monkeypatch, main_module)
     log = []
     connection = _FakeConnection((4242,), log)
     monkeypatch.setattr(main_module, "connect_to_postgres", lambda: connection)
 
-    response = upload_client.post(
+    response = identity_upload_client.post(
         "/upload",
         files=[("files", ("owned.txt", _TXT_BYTES, "text/plain"))],
         data={"auth_token": "a-valid-token"},
@@ -445,18 +471,18 @@ def test_resolved_uploader_id_reaches_upload_document(
 
     assert response.status_code == 200, response.text
     assert record["uploads"][0].uploader_id == 4242
-    assert ("execute", "SELECT id FROM users WHERE token = %s", ("a-valid-token",)) in log
+    assert ("execute", _ACTIVE_LOOKUP, ("a-valid-token",)) in log
 
 
 def test_uploader_lookup_always_closes_its_cursor_and_connection(
-    monkeypatch, main_module, upload_client
+    monkeypatch, main_module, identity_upload_client
 ):
     _install_service_double(monkeypatch, main_module)
     log = []
     connection = _FakeConnection((7,), log)
     monkeypatch.setattr(main_module, "connect_to_postgres", lambda: connection)
 
-    response = upload_client.post(
+    response = identity_upload_client.post(
         "/upload",
         files=[("files", ("owned.txt", _TXT_BYTES, "text/plain"))],
         data={"auth_token": "a-valid-token"},
@@ -480,7 +506,7 @@ def _record_followup_starts(monkeypatch, main_module):
 
 
 def test_unknown_token_is_refused_with_401_before_ingestion(
-    monkeypatch, main_module, upload_client, capsys
+    monkeypatch, main_module, identity_upload_client, capsys
 ):
     """A supplied token that matches no user is a failed identity claim, not an
     anonymous upload. Refusing it before the service is built is what keeps it
@@ -492,7 +518,7 @@ def test_unknown_token_is_refused_with_401_before_ingestion(
     monkeypatch.setattr(main_module, "connect_to_postgres", lambda: connection)
     capsys.readouterr()
 
-    response = upload_client.post(
+    response = identity_upload_client.post(
         "/upload",
         files=[("files", ("anon.txt", _TXT_BYTES, "text/plain"))],
         data={"auth_token": "not-a-real-token"},
@@ -505,7 +531,7 @@ def test_unknown_token_is_refused_with_401_before_ingestion(
         "built, so no ownerless document can be written"
     )
     assert started == [], "no upload follow-up may start for a refused upload"
-    assert ("execute", "SELECT id FROM users WHERE token = %s", ("not-a-real-token",)) in log
+    assert ("execute", _ACTIVE_LOOKUP, ("not-a-real-token",)) in log
     assert connection.closed
     assert connection.cursors and all(cursor.closed for cursor in connection.cursors)
     assert "not-a-real-token" not in response.text
@@ -517,7 +543,7 @@ _LOOKUP_FAILURES = ("connect_raises", "connect_returns_none", "cursor", "execute
 
 @pytest.mark.parametrize("failure", _LOOKUP_FAILURES)
 def test_lookup_failure_is_a_generic_503_and_never_reaches_ingestion(
-    monkeypatch, main_module, upload_client, capsys, failure
+    monkeypatch, main_module, identity_upload_client, capsys, failure
 ):
     """A lookup that cannot complete must not guess an owner.
 
@@ -542,7 +568,7 @@ def test_lookup_failure_is_a_generic_503_and_never_reaches_ingestion(
     monkeypatch.setattr(main_module, "connect_to_postgres", connect)
     capsys.readouterr()
 
-    response = upload_client.post(
+    response = identity_upload_client.post(
         "/upload",
         files=[("files", ("owned.txt", _TXT_BYTES, "text/plain"))],
         data={"auth_token": "a-valid-token"},
@@ -566,18 +592,18 @@ def test_lookup_failure_is_a_generic_503_and_never_reaches_ingestion(
 
 
 @pytest.mark.parametrize(
-    ("row", "fail_on", "status"),
-    [(None, None, 401), ((4242,), "execute", 503)],
-    ids=["unknown-token", "query-failure"],
+    ("token", "row", "fail_on", "status"),
+    [(None, None, None, 401), ("a-token", None, None, 401), ("a-token", (4242,), "execute", 503)],
+    ids=["missing-token", "unknown-token", "query-failure"],
 )
 def test_refusals_carry_no_underlying_exception(
-    monkeypatch, main_module, row, fail_on, status
+    monkeypatch, main_module, token, row, fail_on, status
 ):
     connection = _FakeConnection(row, [], fail_on=fail_on)
     monkeypatch.setattr(main_module, "connect_to_postgres", lambda: connection)
 
     with pytest.raises(main_module.HTTPException) as refused:
-        main_module._resolve_uploader_id("a-token")
+        main_module._resolve_caller_id(token)
 
     assert refused.value.status_code == status
     assert refused.value.__cause__ is None and refused.value.__context__ is None, (
@@ -588,24 +614,28 @@ def test_refusals_carry_no_underlying_exception(
 
 
 @pytest.mark.parametrize("form", [{}, {"auth_token": ""}], ids=["no-field", "empty-field"])
-def test_upload_without_token_never_opens_a_lookup_connection(
-    monkeypatch, main_module, upload_client, form
+def test_upload_without_token_is_refused_before_any_lookup_or_ingestion(
+    monkeypatch, main_module, identity_upload_client, form
 ):
+    """No anonymous uploads: a document stored without an owner would be an
+    ownerless record that no one can be held to, so a missing token is a 401."""
     record = _install_service_double(monkeypatch, main_module)
+    started = _record_followup_starts(monkeypatch, main_module)
 
-    # The fixture's connect_to_postgres raises on any call, so a 200 here is
-    # itself the proof that no lookup connection was opened.
-    response = upload_client.post(
+    # The fixture's connect_to_postgres raises on any call; a failed lookup
+    # would be a 503, so a 401 here is itself proof no lookup was attempted.
+    response = identity_upload_client.post(
         "/upload",
         files=[("files", ("anon.txt", _TXT_BYTES, "text/plain"))],
         data=form,
     )
 
-    assert response.status_code == 200, response.text
-    assert record["batches"] == 1
-    assert record["uploads"][0].uploader_id is None, (
-        "no token keeps the existing anonymous upload"
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Unauthorized"}
+    assert record["constructions"] == 0 and record["batches"] == 0, (
+        "a missing token must be refused before any ingestion service is built"
     )
+    assert started == []
 
 
 # --- 8: the route composes the REAL service with this app's dependencies ----
@@ -702,7 +732,7 @@ def test_upload_route_opens_no_connection_of_its_own(main_tree):
     assert not _calls_to_name(fn, "connect_to_postgres"), (
         "upload_documents must not open a connection directly; the ingestion "
         "write connection belongs to the service's connection factory and the "
-        "auth lookup belongs to _resolve_uploader_id"
+        "auth lookup belongs to _resolve_caller_id"
     )
     for banned in ("psycopg2", "register_vector"):
         assert banned not in ast.dump(fn), (
@@ -744,7 +774,7 @@ def test_upload_route_reads_each_upload_exactly_once(main_tree):
 
 
 def test_uploader_lookup_helper_uses_connect_to_postgres(main_tree):
-    fn = _find_function(main_tree, "_resolve_uploader_id")
+    fn = _find_function(main_tree, "_resolve_caller_id")
     assert len(_calls_to_name(fn, "connect_to_postgres")) == 1, (
         "the preserved auth lookup must still open its connection via "
         "connect_to_postgres()"

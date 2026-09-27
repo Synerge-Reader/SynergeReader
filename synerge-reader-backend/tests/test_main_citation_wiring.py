@@ -189,6 +189,7 @@ class _FakeCursor:
     def execute(self, sql, params=()):
         self._connection.statements.append(" ".join(sql.split()))
         if "INSERT INTO chat_history" in sql:
+            self._connection.history_params.append(tuple(params))
             self._connection._step("insert")
             self._row = (self._connection.entry_id,)
         else:
@@ -211,6 +212,7 @@ class _FakeConnection:
         self.failures = failures
         self.steps = []
         self.statements = []
+        self.history_params = []
 
     def _step(self, name):
         self.steps.append(name)
@@ -284,16 +286,28 @@ def _evidence_bundle():
     )
 
 
+_CALLER_ID = "caller-7"
+
+
 def _route_harness(main_tree, connection, verifier_reply="supported", kb_entries=()):
     """The route's real code, with every collaborator an in-memory stub."""
     calls = SimpleNamespace(
-        ollama=[], scopes=[], kb_queries=[], kb_used=[], auto_saved=threading.Event()
+        ollama=[], callers=[], scopes=[], kb_queries=[], kb_used=[],
+        auto_saved=threading.Event(),
     )
     planning = EvidencePlanningResult(bundle=_evidence_bundle())
 
     def get_relevant_knowledge_base(question, limit=3):
         calls.kb_queries.append(question)
         return [dict(entry) for entry in kb_entries]
+
+    # The caller is resolved before anything streams. Refusing a missing or
+    # unknown token is proven against the real app in
+    # tests/test_kb_containment_routes.py; here every request is an identified
+    # caller, so these tests stay about streaming, citations, and history.
+    def resolve_caller_id(auth_token):
+        calls.callers.append(auth_token)
+        return _CALLER_ID
 
     def resolve_authorized_scope(auth_token):
         calls.scopes.append(auth_token)
@@ -320,6 +334,7 @@ def _route_harness(main_tree, connection, verifier_reply="supported", kb_entries
         "datetime": datetime,
         "post_ollama": post_ollama,
         "connect_to_postgres": lambda: connection,
+        "_resolve_caller_id": resolve_caller_id,
         "_resolve_authorized_scope": resolve_authorized_scope,
         "_build_answer_evidence_planner": lambda scope: SimpleNamespace(
             plan=lambda request, scope: planning
@@ -713,19 +728,24 @@ def test_a_persisted_answer_streams_its_entry_id_then_a_successful_done(main_tre
     assert connection.steps == ["insert", "commit", "close"], (
         "a persisted answer commits and closes, and is never rolled back"
     )
+    assert calls.callers == [None], "the caller is resolved exactly once, up front"
+    assert [params[4] for params in connection.history_params] == [_CALLER_ID], (
+        "the history row belongs to the resolved caller, never to a second lookup"
+    )
     assert not calls.auto_saved.wait(timeout=0.5), (
         "PR #54 containment: a persisted answer is never auto-saved to the shared KB"
     )
 
 
+# There is no user-lookup step in the history write any more: the caller is
+# resolved once, before anything streams, and the row is written for that id.
 @pytest.mark.parametrize(
     ("failing_step", "auth_token", "expected_steps"),
     [
-        ("select", "user-token", ["select", "rollback", "close"]),
         ("insert", None, ["insert", "rollback", "close"]),
         ("commit", None, ["insert", "commit", "rollback", "close"]),
     ],
-    ids=["user-lookup-execute", "history-insert-execute", "commit"],
+    ids=["history-insert-execute", "commit"],
 )
 def test_a_pre_commit_history_failure_rolls_back_closes_and_ends_not_ok(
     main_tree, capsys, failing_step, auth_token, expected_steps
@@ -1214,12 +1234,14 @@ def test_scope_lookup_fails_closed(main_tree, main_source):
     scope = _find_function(main_tree, "_resolve_authorized_scope")
     segment = _segment(main_source, scope)
 
-    assert segment.count("AuthorizedScope.unresolved()") >= 3, (
-        "no connection, a failed lookup, and an unknown token must each fail "
-        "closed rather than degrade into a wider scope"
+    assert segment.count("AuthorizedScope.unresolved()") >= 4, (
+        "no token, no connection, a failed lookup, and an unknown token must "
+        "each fail closed rather than degrade into a wider scope"
     )
-    assert "WHERE user_id IS NULL" in segment
     assert "WHERE user_id = %s" in segment
+    assert "user_id IS NULL" not in segment, (
+        "there is no anonymous scope: ownerless documents are served to no one"
+    )
 
 
 def test_every_documents_query_in_the_ask_flow_is_owner_scoped(main_tree):
@@ -1247,7 +1269,10 @@ def test_every_documents_query_in_the_ask_flow_is_owner_scoped(main_tree):
                 "an unscoped documents read would expose another user's file: "
                 f"{normalized[:120]}"
             )
-    assert checked >= 3, f"expected several scoped document reads, saw {checked}"
+    # The scope listing and the text load, each owner-scoped; the anonymous
+    # (``user_id IS NULL``) variants of both were removed with the anonymous
+    # scope, and retrieval goes through the authorized query builders.
+    assert checked >= 2, f"expected the scoped document reads, saw {checked}"
 
 
 def test_document_text_loading_is_scoped_twice(main_tree, main_source):
@@ -1255,10 +1280,11 @@ def test_document_text_loading_is_scoped_twice(main_tree, main_source):
     segment = _segment(main_source, loader)
 
     assert "scope.authorizes(document_id)" in segment, "the in-memory scope is checked first"
-    assert "AND user_id IS NULL" in segment and "AND user_id = %s" in segment, (
+    assert "AND user_id = %s" in segment, (
         "the SELECT must be owner-scoped again, so a caller bug cannot become a "
         "cross-user read"
     )
+    assert "user_id IS NULL" not in segment, "ownerless documents are loaded for no one"
 
 
 def test_hybrid_retrieval_uses_only_authorized_builders(main_tree, main_source):

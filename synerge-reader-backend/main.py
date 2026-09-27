@@ -2,7 +2,6 @@ from contextlib import asynccontextmanager
 import sys
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Header
-from document_parser import sanitize_filename
 from document_ingestion import (
     CommittedDocument,
     DocumentIngestionService,
@@ -68,9 +67,6 @@ from dotenv import load_dotenv
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 import resend
-import subprocess
-import tempfile
-import shutil
 import socket
 import ipaddress
 from urllib.parse import urlparse, urljoin
@@ -711,26 +707,40 @@ async def hash_password(password: str) -> str:
 
 
 
-def _resolve_uploader_id(auth_token: Optional[str]):
-    """Resolve an upload's owner from the existing users.token column.
+# A session token identifies a user only while that account is active.
+# Suspending an account (is_active = 0) must invalidate the tokens it was
+# already issued -- tokens never expire -- not just block its next login, so
+# every protected identity check uses one of these lookups. NULL counts as
+# active, matching /login and /me: the column predates suspension.
+_ACTIVE_USER_ID_BY_TOKEN = (
+    "SELECT id FROM users WHERE token = %s AND COALESCE(is_active, 1) <> 0"
+)
+_ACTIVE_ADMIN_FLAG_BY_TOKEN = (
+    "SELECT is_admin FROM users WHERE token = %s AND COALESCE(is_active, 1) <> 0"
+)
 
-    No token is an anonymous upload, unchanged. A supplied token is a claim of
-    identity, so it must resolve before anything is ingested -- it can never
-    degrade into an ownerless document:
 
+def _resolve_caller_id(auth_token: Optional[str]):
+    """The signed-in caller of /upload or /ask, from the users.token column.
+
+    Both routes create persistent rows (documents, chat history) that belong
+    to whoever made the request, so a caller must be identified before any
+    work starts -- a request can never degrade into an ownerless record:
+
+    * no token is refused with 401, without opening a connection;
     * a token that matches a user gives that user's id;
     * a token that matches no user is refused with 401;
     * a lookup that cannot complete -- no connection, or a connection, cursor
       or query failure -- is refused with a generic 503.
 
-    Both refusals carry fixed messages and are raised outside any ``except``
+    Every refusal carries a fixed message and is raised outside any ``except``
     block, so neither the token, the SQL, nor the database exception reaches
     the response, even by exception chaining. A lookup failure is logged by
     exception class name only, and the cursor and connection are closed on
     every path.
     """
     if not auth_token:
-        return None
+        raise HTTPException(401, "Unauthorized")
 
     lookup_row = None
     lookup_failed = False
@@ -743,7 +753,7 @@ def _resolve_uploader_id(auth_token: Optional[str]):
             lookup_cursor = None
             try:
                 lookup_cursor = lookup_conn.cursor()
-                lookup_cursor.execute("SELECT id FROM users WHERE token = %s", (auth_token,))
+                lookup_cursor.execute(_ACTIVE_USER_ID_BY_TOKEN, (auth_token,))
                 lookup_row = lookup_cursor.fetchone()
             finally:
                 if lookup_cursor is not None:
@@ -888,9 +898,10 @@ async def upload_documents(
     else:
         raise HTTPException(400, "No files provided")
 
-    # Raises 401 for a supplied token that matches no user and 503 when the
-    # lookup cannot complete, so neither reaches a file read or the service.
-    uploader_id = _resolve_uploader_id(auth_token)
+    # Raises 401 for a missing token or one that matches no user and 503 when
+    # the lookup cannot complete, so none of them reaches a file read or the
+    # service: every stored document has an owner.
+    uploader_id = _resolve_caller_id(auth_token)
 
     metadata = DocumentMetadata(
         author=author,
@@ -949,15 +960,18 @@ _HYBRID_CANDIDATES_PER_RANKER = 12
 def _resolve_authorized_scope(auth_token: Optional[str]) -> AuthorizedScope:
     """Every document this caller may be shown -- or an unresolved scope.
 
-    Fails closed. If the connection cannot be opened, the lookup raises, or a
-    token is supplied that matches no user, the caller gets an unresolved scope
-    and therefore no server-loaded evidence at all.
+    Fails closed. If no token is supplied, the connection cannot be opened, the
+    lookup raises, or the token matches no user, the caller gets an unresolved
+    scope and therefore no server-loaded evidence at all.
 
-    A caller with no token keeps the established anonymous behaviour: the
-    documents that were uploaded without an owner. That is deliberately
-    narrower than the previous /ask behaviour, which searched every document in
-    the database regardless of who uploaded it.
+    There is no anonymous scope: documents stored without an owner (legacy
+    rows) are not served to anyone through /ask, and are never attributed to a
+    caller. The route also refuses a missing or unknown token up front
+    (_resolve_caller_id); this check is the evidence path's own boundary.
     """
+    if not auth_token:
+        return AuthorizedScope.unresolved()
+
     connection = connect_to_postgres()
     if connection is None:
         return AuthorizedScope.unresolved()
@@ -965,35 +979,21 @@ def _resolve_authorized_scope(auth_token: Optional[str]) -> AuthorizedScope:
     cursor = None
     try:
         cursor = connection.cursor()
-        user_id = None
-        if auth_token:
-            cursor.execute("SELECT id FROM users WHERE token = %s", (auth_token,))
-            row = cursor.fetchone()
-            if not row:
-                # A token that resolves to nobody must not quietly degrade into
-                # the anonymous corpus.
-                return AuthorizedScope.unresolved()
-            user_id = row[0]
+        cursor.execute(_ACTIVE_USER_ID_BY_TOKEN, (auth_token,))
+        row = cursor.fetchone()
+        if not row or row[0] is None:
+            return AuthorizedScope.unresolved()
+        user_id = row[0]
 
-        if user_id is None:
-            cursor.execute(
-                """
-                SELECT id, filename, title, length(content)
-                FROM documents
-                WHERE user_id IS NULL
-                ORDER BY id
-                """
-            )
-        else:
-            cursor.execute(
-                """
-                SELECT id, filename, title, length(content)
-                FROM documents
-                WHERE user_id = %s
-                ORDER BY id
-                """,
-                (user_id,),
-            )
+        cursor.execute(
+            """
+            SELECT id, filename, title, length(content)
+            FROM documents
+            WHERE user_id = %s
+            ORDER BY id
+            """,
+            (user_id,),
+        )
 
         documents = []
         for document_id, filename, title, char_length in cursor.fetchall():
@@ -1013,7 +1013,7 @@ def _resolve_authorized_scope(auth_token: Optional[str]) -> AuthorizedScope:
             documents=tuple(documents),
             established=True,
             user_id=user_id,
-            anonymous=user_id is None,
+            anonymous=False,
         )
     except Exception as exc:
         print(f"[Ask] authorization scope lookup failed: {type(exc).__name__}")
@@ -1035,9 +1035,10 @@ def _load_authorized_document_text(scope: AuthorizedScope, document_id) -> Optio
 
     Scoped twice on purpose: the id must already be in the in-memory authorized
     scope, and the SELECT is scoped to the same owner again, so a bug in the
-    caller cannot turn into a cross-user read.
+    caller cannot turn into a cross-user read. A scope without an owner never
+    loads anything: ownerless (legacy) documents are served to no one.
     """
-    if not scope.authorizes(document_id):
+    if not scope.authorizes(document_id) or scope.user_id is None:
         return None
 
     connection = connect_to_postgres()
@@ -1047,16 +1048,10 @@ def _load_authorized_document_text(scope: AuthorizedScope, document_id) -> Optio
     cursor = None
     try:
         cursor = connection.cursor()
-        if scope.user_id is None:
-            cursor.execute(
-                "SELECT content FROM documents WHERE id = %s AND user_id IS NULL",
-                (document_id,),
-            )
-        else:
-            cursor.execute(
-                "SELECT content FROM documents WHERE id = %s AND user_id = %s",
-                (document_id, scope.user_id),
-            )
+        cursor.execute(
+            "SELECT content FROM documents WHERE id = %s AND user_id = %s",
+            (document_id, scope.user_id),
+        )
         row = cursor.fetchone()
         return row[0] if row else None
     except Exception as exc:
@@ -1308,6 +1303,11 @@ async def ask_question(request: AskRequest):
     # Decides the prompt rules and whether claims are graded; evidence
     # planning and authorization below are the same in every mode.
     answer_mode = AnswerMode(request.mode)
+    # Identified before anything streams: a missing or unknown token is a 401
+    # and a failed lookup a 503, so an unidentified request reads no evidence,
+    # calls no model, and writes no history row. The answer's history row
+    # belongs to exactly this caller.
+    caller_id = _resolve_caller_id(request.auth_token)
 
     def verify_claim(claim, records):
         return _ollama_claim_verifier(claim, records, request.model)
@@ -1426,13 +1426,6 @@ async def ask_question(request: AskRequest):
             conn = connect_to_postgres()
             c = conn.cursor()
 
-            user_id = None
-            if request.auth_token:
-                c.execute("SELECT id FROM users WHERE token = %s", (request.auth_token,))
-                row = c.fetchone()
-                if row:
-                    user_id = row[0]
-
             c.execute(
                 """
                 INSERT INTO chat_history (ts, selected_text, question, answer, user_id)
@@ -1444,7 +1437,7 @@ async def ask_question(request: AskRequest):
                     request.selected_text or "",
                     request.question,
                     full_answer,
-                    user_id,
+                    caller_id,
                 )
             )
 
@@ -1497,52 +1490,53 @@ async def ask_question(request: AskRequest):
 
 @app.post("/history", response_model=List[HistoryItem])
 async def get_history(request: HistoryRequest):
-    user_id = None
-    if request.token:
-        conn = connect_to_postgres()
-        c = conn.cursor()
-        c.execute(
-        "SELECT id FROM users WHERE token = %s",
-        (request.token,)
-        )
-        row = c.fetchone()
-        if row:
-            user_id = row[0]
-        conn.close()
+    """The caller's own most recent chat history.
+
+    A missing or invalid token is a 401. There is no anonymous history: rows
+    stored without an owner (legacy anonymous chats) are returned to no one.
+    """
+    conn = _open_db()
     try:
-        conn = connect_to_postgres()
         c = conn.cursor()
-        if user_id:
-            c.execute(
-                "SELECT id, ts, selected_text, question, answer FROM chat_history WHERE user_id = %s ORDER BY id DESC LIMIT 20",
-                (user_id,),
-            )
-        else:
-            c.execute(
-                "SELECT id, ts, selected_text, question, answer FROM chat_history WHERE user_id IS NULL ORDER BY id DESC LIMIT 20"
-            )
+        user_id = _user_id_for_token(c, request.token)
+        c.execute(
+            "SELECT id, ts, selected_text, question, answer FROM chat_history WHERE user_id = %s ORDER BY id DESC LIMIT 20",
+            (user_id,),
+        )
         rows = c.fetchall()
-        conn.close()
         return [
             HistoryItem(
                 id=r[0], timestamp=r[1], selected_text=r[2], question=r[3], answer=r[4]
             )
             for r in rows
         ]
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(500, str(e))
+        print(f"[get_history] failed: {type(e).__name__}")
+        raise HTTPException(500, "Could not load history")
+    finally:
+        conn.close()
 
 
 @app.get("/documents")
-async def get_documents():
+async def get_documents(authorization: Optional[str] = Header(None)):
+    """The caller's own documents' metadata.
+
+    The caller comes from the Authorization header, like the other document
+    routes; a missing, malformed, or invalid token is a 401. Other users'
+    documents and ownerless (legacy) documents are never listed.
+    """
+    token = _bearer_token(authorization)
+    conn = _open_db()
     try:
-        conn = connect_to_postgres()
         c = conn.cursor()
+        user_id = _user_id_for_token(c, token)
         c.execute("""SELECT id, filename, upload_timestamp, author, title, publication_date, source, doi_url,
                      (SELECT COUNT(*) FROM document_chunks WHERE document_id = documents.id)
-                     FROM documents ORDER BY upload_timestamp DESC""")
+                     FROM documents WHERE user_id = %s ORDER BY upload_timestamp DESC""",
+                  (user_id,))
         rows = c.fetchall()
-        conn.close()
         return [
             {
                 "id": r[0],
@@ -1557,8 +1551,13 @@ async def get_documents():
             }
             for r in rows
         ]
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(500, str(e))
+        print(f"[get_documents] failed: {type(e).__name__}")
+        raise HTTPException(500, "Could not list documents")
+    finally:
+        conn.close()
 
 
 def _bearer_token(authorization: Optional[str]) -> Optional[str]:
@@ -1587,7 +1586,7 @@ def _open_db():
 def _user_id_for_token(cursor, token: Optional[str]):
     if not token:
         raise HTTPException(401, "Unauthorized")
-    cursor.execute("SELECT id FROM users WHERE token = %s", (token,))
+    cursor.execute(_ACTIVE_USER_ID_BY_TOKEN, (token,))
     row = cursor.fetchone()
     if not row:
         raise HTTPException(401, "Invalid session")
@@ -2026,74 +2025,23 @@ async def login(request: LoginRequest):
 
 
 @app.post("/google-login")
-async def google_login(request: GoogleLoginRequest):
+async def google_login():
+    """Google sign-in is refused for this release, before any token check.
+
+    The previous flow verified the Google ID token and then returned the
+    token of whichever account had ``username`` equal to the Google email.
+    Registration accepts any username, so an account pre-registered with
+    someone else's email address as its username would receive that
+    person's Google sign-ins. Sign-in stays refused until accounts are bound
+    to a verified Google identity (the token's ``sub``). Username/password
+    login is unaffected. No Google token is verified and no account is read
+    or created here.
     """
-    Google OAuth 2.0 Login Endpoint
+    raise HTTPException(
+        403,
+        "Google sign-in is temporarily unavailable. Please sign in with your username and password.",
+    )
 
-    Flow:
-    1. Frontend sends Google ID token
-    2. Backend verifies token with Google
-    3. Backend extracts user email/name from token
-    4. Backend creates/updates user in database
-    5. Backend returns app token
-    """
-    if not GOOGLE_CLIENT_ID:
-        raise HTTPException(500, "Google Client ID not configured")
-
-    try:
-        # Verify the token with Google
-        # This checks that the token is valid and hasn't been tampered with
-        idinfo = id_token.verify_oauth2_token(
-            request.token, google_requests.Request(), GOOGLE_CLIENT_ID
-        )
-
-        # Extract user information from the verified token
-        email = idinfo.get("email", "")
-        name = idinfo.get("name", "")
-        google_id = idinfo.get("sub", "")  # Unique Google user ID
-
-        if not email:
-            raise HTTPException(400, "Email not provided by Google")
-
-        # Connect to database
-        conn = connect_to_postgres()
-        c = conn.cursor()
-
-        # Check if user already exists
-        c.execute("SELECT id, token FROM users WHERE username = %s", (email,))
-        row = c.fetchone()
-
-        if row:
-            # User exists, return their token
-            conn.close()
-            return {
-                "message": "Login successful",
-                "token": row[1],
-                "email": email,
-                "name": name,
-            }
-        else:
-            # Create new user with Google email as username
-            # Password is not needed for Google users, we can use a placeholder
-            app_token = secrets.token_hex(32)
-            placeholder_password = secrets.token_hex(32)  # Random, unused password
-
-            c.execute("INSERT INTO users (username, password, token) VALUES (%s, %s, %s)", (email, placeholder_password, app_token))
-            conn.commit()
-            conn.close()
-
-            return {
-                "message": "Registration and login successful",
-                "token": app_token,
-                "email": email,
-                "name": name,
-            }
-
-    except ValueError as e:
-        # Token verification failed
-        raise HTTPException(401, f"Invalid token: {str(e)}")
-    except Exception as e:
-        raise HTTPException(500, f"Google login error: {str(e)}")
 
 @app.post("/submit_correction")
 async def submit_correction(request: CorrectionRequest, authorization: Optional[str] = Header(None)):
@@ -2436,7 +2384,7 @@ async def check_admin_status(token: Optional[str] = None):
     try:
         conn = connect_to_postgres()
         c = conn.cursor()
-        c.execute("SELECT is_admin FROM users WHERE token = %s", (token,))
+        c.execute(_ACTIVE_ADMIN_FLAG_BY_TOKEN, (token,))
         row = c.fetchone()
         conn.close()
 
@@ -2458,7 +2406,7 @@ async def get_all_ratings(token: Optional[str] = None):
         c = conn.cursor()
 
         # Check if user is admin
-        c.execute("SELECT is_admin FROM users WHERE token = %s", (token,))
+        c.execute(_ACTIVE_ADMIN_FLAG_BY_TOKEN, (token,))
         row = c.fetchone()
 
         if not row or not row[0]:
@@ -2520,7 +2468,7 @@ async def get_rating_stats(token: Optional[str] = None):
         c = conn.cursor()
 
         # Check if user is admin
-        c.execute("SELECT is_admin FROM users WHERE token = %s", (token,))
+        c.execute(_ACTIVE_ADMIN_FLAG_BY_TOKEN, (token,))
         row = c.fetchone()
 
         if not row or not row[0]:
@@ -2602,7 +2550,7 @@ async def get_my_stats(token: Optional[str] = None, days: int = 7):
     try:
         conn = connect_to_postgres()
         c = conn.cursor()
-        c.execute("SELECT id, username FROM users WHERE token = %s", (token,))
+        c.execute("SELECT id, username FROM users WHERE token = %s AND COALESCE(is_active, 1) <> 0", (token,))
         row = c.fetchone()
         if not row:
             raise HTTPException(401, "Invalid session")
@@ -2727,7 +2675,7 @@ async def get_my_stats(token: Optional[str] = None, days: int = 7):
 def _require_admin(cursor, token: Optional[str]) -> None:
     if not token:
         raise HTTPException(401, "Unauthorized")
-    cursor.execute("SELECT is_admin FROM users WHERE token = %s", (token,))
+    cursor.execute(_ACTIVE_ADMIN_FLAG_BY_TOKEN, (token,))
     row = cursor.fetchone()
     if not row or not row[0]:
         raise HTTPException(403, "Forbidden: Admin access required")
@@ -3114,9 +3062,13 @@ async def admin_update_user(user_id: str, request: UpdateUserRequest):
 
 @app.delete("/admin/users/{user_id}")
 async def admin_delete_user(user_id: str, token: Optional[str] = None):
-    """Delete a user account. Their past chats/documents are kept for the audit
-    trail — only the ownership link is cleared, matching how anonymous rows
-    already display as 'Anonymous'."""
+    """Delete a user account that owns no documents or chats.
+
+    A user who still owns records is refused with 409 and nothing changes.
+    Clearing the ownership link (the previous behaviour) moved that user's
+    private documents and chats into the ownerless pool, and deleting them is
+    a data-retention decision this route does not make. Suspending the account
+    keeps the records attached to their owner."""
     conn = connect_to_postgres()
     try:
         c = conn.cursor()
@@ -3138,11 +3090,16 @@ async def admin_delete_user(user_id: str, token: Optional[str] = None):
         chat_count = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM documents WHERE user_id = %s", (user_id,))
         doc_count = c.fetchone()[0]
-        c.execute("UPDATE chat_history SET user_id = NULL WHERE user_id = %s", (user_id,))
-        c.execute("UPDATE documents SET user_id = NULL WHERE user_id = %s", (user_id,))
+        if chat_count or doc_count:
+            conn.close()
+            raise HTTPException(
+                409,
+                f"This user still owns {doc_count} document(s) and {chat_count} chat(s). "
+                "Suspend the account instead; deleting it would detach those records from their owner.",
+            )
         c.execute("DELETE FROM users WHERE id = %s", (user_id,))
         _log_admin_action(c, token, "delete_user", target_id=user_id, target_username=target_row[1],
-                           detail=f"account removed; {chat_count} chats and {doc_count} documents kept, unlinked")
+                           detail="account removed; it owned no documents or chats")
         conn.commit()
         conn.close()
         return {"message": "Deleted"}
@@ -3513,43 +3470,16 @@ async def test_endpoint():
 
 
 @app.post("/convert-docx")
-async def convert_docx_to_pdf(file: UploadFile = File(...)):
-    """Convert a DOCX file to PDF using LibreOffice headless."""
-    if not file.filename.lower().endswith(".docx"):
-        raise HTTPException(400, "Only .docx files are supported")
-    tmp_dir = tempfile.mkdtemp()
-    try:
-        docx_path = os.path.join(tmp_dir, sanitize_filename(file.filename))
-        content   = await file.read()
-        with open(docx_path, "wb") as f:
-            f.write(content)
-        result = subprocess.run(
-            ["libreoffice", "--headless", "--convert-to", "pdf",
-             "--outdir", tmp_dir, docx_path],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            raise HTTPException(500, f"Conversion failed: {result.stderr}")
-        pdf_name = os.path.splitext(file.filename)[0] + ".pdf"
-        pdf_path = os.path.join(tmp_dir, pdf_name)
-        if not os.path.exists(pdf_path):
-            raise HTTPException(500, "PDF output not found")
-        with open(pdf_path, "rb") as f:
-            pdf_bytes = f.read()
-        return Response(
-            content=pdf_bytes,
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": f"inline; filename={pdf_name}",
-                "Access-Control-Allow-Origin": "*",
-            },
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, str(e))
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+async def convert_docx_to_pdf():
+    """DOCX-to-PDF conversion is disabled for this release.
+
+    The route had no authentication and no frontend caller, ran LibreOffice
+    for anyone, and read its output from a path built from the raw client
+    filename -- which a crafted name could point at an existing ``.pdf``
+    outside the temporary directory. The request body is not read: no file
+    is accepted, written, converted, or opened here.
+    """
+    raise HTTPException(403, "DOCX conversion is disabled.")
 
 if __name__ == "__main__":
     import uvicorn

@@ -48,7 +48,7 @@ persistence, the two INSERT column lists, and preserved uploader ownership --
 are therefore asserted here against ``document_ingestion.py``, which now owns
 them, plus the route's composition of that service. Nothing was dropped; the
 assertions moved to the module that holds the behavior. The route's separate,
-permitted auth-token lookup also moved, into ``_resolve_uploader_id``.
+permitted auth-token lookup also moved, into ``_resolve_caller_id``.
 
 What these tests do NOT prove: they do not prove runtime wiring (main.py is
 never executed by this file), they do not validate Ollama's successful
@@ -401,9 +401,10 @@ def test_main_no_longer_imports_the_ingestion_primitives(main_tree):
         f"main.py must no longer import ingestion primitives: {sorted(leaked)}"
     )
     parser_imports = _imports_by_name(main_tree, ("document_parser",))
-    assert set(parser_imports) == {"sanitize_filename"}, (
-        "main.py should keep only sanitize_filename from document_parser (used by "
-        f"the DOCX conversion route); found {sorted(parser_imports)}"
+    assert set(parser_imports) == set(), (
+        "main.py imports nothing from document_parser: its one remaining use, "
+        "sanitize_filename in the DOCX conversion route, went with that route's "
+        f"release-containment refusal; found {sorted(parser_imports)}"
     )
 
 
@@ -888,10 +889,11 @@ def test_save_kb_pairs_aborts_batch_atomically_on_embedding_failure(main_tree):
 
 
 def test_upload_has_permitted_auth_lookup_connection(main_tree):
-    # E1b: the lookup moved out of the route body into _resolve_uploader_id,
-    # which upload_documents calls. It is still the only connection the route
-    # side opens, and it is still opened via connect_to_postgres().
-    fn = _find_function(main_tree, "_resolve_uploader_id")
+    # E1b: the lookup moved out of the route body into a helper -- now
+    # _resolve_caller_id, which /ask shares -- that upload_documents calls. It is
+    # still the only connection the route side opens, and it is still opened
+    # via connect_to_postgres().
+    fn = _find_function(main_tree, "_resolve_caller_id")
     lookup_assignments = _assignments_to_name(fn, "lookup_conn")
     assert lookup_assignments, "the auth lookup must retain its lookup_conn connection"
     value = lookup_assignments[0].value
@@ -902,7 +904,7 @@ def test_upload_has_permitted_auth_lookup_connection(main_tree):
     ), "lookup_conn must be opened via connect_to_postgres()"
 
     route = _find_function(main_tree, "upload_documents")
-    assert len(_calls_to_name(route, "_resolve_uploader_id")) == 1, (
+    assert len(_calls_to_name(route, "_resolve_caller_id")) == 1, (
         "upload_documents must resolve the uploader through that one helper"
     )
 
