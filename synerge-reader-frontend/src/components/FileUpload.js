@@ -24,12 +24,15 @@ export default function FileUpload({
   ];
   const setDefault = () => setIsDragging(false);
 
-  const uploadBatchToBackend = async (parsedDocs) => {
+  // Legacy/dormant upload path. It must never send client-extracted text in
+  // place of the file: /upload ingests the ORIGINAL PDF/DOCX/TXT bytes and
+  // parses them server-side, so the original File objects are appended here.
+  // The local parsing below stays local, for preview only.
+  const uploadBatchToBackend = async (originalFiles) => {
     try {
       const formData = new FormData();
-      parsedDocs.forEach(({ text, name }) => {
-        const blob = new Blob([text], { type: 'text/plain' });
-        formData.append('files', blob, name);
+      originalFiles.forEach((file) => {
+        formData.append('files', file, file.name);
       });
 
       const response = await fetch((process.env.REACT_APP_BACKEND_URL || "http://localhost:5000") + '/upload', {
@@ -37,13 +40,14 @@ export default function FileUpload({
         body: formData
       });
 
-      if (!response.ok) {
-        throw new Error(`Upload failed: ${response.statusText}`);
+      // 207/422/503 still carry the structured batch envelope, so the body is
+      // read before res.ok is consulted.
+      const payload = await response.json().catch(() => null);
+      if (!payload || !Array.isArray(payload.results)) {
+        throw new Error(`Upload failed: ${response.statusText || response.status}`);
       }
 
-      const result = await response.json();
-      console.log('Documents uploaded successfully:', result);
-      return result;
+      return payload.results;
     } catch (error) {
       console.error('Upload error:', error);
       setError(`Failed to upload documents: ${error.message}`);
@@ -176,12 +180,15 @@ export default function FileUpload({
         onFileParsed(parsedDoc);
       }
 
-      const backendResults = await uploadBatchToBackend(parsedDocs);
+      const backendResults = await uploadBatchToBackend(validFiles);
 
       const uploadErrors = [];
       backendResults.forEach((result, index) => {
-        if (result && result.error) {
-          uploadErrors.push(`${parsedDocs[index].name}: ${result.error}`);
+        // Anything the backend did not index is reported with the ingestion
+        // contract's safe error_message -- never a raw server exception.
+        if (!result || result.status !== 'indexed' || !result.document_id) {
+          const name = (result && result.filename) || validFiles[index]?.name || 'Document';
+          uploadErrors.push(`${name}: ${(result && result.error_message) || 'could not be indexed.'}`);
         }
       });
 

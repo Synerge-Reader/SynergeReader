@@ -8,6 +8,22 @@ MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_PDF_PAGES = 150
 MAX_EXTRACTED_CHARS = 300_000
 
+# pdfplumber decides where one word ends and the next begins by measuring the
+# gap between consecutive glyphs against a tolerance. Its default is a FIXED 3
+# points, which is wrong for typeset research papers: at the 9-10pt body size
+# LaTeX uses, an inter-word space is itself only about 2.5-3.3 points. The gap
+# therefore falls under the threshold and whole sentences are returned as a
+# single token -- "Inpractice,wecomputetheattentionfunction".
+#
+# Scaling the tolerance to the glyph's own font size separates words using the
+# geometry the PDF already carries, so no space is inserted that the character
+# positions do not themselves imply. This is measurement, not a regex guess.
+#
+# 0.15 sits in the middle of the safe band: at 9pt it allows 1.35pt, well above
+# the ~0-0.4pt gaps *inside* a word and well below the ~2.5pt gap *between*
+# words. It scales correctly for headings and for small sub/superscripts.
+PDF_X_TOLERANCE_RATIO = 0.15
+
 
 class ExtractionError(Exception):
     def __init__(self, user_message: str, http_status: int = 422):
@@ -140,6 +156,21 @@ def _truncate_pages(
     return new_pages, False
 
 
+def _extract_page_text(page) -> str:
+    """One page's text, with word boundaries measured against the font size.
+
+    Falls back to the library default only if this build of pdfplumber does
+    not accept the ratio. That degrades to the previous (word-collapsing)
+    behaviour rather than failing the upload, so an older pinned pdfplumber
+    still ingests documents; it never produces different text on a build that
+    does support the ratio.
+    """
+    try:
+        return page.extract_text(x_tolerance_ratio=PDF_X_TOLERANCE_RATIO)
+    except TypeError:
+        return page.extract_text()
+
+
 def _extract_pdf(content: bytes, filename: str) -> ParsedDocument:
     try:
         import pdfplumber
@@ -156,7 +187,7 @@ def _extract_pdf(content: bytes, filename: str) -> ParsedDocument:
 
         pages = []
         for i, page in enumerate(pdf_pages, start=1):
-            page_text = page.extract_text()
+            page_text = _extract_page_text(page)
             if page_text and page_text.strip():
                 pages.append(ParsedPage(page_number=i, text=page_text))
 
