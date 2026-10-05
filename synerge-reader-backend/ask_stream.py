@@ -19,6 +19,7 @@ Event types:
 
 ``evidence``      structured citation records for this answer, sent before the
                   first token so the UI can render sources while streaming.
+                  May carry ``generation``: the model the backend resolved.
 ``delta``         one piece of answer text, in ``text``.
 ``verification``  structured per-claim verification results.
 ``entry_id``      the chat_history row id for this answer (unchanged semantics).
@@ -74,14 +75,24 @@ def evidence_event(
     mode: str,
     truncated: bool = False,
     warnings: Sequence[str] = (),
+    generation: Optional[dict] = None,
 ) -> str:
-    return encode_event(
-        EVENT_EVIDENCE,
+    """Candidate citations, sent before the first token.
+
+    ``generation`` is optional metadata naming the model profile and tag the
+    backend actually resolved for this answer, so a client never has to label
+    the answer from its own (possibly stale) request. Omitted when not given,
+    so the event keeps its original shape for other callers.
+    """
+    payload = dict(
         citations=list(citations),
         mode=mode,
         truncated=bool(truncated),
         warnings=list(warnings),
     )
+    if generation is not None:
+        payload["generation"] = dict(generation)
+    return encode_event(EVENT_EVIDENCE, **payload)
 
 
 def delta_event(text: str) -> str:

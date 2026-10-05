@@ -13,7 +13,11 @@ unknown citation id is not interactive, the four claim states stay visually
 distinct, and the E1b original-file upload path is untouched.
 
 What these do NOT prove: that the UI renders correctly, that the click handler
-scrolls to the right page, or anything about runtime behaviour.
+scrolls to the right page, or anything about runtime behaviour. The claim
+support summary (headline, coverage counts, per-claim labels) now lives in
+src/components/ClaimSupportSummary.jsx; its rendered behaviour is proven by
+the jest test beside it (ClaimSupportSummary.test.jsx), and the checks here
+only pin its shape and its wiring into GridApp.jsx.
 """
 
 from pathlib import Path
@@ -24,12 +28,28 @@ import pytest
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _GRID_APP_PATH = _REPOSITORY_ROOT / "synerge-reader-frontend" / "src" / "GridApp.jsx"
+_CLAIM_SUPPORT_PATH = (
+    _REPOSITORY_ROOT / "synerge-reader-frontend" / "src" / "components" / "ClaimSupportSummary.jsx"
+)
+
+# How GridApp mounts the summary: the same claims and citations as before, and
+# its own AnswerText as the rewriter for claim text.
+_SUMMARY_MOUNT = (
+    "<ClaimSupportSummary claims={msg.claims} citations={msg.citations} "
+    "onOpen={handleCitation} ClaimText={AnswerText} />"
+)
 
 
 @pytest.fixture(scope="module")
 def grid_app_source():
     assert _GRID_APP_PATH.is_file()
     return _GRID_APP_PATH.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def claim_support_source():
+    assert _CLAIM_SUPPORT_PATH.is_file()
+    return _CLAIM_SUPPORT_PATH.read_text(encoding="utf-8")
 
 
 def _slice(source, start_marker, end_marker, label):
@@ -276,7 +296,7 @@ def test_citation_excerpts_are_shown_as_the_bounded_backend_excerpt(grid_app_sou
 # --- 36: claim verification states stay distinguishable --------------------
 
 
-def test_claim_verification_states_remain_distinguishable(grid_app_source):
+def test_claim_verification_states_remain_distinguishable(claim_support_source):
     # Every state the backend can report has its own reader-facing wording, and
     # the reason is what separates "checked and unsupported" from "never
     # checked". Collapsing those is the defect this replaces.
@@ -285,22 +305,29 @@ def test_claim_verification_states_remain_distinguishable(grid_app_source):
         ("partially_supported", "Partly supported"),
         ("no_citation", "Not supported by a cited document"),
         ("invalid_citation", "Citation could not be resolved"),
+        ("checked_unsupported", "Cited source does not support this"),
         ("not_checked", "Not checked"),
         ("check_unavailable", "Check unavailable"),
     ):
-        assert f"{key}:" in grid_app_source, f"{key} must have its own presentation"
-        assert f'label: "{label}"' in grid_app_source
+        assert f"{key}:" in claim_support_source, f"{key} must have its own presentation"
+        assert f'label: "{label}"' in claim_support_source
 
 
-def test_claim_states_are_derived_from_the_backend_status_and_reason(grid_app_source):
-    assert "<ClaimSupportSummary claims={msg.claims} citations={msg.citations} onOpen={handleCitation} />" in grid_app_source
+def test_claim_states_are_derived_from_the_backend_status_and_reason(grid_app_source, claim_support_source):
+    assert _SUMMARY_MOUNT in grid_app_source
     assert "claims: event.claims || []" in grid_app_source, (
         "claim states come from the backend verification event, not from the UI"
     )
-    mapper = _slice(grid_app_source, "function claimStateKey(", "const SUPPORT_HEADLINE", "GridApp.jsx")
+    mapper = _slice(
+        claim_support_source, "export function claimStateKey(", "export const SUPPORT_HEADLINE",
+        "ClaimSupportSummary.jsx",
+    )
     assert 'claim.reason === "invalid_citation"' in mapper
     assert 'claim.reason === "verifier_unavailable"' in mapper
     assert 'claim.reason === "verifier_malformed"' in mapper
+    assert 'if (claim.reason === "verified") return "checked_unsupported";' in mapper, (
+        "a verifier's unsupported verdict on a cited claim is not a missing citation"
+    )
 
 
 def test_verified_is_not_used_as_a_user_facing_claim_label(grid_app_source):
@@ -423,7 +450,7 @@ def test_a_neutral_pending_state_is_shown_while_checking(grid_app_source):
 
 
 def test_only_exact_citation_tokens_are_rewritten(grid_app_source):
-    answer = _slice(grid_app_source, "function AnswerText(", "// What happened to one claim", "GridApp.jsx")
+    answer = _slice(grid_app_source, "function AnswerText(", "function DotsLoader(", "GridApp.jsx")
 
     assert "const pattern = /\\[C(\\d+)\\]/g;" in answer, (
         "only exact [Cn] tokens are candidates for rewriting"
@@ -460,38 +487,51 @@ def test_no_internal_identifier_or_score_is_rendered_as_a_label(grid_app_source)
     "headline",
     [
         "Supported by your documents",
+        "Partly supported by your documents",
         "Parts of this answer are not supported by your documents",
         "Citation check incomplete",
         "Citation check unavailable",
     ],
 )
-def test_support_headline_language_is_exact(grid_app_source, headline):
-    assert f'"{headline}"' in grid_app_source
+def test_support_headline_language_is_exact(claim_support_source, headline):
+    assert f'"{headline}"' in claim_support_source
 
 
-def test_headline_precedence_is_explicit(grid_app_source):
-    chooser = _slice(grid_app_source, "function supportHeadlineKey(", "function ClaimSupportSummary(", "GridApp.jsx")
-    unsupported = chooser.index('return "unsupported"')
-    unavailable = chooser.index('return "unavailable"')
-    incomplete = chooser.index('return "incomplete"')
-    supported = chooser.index('return "supported"')
-    assert unsupported < unavailable < incomplete < supported, (
-        "an unsupported claim is the most important thing to say; a fully "
-        "checked answer is the last case left"
+def _headline_chooser(claim_support_source):
+    return _slice(
+        claim_support_source, "export function supportHeadlineKey(", "function PlainClaimText(",
+        "ClaimSupportSummary.jsx",
     )
 
 
-def test_limit_skipped_and_failed_checks_read_differently(grid_app_source):
-    assert 'not_checked:         { label: "Not checked"' in grid_app_source
-    assert 'check_unavailable:   { label: "Check unavailable"' in grid_app_source
-    mapper = _slice(grid_app_source, "function claimStateKey(", "const SUPPORT_HEADLINE", "GridApp.jsx")
+def test_headline_precedence_is_explicit(claim_support_source):
+    chooser = _headline_chooser(claim_support_source)
+    unsupported = chooser.index('return "unsupported"')
+    unavailable = chooser.index('return "unavailable"')
+    incomplete = chooser.index('return "incomplete"')
+    partial = chooser.index('return "partial"')
+    supported = chooser.index('return "supported"')
+    assert unsupported < unavailable < incomplete < partial < supported, (
+        "an unsupported claim is the most important thing to say; a fully "
+        "checked, fully supported answer is the last case left, and a partly "
+        "supported one is decided before it so it can never fall through to green"
+    )
+
+
+def test_limit_skipped_and_failed_checks_read_differently(claim_support_source):
+    assert 'not_checked:         { label: "Not checked"' in claim_support_source
+    assert 'check_unavailable:   { label: "Check unavailable"' in claim_support_source
+    mapper = _slice(
+        claim_support_source, "export function claimStateKey(", "export const SUPPORT_HEADLINE",
+        "ClaimSupportSummary.jsx",
+    )
     assert '"check_unavailable"' in mapper and '"not_checked"' in mapper
 
 
 def test_the_answer_stays_visible_when_verification_is_incomplete(grid_app_source):
     # The summary is a sibling of the answer body, never a replacement for it.
     assert "<AnswerText text={msg.text} citations={msg.citations}" in grid_app_source
-    assert "<ClaimSupportSummary claims={msg.claims} citations={msg.citations} onOpen={handleCitation} />" in grid_app_source
+    assert _SUMMARY_MOUNT in grid_app_source
 
 
 def test_markers_are_not_called_invalid_before_verification_arrives(grid_app_source):
@@ -710,25 +750,26 @@ def test_suggestions_no_longer_parse_the_retired_sentinels(grid_app_source):
 
 
 @pytest.fixture(scope="module")
-def claim_summary_block(grid_app_source):
-    return _slice(
-        grid_app_source, "function ClaimSupportSummary(", "function DotsLoader(", "GridApp.jsx"
-    )
+def claim_summary_block(claim_support_source):
+    start = claim_support_source.find("export function ClaimSupportSummary(")
+    assert start != -1, "ClaimSupportSummary must be exported from its module"
+    return claim_support_source[start:]
 
 
 @pytest.fixture(scope="module")
 def answer_text_block(grid_app_source):
     return _slice(
-        grid_app_source, "function AnswerText(", "// What happened to one claim", "GridApp.jsx"
+        grid_app_source, "function AnswerText(", "function DotsLoader(", "GridApp.jsx"
     )
 
 
-def test_expanded_claim_text_is_rewritten_not_printed_raw(claim_summary_block):
+def test_expanded_claim_text_is_rewritten_not_printed_raw(grid_app_source, claim_summary_block):
     assert ">{claim.text}<" not in claim_summary_block, (
         "printing the model's claim verbatim as a JSX child exposes its raw "
         "[Cn] registry ids"
     )
-    assert "<AnswerText text={claim.text} citations={citations}" in claim_summary_block, (
+    assert "<ClaimText text={claim.text} citations={citations}" in claim_summary_block
+    assert "ClaimText={AnswerText}" in grid_app_source, (
         "claim rows must go through the same public-number rewriter as the "
         "answer body"
     )
@@ -737,7 +778,10 @@ def test_expanded_claim_text_is_rewritten_not_printed_raw(claim_summary_block):
 def test_the_summary_receives_the_citations_it_needs_to_rewrite_with(
     grid_app_source, claim_summary_block
 ):
-    assert "function ClaimSupportSummary({ claims, citations, onOpen })" in grid_app_source
+    assert claim_summary_block.startswith(
+        "export function ClaimSupportSummary({ claims, citations, onOpen, ClaimText = PlainClaimText })"
+    )
+    assert _SUMMARY_MOUNT in grid_app_source
     assert "onOpen={onOpen}" in claim_summary_block
 
 
@@ -806,10 +850,8 @@ def test_source_cards_keep_name_locator_excerpt_and_open_source(grid_app_source)
 # --- Final round: generic framing does not turn a cited answer wholly red --
 
 
-def test_a_cited_answer_is_not_made_wholly_red_by_one_framing_sentence(grid_app_source):
-    chooser = _slice(
-        grid_app_source, "function supportHeadlineKey(", "function ClaimSupportSummary(", "GridApp.jsx"
-    )
+def test_a_cited_answer_is_not_made_wholly_red_by_one_framing_sentence(claim_support_source):
+    chooser = _headline_chooser(claim_support_source)
     assert "if (unsupported > 0 && supported === 0) return \"unsupported\";" in chooser, (
         "red is reserved for an answer with no supported claim at all"
     )
@@ -819,14 +861,12 @@ def test_a_cited_answer_is_not_made_wholly_red_by_one_framing_sentence(grid_app_
     )
 
 
-def test_a_mixed_answer_says_some_claims_need_checking(grid_app_source):
-    assert '"Some claims in this answer need checking"' in grid_app_source
+def test_a_mixed_answer_says_some_claims_need_checking(claim_support_source):
+    assert '"Some claims in this answer need checking"' in claim_support_source
 
 
-def test_zero_supported_claims_stays_red(grid_app_source):
-    chooser = _slice(
-        grid_app_source, "function supportHeadlineKey(", "function ClaimSupportSummary(", "GridApp.jsx"
-    )
+def test_zero_supported_claims_stays_red(claim_support_source):
+    chooser = _headline_chooser(claim_support_source)
     unsupported_rule = chooser.index('supported === 0) return "unsupported"')
     mixed_rule = chooser.index('if (unsupported > 0) return "mixed"')
     assert unsupported_rule < mixed_rule, (
@@ -835,15 +875,14 @@ def test_zero_supported_claims_stays_red(grid_app_source):
     )
 
 
-def test_headline_precedence_still_puts_the_worst_case_first(grid_app_source):
-    chooser = _slice(
-        grid_app_source, "function supportHeadlineKey(", "function ClaimSupportSummary(", "GridApp.jsx"
-    )
+def test_headline_precedence_still_puts_the_worst_case_first(claim_support_source):
+    chooser = _headline_chooser(claim_support_source)
     order = [
         chooser.index('return "unsupported"'),
         chooser.index('return "mixed"'),
         chooser.index('return "unavailable"'),
         chooser.index('return "incomplete"'),
+        chooser.index('return "partial"'),
         chooser.index('return "supported"'),
     ]
     assert order == sorted(order)
@@ -855,9 +894,12 @@ def test_detailed_claim_statuses_are_never_hidden(claim_summary_block):
     assert "{state.label}" in claim_summary_block
 
 
-def test_an_evidence_mismatch_reads_differently_from_an_uncited_claim(grid_app_source):
-    assert 'evidence_mismatch:   { label: "Cited source does not state this"' in grid_app_source
-    mapper = _slice(grid_app_source, "function claimStateKey(", "const SUPPORT_HEADLINE", "GridApp.jsx")
+def test_an_evidence_mismatch_reads_differently_from_an_uncited_claim(claim_support_source):
+    assert 'evidence_mismatch:   { label: "Cited source does not state this"' in claim_support_source
+    mapper = _slice(
+        claim_support_source, "export function claimStateKey(", "export const SUPPORT_HEADLINE",
+        "ClaimSupportSummary.jsx",
+    )
     assert 'if (claim.reason === "evidence_terms_missing") return "evidence_mismatch";' in mapper, (
         "a claim whose cited source does not state it is not the same failure "
         "as a claim that cited nothing"

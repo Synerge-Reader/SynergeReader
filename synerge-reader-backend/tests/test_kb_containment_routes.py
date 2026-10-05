@@ -619,10 +619,12 @@ _ANSWER_TOKENS = ("The term ", "is stated in ", "the document [C1].")
 
 
 class _FakeGeneration:
-    """A streamed /api/generate response: NDJSON lines cut into small chunks."""
+    """A streamed /api/generate response: NDJSON lines cut into small chunks,
+    ending with Ollama's final ``done`` record as the real server sends it."""
 
     def __init__(self, tokens):
         self._payload = "".join(json.dumps({"response": token}) + "\n" for token in tokens)
+        self._payload += json.dumps({"response": "", "done": True, "done_reason": "stop"}) + "\n"
 
     def __enter__(self):
         return self

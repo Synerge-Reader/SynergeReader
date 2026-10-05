@@ -18,7 +18,14 @@ class SelectionContext(BaseModel):
 class AskRequest(BaseModel):
     selected_text: str = ""
     question: str
-    model: str
+    # Legacy compatibility input only. Older clients send a model tag here; the
+    # backend never forwards it and never lets it choose a model -- every
+    # answer uses the backend-resolved profile.
+    model: Optional[str] = None
+    # An explicit backend model profile id (e.g. "llama_control"). Honoured
+    # only for a caller the backend itself identifies as an active admin;
+    # anyone else sending it is refused before any evidence or model is used.
+    model_profile_id: Optional[str] = Field(default=None, min_length=1, max_length=64)
     auth_token: Optional[str] = None
     active_document_name: Optional[str] = None
     selections: List[SelectionContext] = Field(default_factory=list)

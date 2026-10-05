@@ -57,6 +57,19 @@ from typing import List, Optional
 from dbSetup import VectorSchemaError,init_db,connect_to_postgres,test_postgres_connection
 from rag_model_profiles import resolve_embedding_profile
 from ollama_embedding_provider import EmbeddingProviderError, OllamaEmbeddingProvider
+from generation_profiles import (
+    AnswerGenerationSnapshot,
+    ModelIdentityMismatchError,
+    ModelIdentityUnavailableError,
+    ModelSelectionError,
+    OverrideNotPermittedError,
+    ProfileNotQualifiedError,
+    SelectionAuthorityUnavailableError,
+    UnknownModelProfileError,
+    default_model_registry,
+    resolve_answer_generation,
+)
+from ollama_generation import FAILURE_OUTPUT_LIMIT, OllamaGenerateStream
 import requests
 import json
 import time
@@ -116,7 +129,13 @@ OLLAMA_FALLBACK_HOSTS = [
 ]
 OLLAMA_CONNECT_TIMEOUT = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "1.5"))
 OLLAMA_READ_TIMEOUT = float(os.getenv("OLLAMA_READ_TIMEOUT", "60"))
+# Embedding keep-alive only. Generation calls take theirs from the model
+# registry below, never from the environment or a request.
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
+# The one source of answer, verifier and helper model settings. Pure data,
+# built at import: no request can add a tag, change an option, or redirect a
+# call. See generation_profiles.py.
+_MODEL_REGISTRY = default_model_registry()
 _ACTIVE_OLLAMA_BASE_URL = None
 _OLLAMA_HEALTH_CHECKED_AT = 0
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -172,7 +191,14 @@ def get_active_ollama_base_url() -> str:
     raise RuntimeError("Ollama is not reachable. Checked " + " | ".join(errors))
 
 
-def post_ollama(endpoint: str, payload: dict, *, stream: bool = False, timeout: int = 60):
+def post_ollama(endpoint: str, payload: dict, *, stream: bool = False, timeout: float = 60):
+    """POST to the active local Ollama endpoint.
+
+    ``timeout`` is the Requests READ timeout: the longest wait for any one
+    read, including the first response byte (which covers a cold model load).
+    The connect timeout stays the short OLLAMA_CONNECT_TIMEOUT. It bounds each
+    wait, not the whole streamed answer, whose length num_predict bounds.
+    """
     base_url = get_active_ollama_base_url()
     return requests.post(
         f"{base_url}{endpoint}",
@@ -446,24 +472,13 @@ def auto_save_to_kb(question: str, answer: str, source: str = "auto"):
         print(f"[KB] Auto-save failed (non-critical): {e}")
 
 
-def _pick_kb_generation_model(base_url: str) -> Optional[str]:
-    generation_models = [
-        "saul-instruct:latest", "llama3.1:latest", "llama3.1:8b",
-        "llama3:latest", "mistral:latest", "qwen2.5:latest",
-        "qwen2.5:7b", "phi3:latest", "gemma2:latest", "gemma:latest",
-    ]
-    for model in generation_models:
-        try:
-            test = requests.post(
-                f"{base_url}/api/generate",
-                json={"model": model, "prompt": "Say OK", "stream": False},
-                timeout=(3, 20),
-            )
-            if test.status_code == 200 and test.json().get("response"):
-                return model
-        except Exception:
-            continue
-    return None
+# Background helper calls use the registry's fixed, bounded Llama call. They
+# used to probe a list of tags (several of them never approved) with a bare
+# "Say OK" generation each -- every probe could load a model at its default,
+# unbounded context -- and then send their temperature at the top level, where
+# Ollama ignores it.
+_KB_HELPER_TEMPERATURE = 0.2
+_INSIGHTS_HELPER_TEMPERATURE = 0.1
 
 
 def _generate_qa_pairs_from_text(text: str, label: str) -> List[dict]:
@@ -479,10 +494,7 @@ def _generate_qa_pairs_from_text(text: str, label: str) -> List[dict]:
         print(f"[KB] Ollama not reachable — skipping KB generation for {label}")
         return []
 
-    active_model = _pick_kb_generation_model(base_url)
-    if not active_model:
-        print(f"[KB] No text-generation model available for {label}")
-        return []
+    helper = _MODEL_REGISTRY.helper_call(_KB_HELPER_TEMPERATURE)
 
     mid = min(len(text) // 2, 4000)
     excerpts = [text[:4000].strip(), text[mid:mid + 4000].strip()]
@@ -514,7 +526,7 @@ Start with Q:"""
         try:
             resp = requests.post(
                 f"{base_url}/api/generate",
-                json={"model": active_model, "prompt": prompt, "stream": False, "temperature": 0.2},
+                json=helper.ollama_payload(prompt, stream=False),
                 timeout=(5, 120),
             )
             resp.raise_for_status()
@@ -641,10 +653,7 @@ def _extract_document_insights(doc_id: int, filename: str, text: str):
         print(f"[Insights] Ollama not reachable — skipping insight extraction for {filename}")
         return
 
-    active_model = _pick_kb_generation_model(base_url)
-    if not active_model:
-        print(f"[Insights] No text-generation model available for {filename}")
-        return
+    helper = _MODEL_REGISTRY.helper_call(_INSIGHTS_HELPER_TEMPERATURE)
 
     excerpt = text[:6000].strip()
     prompt = f"""Read the legal document excerpt below and respond with ONLY a JSON object — no markdown, no commentary, no code fences. Use exactly this shape:
@@ -664,7 +673,7 @@ JSON:"""
     try:
         resp = requests.post(
             f"{base_url}/api/generate",
-            json={"model": active_model, "prompt": prompt, "stream": False, "temperature": 0.1},
+            json=helper.ollama_payload(prompt, stream=False),
             timeout=(5, 120),
         )
         resp.raise_for_status()
@@ -1243,7 +1252,7 @@ def _claim_verifier_status(reply: object) -> Optional[str]:
     return word if word in _CLAIM_VERIFIER_WORDS else None
 
 
-def _ollama_claim_verifier(claim: str, records, model: str) -> Optional[str]:
+def _ollama_claim_verifier(claim: str, records, verifier) -> Optional[str]:
     """Local-only claim verification against the cited evidence.
 
     Reads each record's INTERNAL ``evidence_text`` -- the same text the answer
@@ -1253,25 +1262,110 @@ def _ollama_claim_verifier(claim: str, records, model: str) -> Optional[str]:
     document looks like. The verifier's own result stays public-safe: it
     returns one status word, and the claim payload carries only citation ids.
 
+    ``verifier`` is the registry's fixed Llama call (model, bounded options,
+    keep_alive), the same for every answer profile; a request cannot change it.
     Runs through the same local Ollama transport as generation and nothing
     else. A transport or model failure raises, and a reply that is not exactly
-    one status returns None; citation_generation turns either into
-    ``unverified`` -- it can never become ``supported``.
+    one status -- including one cut off at the output limit -- returns None;
+    citation_generation turns either into ``unverified``, never ``supported``.
+    Only the ``response`` field is read, so separate thinking text is ignored.
     """
     evidence = "\n\n".join(
         f"[{record.citation_id}] {record.evidence_text}" for record in records
     )
     prompt = _CLAIM_VERIFIER_PROMPT.format(evidence=evidence, claim=claim.strip())
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": 0.0},
-        "keep_alive": OLLAMA_KEEP_ALIVE,
-    }
-    response = post_ollama("/api/generate", payload, timeout=30)
+    response = post_ollama("/api/generate", verifier.ollama_payload(prompt), timeout=30)
     response.raise_for_status()
-    return _claim_verifier_status(response.json().get("response"))
+    body = response.json()
+    if not isinstance(body, dict):
+        return None
+    if "error" in body:
+        # Fixed text: the server's error string is never carried along.
+        raise RuntimeError("verifier reported an error")
+    if body.get("done_reason") == "length":
+        return None
+    return _claim_verifier_status(body.get("response"))
+
+
+def _caller_is_admin(auth_token: Optional[str]) -> bool:
+    """Trusted admin authority for an explicit model override.
+
+    The caller's own token is looked up against the active-account is_admin
+    flag -- the same lookup every admin route uses. Nothing the client sends
+    about its role is read. A lookup that cannot complete raises, and the
+    selection then fails closed with a 503 instead of guessing.
+    """
+    if not auth_token:
+        return False
+    connection = connect_to_postgres()
+    if connection is None:
+        raise RuntimeError("admin lookup unavailable")
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        cursor.execute(_ACTIVE_ADMIN_FLAG_BY_TOKEN, (auth_token,))
+        row = cursor.fetchone()
+        return bool(row and row[0])
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
+def _installed_model_digest(model_tag: str) -> Optional[str]:
+    """The manifest digest Ollama lists for exactly this tag, or None.
+
+    Read-only (``/api/tags``) and only consulted for a qualified, non-default
+    profile, so ordinary answers make no extra request.
+    """
+    base_url = get_active_ollama_base_url()
+    response = requests.get(f"{base_url}/api/tags", timeout=(OLLAMA_CONNECT_TIMEOUT, 5))
+    response.raise_for_status()
+    for model in response.json().get("models", []):
+        if model.get("name") == model_tag or model.get("model") == model_tag:
+            return model.get("digest")
+    return None
+
+
+# Fixed refusals for an explicit model selection. Only the class of the
+# selection error is used; no exception text reaches the response.
+_MODEL_SELECTION_REFUSALS = {
+    OverrideNotPermittedError: (403, "Model selection requires an administrator account."),
+    UnknownModelProfileError: (400, "Unknown model profile."),
+    ProfileNotQualifiedError: (409, "That model profile is not qualified for selection."),
+    ModelIdentityMismatchError: (409, "That model is not installed with its qualified identity."),
+    SelectionAuthorityUnavailableError: (503, "Could not verify your session. Please try again shortly."),
+    ModelIdentityUnavailableError: (503, "Could not verify the model. Please try again shortly."),
+}
+
+
+def _resolve_answer_generation(request: AskRequest) -> AnswerGenerationSnapshot:
+    """The model, options and verifier for one answer, fixed before it starts.
+
+    An omitted ``model_profile_id`` resolves the backend default. The legacy
+    ``request.model`` string is deliberately not read: it never selects or
+    reaches a model. An explicit profile is honoured only for a trusted admin,
+    and every refusal is an HTTP error raised before any evidence is read or
+    any model is called.
+    """
+    refusal = None
+    try:
+        return resolve_answer_generation(
+            _MODEL_REGISTRY,
+            requested_profile_id=request.model_profile_id,
+            caller_is_admin=lambda: _caller_is_admin(request.auth_token),
+            installed_digest=_installed_model_digest,
+        )
+    except ModelSelectionError as exc:
+        refusal = _MODEL_SELECTION_REFUSALS.get(type(exc), (503, "Model selection is unavailable."))
+    # Raised outside the except block so nothing chains onto the HTTP error.
+    raise HTTPException(*refusal)
 
 
 def _resolve_citations(
@@ -1308,9 +1402,14 @@ async def ask_question(request: AskRequest):
     # calls no model, and writes no history row. The answer's history row
     # belongs to exactly this caller.
     caller_id = _resolve_caller_id(request.auth_token)
+    # The answer model, its native options and the verifier are resolved once,
+    # here, before anything streams: an explicit profile from a non-admin is
+    # refused before any evidence is read or any model is called, and nothing
+    # that happens later can change what this answer is generated with.
+    generation = _resolve_answer_generation(request)
 
     def verify_claim(claim, records):
-        return _ollama_claim_verifier(claim, records, request.model)
+        return _ollama_claim_verifier(claim, records, generation.verifier)
 
     def build_evidence():
         """Plan the evidence and register its citations. Authorization-scoped."""
@@ -1344,16 +1443,10 @@ async def ask_question(request: AskRequest):
                 mode=planning.mode.value,
                 truncated=planning.bundle.truncated,
                 warnings=planning.warnings,
+                generation=generation.public_metadata(),
             )
 
-            payload = {
-                "model": request.model,
-                "prompt": prompt,
-                "max_tokens": 1000,
-                "temperature": 0.7,
-                "stream": True,
-                "keep_alive": OLLAMA_KEEP_ALIVE,
-            }
+            payload = generation.ollama_payload(prompt, stream=True)
         except EmbeddingProviderError:
             yield '{"type": "error", "code": "search_unavailable", "message": "Search is temporarily unavailable. Please try again shortly."}\n'
             yield '{"type": "done", "ok": false}\n'
@@ -1364,37 +1457,25 @@ async def ask_question(request: AskRequest):
             yield '{"type": "done", "ok": false}\n'
             return
 
+        # Only "response" text becomes the answer; thinking, error lines and
+        # the final metrics record are handled by the reader (see
+        # ollama_generation.py), which also survives split lines and split
+        # multi-byte characters.
+        generated = OllamaGenerateStream()
         try:
-            with post_ollama("/api/generate", payload, stream=True, timeout=60) as r:
+            # Per-profile, finite read timeout from the snapshot: a cold Gemma
+            # load alone exceeded the 60 s Llama keeps.
+            with post_ollama(
+                "/api/generate", payload, stream=True, timeout=generation.answer_read_timeout_s
+            ) as r:
                 r.raise_for_status()
-                buffer = ""
                 for chunk in r.iter_content(decode_unicode=True, chunk_size=32):
-                    if chunk:
-                        if isinstance(chunk, bytes):
-                            chunk = chunk.decode("utf-8")
-                        buffer += chunk
-                        # Process complete JSON objects (lines ending with \n)
-                        while "\n" in buffer:
-                            line, buffer = buffer.split("\n", 1)
-                            if line:
-                                try:
-                                    data = json.loads(line)
-                                    token = data.get("response", "")
-                                    if token:
-                                        answer_parts.append(token)
-                                        yield delta_event(token)
-                                except Exception:
-                                    continue
-                # Handle any remaining buffered data
-                if buffer:
-                    try:
-                        data = json.loads(buffer)
-                        token = data.get("response", "")
-                        if token:
-                            answer_parts.append(token)
-                            yield delta_event(token)
-                    except Exception:
-                        pass
+                    for token in generated.feed(chunk):
+                        answer_parts.append(token)
+                        yield delta_event(token)
+                for token in generated.close():
+                    answer_parts.append(token)
+                    yield delta_event(token)
         except Exception as e:
             stream_error = True
             response = getattr(e, "response", None)
@@ -1403,9 +1484,35 @@ async def ask_question(request: AskRequest):
             else:
                 yield '{"type": "error", "code": "generation_unreachable", "message": "The local LLM server is not reachable. Start Ollama or update OLLAMA_BASE_URL / OLLAMA_PORT in .env."}\n'
 
-        if stream_error or not answer_parts:
+        # Counts only, never content: lets an operator compare the prompt the
+        # server evaluated with the requested context and spot output limits.
+        print(
+            f"[Ask] generation profile={generation.profile_id} "
+            f"failure={generated.failure} done_reason={generated.done_reason} "
+            f"prompt_eval_count={generated.metrics.get('prompt_eval_count')} "
+            f"eval_count={generated.metrics.get('eval_count')} "
+            f"thinking_chars={generated.thinking_chars}"
+        )
+
+        if not stream_error and generated.failure is not None:
+            # The server reported an error, a line was corrupt, the final
+            # record never came, or the output limit cut the answer off. Text
+            # may have streamed, but it is not a finished answer.
+            stream_error = True
+            code = (
+                "generation_output_limit"
+                if generated.failure == FAILURE_OUTPUT_LIMIT
+                else "generation_incomplete"
+            )
+            yield error_event(**safe_error(code))
+
+        if stream_error or not "".join(answer_parts).strip():
             # An interrupted or empty generation must never terminate as a
-            # success: done carries ok=false and no entry id is written.
+            # success: done carries ok=false and no entry id is written. A
+            # reply with no answer text (for example thinking only, or only
+            # whitespace) says so.
+            if not stream_error:
+                yield error_event(**safe_error("generation_empty"))
             yield done_event(ok=False)
             return
 

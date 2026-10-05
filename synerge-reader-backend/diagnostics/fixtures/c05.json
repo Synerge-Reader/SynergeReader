@@ -1,0 +1,10 @@
+{
+  "fixture_id": "C05",
+  "fixture_revision": 2,
+  "question": "What conditions terminate IRCoT, and what limits were used for reasoning steps and collected paragraphs in the experiments?",
+  "task_prefix": "none (Research & Q&A mode)",
+  "evidence_supply": "manual_evidence",
+  "prompt_evidence_mode": "hybrid_retrieval",
+  "evidence_file": "ircot_page4_evidence.json",
+  "evidence_text_sha256": "0bc45a825ae0a2bce85877d30f6a6fcced4802713bf3fb66db9b13af50f9c8c7"
+}

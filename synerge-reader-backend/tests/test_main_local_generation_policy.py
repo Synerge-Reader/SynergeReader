@@ -154,8 +154,12 @@ def test_local_generation_call_retains_required_structure(main_tree):
     keywords = {keyword.arg: keyword.value for keyword in call.keywords}
     assert isinstance(keywords.get("stream"), ast.Constant)
     assert keywords["stream"].value is True
-    assert isinstance(keywords.get("timeout"), ast.Constant)
-    assert keywords["timeout"].value == 60
+    # The read timeout is the resolved profile's finite value, taken from the
+    # per-answer snapshot -- never a request field. Its values reaching the
+    # transport are proven in tests/test_answer_model_selection.py.
+    timeout = keywords.get("timeout")
+    assert isinstance(timeout, ast.Attribute) and timeout.attr == "answer_read_timeout_s"
+    assert isinstance(timeout.value, ast.Name) and timeout.value.id == "generation"
 
     assert any(
         isinstance(candidate, ast.With)
@@ -253,8 +257,9 @@ def test_failed_or_empty_generation_guard_precedes_chat_history_persistence(main
                 and values[0].id == "stream_error"
                 and isinstance(values[1], ast.UnaryOp)
                 and isinstance(values[1].op, ast.Not)
-                and isinstance(values[1].operand, ast.Name)
-                and values[1].operand.id == "answer_parts"
+                # Whitespace-only output is empty too: the guard must test
+                # "".join(answer_parts).strip(), not just the list.
+                and ast.unparse(values[1].operand) == "''.join(answer_parts).strip()"
                 and any(isinstance(node, ast.Return) for node in statement.body)
             )
             if is_required_guard:

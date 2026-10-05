@@ -1,0 +1,10 @@
+{
+  "evidence_id": "ircot-page4-normalized-v1",
+  "filename": "IR-CoT.pdf",
+  "page_start": 4,
+  "page_end": 4,
+  "source_kind": "normalized_excerpt",
+  "provenance_note": "Supplied by the operator and verified against physical PDF page 4 of the public IRCoT paper. Punctuation, spacing and footnote placement are normalized and the footnote labels are part of that supplied normalization. This is NOT a byte-exact whole-page extraction, and it does not show what the production prompt contained.",
+  "excerpt_scope_note": "A normalized relevant excerpt in the page's reading order, with footnotes 4 and 5 placed after the body sentences. It is not a byte-exact whole-page extraction.",
+  "text": "IRCoT interleaves chain-of-thought (CoT) generation and retrieval steps to guide the retrieval by CoT and vice-versa.\nIf the generated CoT sentence has the 'answer is:' string or the maximum number of steps has been reached, we terminate the process and return all collected paragraphs as the retrieval result.\nThe CoT-guided retrieval step ('Retrieve') uses the last generated CoT sentence as a query to retrieve more paragraphs and adds them to the collected paragraphs. We cap the total number of collected paragraphs so as to fit in at least a few demonstrations in the model's context limit.\nFootnote 4 (maximum steps): set to 8 in our experiments.\nFootnote 5 (collected paragraphs): set to 15 in our experiments."
+}

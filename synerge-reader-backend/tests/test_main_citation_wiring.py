@@ -82,6 +82,8 @@ from citation_generation import (
     generate_citations,
     safe_error,
 )
+from generation_profiles import default_model_registry, resolve_answer_generation
+from ollama_generation import FAILURE_OUTPUT_LIMIT, OllamaGenerateStream
 
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -233,10 +235,12 @@ class _FakeConnection:
 
 
 class _FakeGenerationStream:
-    """A streamed /api/generate response: NDJSON lines cut into small chunks."""
+    """A streamed /api/generate response: NDJSON lines cut into small chunks,
+    ending with Ollama's final ``done`` record as the real server sends it."""
 
     def __init__(self, tokens):
         self._payload = "".join(json.dumps({"response": token}) + "\n" for token in tokens)
+        self._payload += json.dumps({"response": "", "done": True, "done_reason": "stop"}) + "\n"
 
     def __enter__(self):
         return self
@@ -321,6 +325,17 @@ def _route_harness(main_tree, connection, verifier_reply="supported", kb_entries
             return _FakeGenerationStream(_ANSWER_TOKENS)
         return _FakeVerifierResponse(verifier_reply)
 
+    # The real default resolution (no explicit profile). Admin authority and
+    # installed-model lookups are never consulted on this path; route-level
+    # selection is proven in tests/test_answer_model_selection.py.
+    def resolve_answer_generation_default(request):
+        return resolve_answer_generation(
+            default_model_registry(),
+            requested_profile_id=None,
+            caller_is_admin=lambda: pytest.fail("no admin lookup for a default answer"),
+            installed_digest=lambda tag: pytest.fail("no inventory lookup for a default answer"),
+        )
+
     namespace = {
         "app": SimpleNamespace(post=lambda path: (lambda function: function)),
         "AskRequest": object,
@@ -333,6 +348,9 @@ def _route_harness(main_tree, connection, verifier_reply="supported", kb_entries
         "json": json,
         "datetime": datetime,
         "post_ollama": post_ollama,
+        "OllamaGenerateStream": OllamaGenerateStream,
+        "FAILURE_OUTPUT_LIMIT": FAILURE_OUTPUT_LIMIT,
+        "_resolve_answer_generation": resolve_answer_generation_default,
         "connect_to_postgres": lambda: connection,
         "_resolve_caller_id": resolve_caller_id,
         "_resolve_authorized_scope": resolve_authorized_scope,
@@ -856,15 +874,17 @@ def test_the_runtime_claim_verifier_is_local_only(main_tree):
     ]
 
 
-def test_the_claim_verifier_sends_temperature_as_an_ollama_option(main_tree):
+def test_the_claim_verifier_sends_bounded_native_options(main_tree):
     """Ollama reads runtime generation settings from ``options`` and ignores an
-    unknown top-level ``temperature``, so the deterministic verifier setting
-    must travel there to take effect."""
+    unknown top-level ``temperature``, so the deterministic verifier setting,
+    its context window and its output cap must all travel there. The model is
+    the registry's fixed Llama verifier, never a request value, and no think
+    field is sent to it."""
     namespace, calls = _route_harness(main_tree, _FakeConnection())
     records = CitationRegistry.from_bundle(_evidence_bundle()).records
 
     status = namespace["_ollama_claim_verifier"](
-        "The term is three years [C1].", records, "local-verifier-model"
+        "The term is three years [C1].", records, default_model_registry().verifier_call()
     )
 
     assert status == "supported"
@@ -873,10 +893,10 @@ def test_the_claim_verifier_sends_temperature_as_an_ollama_option(main_tree):
     assert request.endpoint == "/api/generate"
     assert request.stream is False and request.timeout == 30
     assert set(request.payload) == {"model", "prompt", "stream", "options", "keep_alive"}
-    assert request.payload["options"] == {"temperature": 0.0}
-    assert request.payload["model"] == "local-verifier-model"
+    assert request.payload["options"] == {"temperature": 0.0, "num_ctx": 8192, "num_predict": 16}
+    assert request.payload["model"] == "llama3.1:8b"
     assert request.payload["stream"] is False
-    assert request.payload["keep_alive"] == "30m"
+    assert request.payload["keep_alive"] == "5m"
     assert "[C1] The agreement term is three years" in request.payload["prompt"]
 
 
@@ -888,7 +908,9 @@ _VERIFIED_CLAIM = "The term is three years [C1]."
 def _verifier_result(main_tree, reply):
     namespace, _ = _route_harness(main_tree, _FakeConnection(), reply)
     records = CitationRegistry.from_bundle(_evidence_bundle()).records
-    return namespace["_ollama_claim_verifier"](_VERIFIED_CLAIM, records, "local-verifier-model")
+    return namespace["_ollama_claim_verifier"](
+        _VERIFIED_CLAIM, records, default_model_registry().verifier_call()
+    )
 
 
 def _streamed_claims(main_tree, reply):

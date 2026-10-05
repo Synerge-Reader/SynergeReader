@@ -1,0 +1,31 @@
+{
+  "anchors_revision": 1,
+  "purpose": "Heuristic aid for the operator's manual grading. Never sent to a model: the harness reads this file only in --grade mode, after generation.",
+  "fixtures": {
+    "C04": {
+      "required_facts": [
+        "Expected: the method alternates between producing a reasoning (chain-of-thought) step and running a retrieval step.",
+        "Expected: each later retrieval is queried with the most recently produced reasoning sentence."
+      ],
+      "expected_citation_pages": [4],
+      "anchor_groups": [
+        {"fact": "alternates CoT generation", "any": ["chain[- ]of[- ]thought", "\\bCoT\\b", "reason"]},
+        {"fact": "alternates retrieval", "any": ["retriev"]},
+        {"fact": "query is the last generated CoT sentence", "all": ["\\b(last|latest|most recent(ly)?)\\b", "sentence"]}
+      ]
+    },
+    "C05": {
+      "required_facts": [
+        "Expected: stopping happens once a reasoning sentence contains the answer-is marker, or once the step budget is used up.",
+        "Expected: the experiments used a budget of eight reasoning steps and fifteen collected paragraphs."
+      ],
+      "expected_citation_pages": [4],
+      "anchor_groups": [
+        {"fact": "stops on the 'answer is' marker", "any": ["answer is"]},
+        {"fact": "stops at the maximum number of steps", "any": ["maximum (number of )?(reasoning )?steps", "max(imum)? (number of )?steps", "step limit", "number of steps"]},
+        {"fact": "8 reasoning steps", "any": ["\\b8\\b", "\\beight\\b"]},
+        {"fact": "15 collected paragraphs", "any": ["\\b15\\b", "\\bfifteen\\b"]}
+      ]
+    }
+  }
+}

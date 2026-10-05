@@ -112,7 +112,7 @@ npm start
 - **Retrieval and locators**: page-aware chunk locator metadata is persisted in the database and reconstructed by the backend's internal retrieval helper. The current `/ask` stream and frontend do not yet expose or render that locator metadata as user-visible citations, and not every `/ask` context-building mode calls vector retrieval (e.g. an active document or an explicit text selection is used directly).
 - **Embedding profile**: `main.py` wires every `EMBEDDING_*` variable through `resolve_embedding_profile(os.environ)` at startup. Leaving every `EMBEDDING_*` variable unset selects the documented mxbai/1024 default; using a different model (e.g. the Nomic/768 example) requires the complete explicit override described in `.env.example`. A complete override may match the existing column dimension without thereby establishing representation compatibility with the vectors already stored. An invalid, missing, malformed, wrong-count, wrong-dimension, non-finite, or all-zero embedding response fails closed rather than being persisted as a NULL or fabricated vector.
 - **Schema compatibility**: the last read-only production inventory reported both existing vector columns as 768-dimensional, so against that deployment the resolved profile's dimension must match or the backend refuses to start. A fresh database instead creates its vector columns from the resolved `expected_dimension`. Separately, `docker-compose.yml` defines six backend pass-through entries intended to carry the complete embedding-profile configuration, but actual Compose 1.29.2 resolution and propagation — including intentionally empty prefix values — remains unverified and is a release-gate check.
-- **Generation profile (foundation only)**: `rag_model_profiles.py` defines `GenerationProfile`/`resolve_generation_profile()` and the `GENERATION_*` variables, but nothing in `main.py` calls them yet — they are not wired into `/ask`. The generation model actually used today is the one selected in the request and sent directly to local Ollama; there is no external generation fallback.
+- **Answer model registry**: `generation_profiles.py` is the backend-owned registry of answer models (`llama_control` → `llama3.1:8b`, the unqualified control and default; `gemma_candidate` → `gemma4:31b`, which requires qualification and stays unselectable until combined-capacity and quality evidence are recorded — only its pinned digest and `think: false` behaviour are evidenced). Each profile pins the expected digest of its installed artifact; a qualification-required profile, explicit or default, answers only after its installed digest matches. `/ask` resolves the model once per answer and sends native Ollama `options` (temperature 0.2, `num_ctx` 8192, `num_predict` 1200, `keep_alive` 5m) to local Ollama with a per-profile read timeout (Llama 60 s, Gemma 150 s); there is no external generation fallback. A request's legacy `model` string is ignored, and an explicit `model_profile_id` is honoured only for an active admin. Claim verification and the background helpers always use a fixed, bounded Llama call. The older `GenerationProfile`/`GENERATION_*` definitions in `rag_model_profiles.py` remain unused by `/ask`.
 
 ## Configuration
 
@@ -121,7 +121,8 @@ npm start
 - `OLLAMA_HOST` and `OLLAMA_PORT`: Ollama connection host and port when no base URL is set
 - `OLLAMA_FALLBACK_HOSTS`: Comma-separated fallback hosts for local Ollama discovery
 - `EMBEDDING_*`: optional strict embedding profile override, wired through `resolve_embedding_profile(os.environ)` in `main.py` — see `.env.example` for the full set and the all-or-nothing rules that govern them
-- `GENERATION_*`: profile definitions exist in `rag_model_profiles.py` (`resolve_generation_profile()`), but this is foundation-only — nothing in `main.py` reads these yet, so setting them today has no effect on `/ask`
+- `GENERATION_*`: profile definitions exist in `rag_model_profiles.py` (`resolve_generation_profile()`), but nothing in `main.py` reads these, so setting them has no effect on `/ask`; answer models and their options come from `generation_profiles.py`
+- `OLLAMA_KEEP_ALIVE`: keep-alive for embedding requests only; generation keep-alive comes from the model registry
 - **Chunk size**: not environment-driven. `document_chunker.py` currently uses a code default of 500 characters per chunk with no overlap.
 - **File size limits**: not environment-driven, and enforced at two different layers with two different values — the current GridApp upload UI rejects files over 20MB client-side, while the backend's own parser (`document_parser.py`) accepts up to 50MB.
 
@@ -187,7 +188,6 @@ synerge-reader/
 
 - **Client-Visible Citations**: Return the already-persisted page locators through `/ask` and render them in the UI
 - **Page-Provenant Frontend Upload**: Send original PDF bytes (or page boundaries) from GridApp instead of flattened client-parsed text, so `/upload`'s existing page-aware parsing applies to the live UI path (E1a)
-- **Generation Profile Wiring**: Wire `resolve_generation_profile()`/`GENERATION_*` into `/ask` instead of the current per-request model selection
 - **Multi-Document Support**: Cross-document question answering
 - **Advanced Parsing**: Better PDF/DOCX formatting preservation
 - **User Authentication**: Multi-user support
@@ -208,7 +208,7 @@ synerge-reader/
 
 3. **Local LLM Errors**
    - Verify that the Ollama service is reachable using the configured connection settings
-   - Check that the requested generation model is installed in Ollama
+   - Check that the registry's answer model (`llama3.1:8b` by default) is installed in Ollama
 
 4. **Vector Search Issues**
    - Ensure PostgreSQL is running and the vector extension is enabled
