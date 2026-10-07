@@ -59,8 +59,8 @@ _SCOPE_OWNED = (
 )
 _LOAD_OWNED = "SELECT content FROM documents WHERE id = %s AND user_id = %s"
 _INSERT_HISTORY = (
-    "INSERT INTO chat_history (ts, selected_text, question, answer, user_id) "
-    "VALUES (%s, %s, %s, %s, %s) RETURNING id"
+    "INSERT INTO chat_history (ts, selected_text, question, answer, user_id, trace_id, answer_provenance) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id"
 )
 
 # token -> (user id, is_admin, active)

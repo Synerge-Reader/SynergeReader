@@ -70,6 +70,13 @@ from generation_profiles import (
     resolve_answer_generation,
 )
 from ollama_generation import FAILURE_OUTPUT_LIMIT, OllamaGenerateStream
+from answer_provenance import (
+    AnswerTimer,
+    answer_provenance_json,
+    build_answer_provenance,
+    new_trace_id,
+)
+from release_metadata import API_CONTRACT_VERSION, release_metadata_from_env
 import requests
 import json
 import time
@@ -106,7 +113,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="SynergeReader API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="SynergeReader API", version=API_CONTRACT_VERSION, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -136,6 +143,11 @@ OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 # built at import: no request can add a tag, change an option, or redirect a
 # call. See generation_profiles.py.
 _MODEL_REGISTRY = default_model_registry()
+# This deployment's release identity: the app version, the prompt versions,
+# and the build commit the release operator injected as SYNERGE_BUILD_SHA.
+# Read once at import. Git is never run here; a missing or malformed SHA is
+# reported as unknown. See release_metadata.py.
+_RELEASE = release_metadata_from_env(os.environ)
 _ACTIVE_OLLAMA_BASE_URL = None
 _OLLAMA_HEALTH_CHECKED_AT = 0
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -1211,6 +1223,9 @@ def _evidence_request_from_ask(request: AskRequest, scope: AuthorizedScope) -> E
     )
 
 
+# Versioned as CLAIM_SUPPORT_PROMPT_VERSION in release_metadata.py, separately
+# from the answer prompt; tests/test_release_metadata.py pins this template's
+# fingerprint, so editing it means bumping that version.
 _CLAIM_VERIFIER_PROMPT = (
     "You check whether a claim is supported by evidence excerpts.\n"
     "Answer with exactly one word: supported, partially_supported, or unsupported.\n"
@@ -1392,6 +1407,9 @@ def _resolve_citations(
 
 @app.post("/ask")
 async def ask_question(request: AskRequest):
+    # Server-measured milestones for this answer's provenance, all relative
+    # to this moment (monotonic, so wall-clock changes cannot skew them).
+    timer = AnswerTimer()
     answer_parts = []
     entry_id = None
     # Decides the prompt rules and whether claims are graded; evidence
@@ -1407,8 +1425,18 @@ async def ask_question(request: AskRequest):
     # refused before any evidence is read or any model is called, and nothing
     # that happens later can change what this answer is generated with.
     generation = _resolve_answer_generation(request)
+    # Fixed with the model snapshot, for the same reason: the provenance of
+    # this answer describes the release and embedding configuration it started
+    # under. The trace id is generated here, server-side, for this attempt; it
+    # is stored only with a successfully saved answer.
+    trace_id = new_trace_id()
+    release = _RELEASE
+    embedding_profile = _EMBEDDING_PROFILE
+    verifier_calls = 0
 
     def verify_claim(claim, records):
+        nonlocal verifier_calls
+        verifier_calls += 1
         return _ollama_claim_verifier(claim, records, generation.verifier)
 
     def build_evidence():
@@ -1463,6 +1491,7 @@ async def ask_question(request: AskRequest):
         # multi-byte characters.
         generated = OllamaGenerateStream()
         try:
+            timer.mark("generation_request_sent")
             # Per-profile, finite read timeout from the snapshot: a cold Gemma
             # load alone exceeded the 60 s Llama keeps.
             with post_ollama(
@@ -1471,11 +1500,14 @@ async def ask_question(request: AskRequest):
                 r.raise_for_status()
                 for chunk in r.iter_content(decode_unicode=True, chunk_size=32):
                     for token in generated.feed(chunk):
+                        timer.mark("first_answer_token")
                         answer_parts.append(token)
                         yield delta_event(token)
                 for token in generated.close():
+                    timer.mark("first_answer_token")
                     answer_parts.append(token)
                     yield delta_event(token)
+            timer.mark("generation_complete")
         except Exception as e:
             stream_error = True
             response = getattr(e, "response", None)
@@ -1487,7 +1519,7 @@ async def ask_question(request: AskRequest):
         # Counts only, never content: lets an operator compare the prompt the
         # server evaluated with the requested context and spot output limits.
         print(
-            f"[Ask] generation profile={generation.profile_id} "
+            f"[Ask] trace_id={trace_id} generation profile={generation.profile_id} "
             f"failure={generated.failure} done_reason={generated.done_reason} "
             f"prompt_eval_count={generated.metrics.get('prompt_eval_count')} "
             f"eval_count={generated.metrics.get('eval_count')} "
@@ -1521,6 +1553,7 @@ async def ask_question(request: AskRequest):
         citation_result = _resolve_citations(
             full_answer, registry, verify_claim, mode=answer_mode
         )
+        timer.mark("verification_complete")
         yield verification_event(
             [claim.to_dict() for claim in citation_result.claims],
             invalid_citation_ids=citation_result.invalid_citation_ids,
@@ -1530,13 +1563,31 @@ async def ask_question(request: AskRequest):
         conn = None
         committed = False
         try:
+            # Built only from the snapshot, the server's release metadata, the
+            # configured embedding profile, server timing and the finished
+            # stream -- nothing from the request. Built inside this try and
+            # written in the same INSERT as the answer, so either both are
+            # saved or neither is: a provenance failure saves no answer row.
+            provenance_json = answer_provenance_json(build_answer_provenance(
+                trace_id=trace_id,
+                release=release,
+                generation=generation,
+                answer_mode=answer_mode,
+                evidence_mode=planning.mode,
+                embedding_profile=embedding_profile,
+                timer=timer,
+                stream=generated,
+                verifier_calls=verifier_calls,
+            ))
+
             conn = connect_to_postgres()
             c = conn.cursor()
 
             c.execute(
                 """
-                INSERT INTO chat_history (ts, selected_text, question, answer, user_id)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO chat_history
+                    (ts, selected_text, question, answer, user_id, trace_id, answer_provenance)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 (
@@ -1545,6 +1596,8 @@ async def ask_question(request: AskRequest):
                     request.question,
                     full_answer,
                     caller_id,
+                    trace_id,
+                    provenance_json,
                 )
             )
 
@@ -2908,7 +2961,8 @@ async def admin_chat_history(
 
         c.execute(
             f"""
-            SELECT ch.id, ch.user_id, u.username, ch.ts, ch.question, ch.answer, ch.rating, ch.comment
+            SELECT ch.id, ch.user_id, u.username, ch.ts, ch.question, ch.answer, ch.rating, ch.comment,
+                   ch.trace_id, ch.answer_provenance
             FROM chat_history ch
             LEFT JOIN users u ON ch.user_id = u.id
             {where_sql}
@@ -2931,6 +2985,11 @@ async def admin_chat_history(
                     "answer": r[5],
                     "rating": r[6],
                     "comment": r[7],
+                    # Admin-only. Null on rows saved before provenance was
+                    # recorded: "not recorded", never the current release,
+                    # model, or prompt.
+                    "trace_id": str(r[8]) if r[8] is not None else None,
+                    "answer_provenance": r[9],
                 }
                 for r in rows
             ],
@@ -3570,6 +3629,19 @@ async def admin_system_status(token: Optional[str] = None):
 @app.get("/test")
 async def test_endpoint():
     return {"message": "SynergeReader API is running successfully!"}
+
+
+@app.get("/version")
+async def get_version():
+    """The deployed release identity, for the UI and the post-deploy check.
+
+    Public and read-only (served as /api/version behind nginx). The body is
+    exactly ReleaseMetadata.public_version(): version and build commit only --
+    no model inventory, profile names, paths, environment values, database
+    details, or endpoints. ``no-store`` keeps a browser or proxy from showing
+    a previous deployment's version after a release.
+    """
+    return JSONResponse(_RELEASE.public_version(), headers={"Cache-Control": "no-store"})
 
 
 # ------------------- Startup -------------------

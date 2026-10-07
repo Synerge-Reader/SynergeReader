@@ -47,6 +47,10 @@ jobs:
           echo "After step: $(whoami)"
       # 5️⃣ Build first while site is live, then do a quick swap
       - name: Build & Start Containers
+        # The exact commit actions/checkout checked out above. docker-compose
+        # forwards it to the backend, and /api/version must report it.
+        env:
+          SYNERGE_BUILD_SHA: ${{ github.sha }}
         run: |
           set -e
           echo "Before step: $(whoami)"

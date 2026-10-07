@@ -4,6 +4,7 @@ import { GlobalWorkerOptions } from "pdfjs-dist/build/pdf";
 import { renderAsync } from "docx-preview";
 import UserAuth from "./components/UserAuth/UserAuth";
 import { ClaimSupportSummary } from "./components/ClaimSupportSummary";
+import VersionBadge from "./components/VersionBadge";
 
 GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.js",
@@ -4154,6 +4155,12 @@ export default function GridApp() {
                 onMouseLeave={e => e.currentTarget.style.color = "#a8adbd"}
               ><IconUser width={15} height={15} />Sign In</button>
             )}
+
+            {/* server-reported release identity; renders nothing until /version answers */}
+            <VersionBadge backendUrl={BACKEND} style={{
+              padding: "8px 9px 0", fontSize: "10px", color: "#8b91a3",
+              fontFamily: UI_FONT, letterSpacing: ".02em", fontVariantNumeric: "tabular-nums",
+            }} />
           </div>
         </div>
       </div>

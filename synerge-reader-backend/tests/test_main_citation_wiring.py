@@ -84,6 +84,14 @@ from citation_generation import (
 )
 from generation_profiles import default_model_registry, resolve_answer_generation
 from ollama_generation import FAILURE_OUTPUT_LIMIT, OllamaGenerateStream
+from answer_provenance import (
+    AnswerTimer,
+    answer_provenance_json,
+    build_answer_provenance,
+    new_trace_id,
+)
+from rag_model_profiles import default_embedding_profile
+from release_metadata import release_metadata_from_env
 
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -351,6 +359,14 @@ def _route_harness(main_tree, connection, verifier_reply="supported", kb_entries
         "OllamaGenerateStream": OllamaGenerateStream,
         "FAILURE_OUTPUT_LIMIT": FAILURE_OUTPUT_LIMIT,
         "_resolve_answer_generation": resolve_answer_generation_default,
+        # Answer provenance is built from the real pure modules; its contents
+        # are proven in tests/test_answer_provenance_routes.py.
+        "AnswerTimer": AnswerTimer,
+        "new_trace_id": new_trace_id,
+        "build_answer_provenance": build_answer_provenance,
+        "answer_provenance_json": answer_provenance_json,
+        "_RELEASE": release_metadata_from_env({}),
+        "_EMBEDDING_PROFILE": default_embedding_profile(),
         "connect_to_postgres": lambda: connection,
         "_resolve_caller_id": resolve_caller_id,
         "_resolve_authorized_scope": resolve_authorized_scope,
