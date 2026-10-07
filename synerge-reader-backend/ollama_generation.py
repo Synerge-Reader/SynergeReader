@@ -1,8 +1,8 @@
-"""Reader for Ollama's native ``/api/generate`` NDJSON stream.
+"""Completion rules for Ollama's native ``/api/generate`` replies.
 
-Shared by the ``/ask`` route and the operator diagnostic harness, so both judge
-a generation by the same rules. Pure: it parses chunks it is handed and never
-opens a connection.
+Shared by the ``/ask`` route, the claim verifier, the background helpers and
+the operator diagnostic harness, so all of them judge a generation by the same
+rules. Pure: it parses what it is handed and never opens a connection.
 
 What it guarantees:
 
@@ -12,11 +12,18 @@ What it guarantees:
 * Network chunks may split a line, or a multi-byte UTF-8 character, anywhere.
   Bytes go through an incremental UTF-8 decoder rather than being decoded one
   chunk at a time.
-* A stream only counts as finished when Ollama's final ``"done": true`` record
-  arrived. An ``{"error": ...}`` line, a malformed line, a missing final
-  record, or ``done_reason == "length"`` (the output limit was reached) is
-  reported through ``failure``; after an error or malformed line no further
-  text is returned. Error text from the server is never kept.
+* A generation only counts as finished when Ollama's final record has
+  ``"done": true`` and ``done_reason`` is exactly ``"stop"`` (the model ended
+  its reply itself). An ``{"error": ...}`` line, a malformed line, a missing
+  final record, ``done_reason == "length"`` (the output limit was reached), or
+  any other completion reason -- missing, not a string, ``"load"``, or one
+  this module does not know -- is reported through ``failure``; after an error
+  or malformed line no further text is returned. Error text from the server is
+  never kept.
+
+Requiring ``"stop"`` assumes the target Ollama runtime reports it for a
+naturally finished native ``/api/generate`` reply. A runtime that reports
+anything else fails closed here; it is never treated as a success.
 """
 
 from __future__ import annotations
@@ -29,6 +36,12 @@ FAILURE_MODEL_ERROR = "model_error"
 FAILURE_MALFORMED = "malformed"
 FAILURE_INCOMPLETE = "incomplete"
 FAILURE_OUTPUT_LIMIT = "output_limit"
+
+# The only completion reason that makes a finished generation.
+COMPLETED_DONE_REASON = "stop"
+# Fixed text for a reply that carried an error. The server's error value is
+# never read into it, so it cannot carry paths, internals or model output.
+MODEL_ERROR_MESSAGE = "the model reported a generation error"
 
 # Counters and durations from the final record. Durations are nanoseconds.
 METRIC_FIELDS = (
@@ -141,4 +154,42 @@ class OllamaGenerateStream:
             return FAILURE_INCOMPLETE
         if self.done_reason == "length":
             return FAILURE_OUTPUT_LIMIT
+        if self.done_reason != COMPLETED_DONE_REASON:
+            # Missing, "load", or unknown: the final record arrived, but it
+            # does not say the model finished its reply.
+            return FAILURE_INCOMPLETE
         return None
+
+
+def completed_generate_response(body) -> Optional[str]:
+    """The ``response`` text of one finished non-streamed reply, or None.
+
+    For the claim verifier and the background helpers, which read a single
+    ``/api/generate`` JSON body rather than a stream. In order:
+
+    * a body that is not a JSON object returns None;
+    * a body with an ``error`` key raises RuntimeError with fixed text -- the
+      error value is never read -- so a caller can tell a model failure from
+      an unusable reply, whatever completion fields came with it;
+    * ``done`` must be exactly True and ``done_reason`` exactly ``"stop"``,
+      or the reply was not finished and None is returned;
+    * ``response`` must be a string with non-whitespace text, or None is
+      returned.
+
+    Otherwise the original ``response`` string is returned unchanged. A
+    separate ``thinking`` field is never read. Nothing is coerced or
+    normalized: ``"true"`` is not True and ``"STOP"`` is not ``"stop"``.
+    """
+    if not isinstance(body, dict):
+        return None
+    if "error" in body:
+        raise RuntimeError(MODEL_ERROR_MESSAGE)
+    if body.get("done") is not True:
+        return None
+    reason = body.get("done_reason")
+    if not isinstance(reason, str) or reason != COMPLETED_DONE_REASON:
+        return None
+    text = body.get("response")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return text

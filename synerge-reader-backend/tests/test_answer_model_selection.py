@@ -11,9 +11,11 @@ profile is refused for anonymous, ordinary, forged-role and suspended callers
 before any evidence is read or model called; a trusted admin may choose only a
 registered, qualified profile whose installed digest matches; resolution is
 fixed before streaming; generation options are native and bounded; separate
-thinking, model errors, malformed or unfinished streams and the output limit
-never produce a persisted success; verification uses the fixed Llama call;
-background helpers no longer probe models and are bounded.
+thinking, model errors, malformed or unfinished streams, the output limit and
+any completion reason other than "stop" never produce a persisted success;
+verification uses the fixed Llama call and grades only a finished reply;
+background helpers no longer probe models, are bounded, parse or store only a
+finished reply, and log fixed categories and counts rather than content.
 
 REQUIRES THE SOCKETPAIR-AWARE SIBLING GUARD (see test_main_route_harness.py):
 entering a TestClient builds a real asyncio loop.
@@ -679,6 +681,19 @@ _FAILING_STREAMS = {
         _ndjson({"response": "The lease "}) + '{"response": "te\n' + _ndjson(_DONE),
         "generation_incomplete",
     ),
+    # A final record arrived, with an answer streamed before it, but it does
+    # not say the model finished: only done_reason "stop" does.
+    "done-reason-missing": (
+        _ndjson({"response": _ANSWER}, {k: v for k, v in _DONE.items() if k != "done_reason"}),
+        "generation_incomplete",
+    ),
+    "done-reason-non-string": (_ndjson({"response": _ANSWER}, dict(_DONE, done_reason=7)), "generation_incomplete"),
+    "done-reason-load": (_ndjson({"response": _ANSWER}, dict(_DONE, done_reason="load")), "generation_incomplete"),
+    "done-reason-unknown": (
+        _ndjson({"response": _ANSWER}, dict(_DONE, done_reason="something_new")),
+        "generation_incomplete",
+    ),
+    "done-not-true": (_ndjson({"response": _ANSWER}, dict(_DONE, done="true")), "generation_incomplete"),
 }
 
 
@@ -722,7 +737,8 @@ def test_thinking_alongside_an_answer_is_kept_out_of_everything(client, db, olla
 @pytest.mark.parametrize(
     "body, expected",
     [
-        ({"thinking": "supported", "response": "unsupported", "done": True}, "unsupported"),
+        # A finished reply, so only the thinking/response split decides it.
+        ({"thinking": "supported", "response": "unsupported", "done": True, "done_reason": "stop"}, "unsupported"),
         ({"thinking": "supported", "response": "", "done": True}, None),
         ({"response": "supported", "done": True, "done_reason": "length"}, None),
         (["supported"], None),
@@ -755,6 +771,68 @@ def test_a_verifier_error_reply_is_unavailable_never_supported(client, db, ollam
         ("unverified", "verifier_unavailable")
     ]
     assert "/srv/secret" not in response.text
+
+
+# Each would read "supported" if completion were not checked.
+_UNFINISHED_VERIFIER_BODIES = {
+    "done-missing": {"response": "supported", "done_reason": "stop"},
+    "done-false": {"response": "supported", "done": False, "done_reason": "stop"},
+    "done-string": {"response": "supported", "done": "true", "done_reason": "stop"},
+    "reason-missing": {"response": "supported", "done": True},
+    "reason-non-string": {"response": "supported", "done": True, "done_reason": 7},
+    "reason-load": {"response": "supported", "done": True, "done_reason": "load"},
+    "reason-unknown": {"response": "supported", "done": True, "done_reason": "something_new"},
+    "blank-response": {"response": "   ", "done": True, "done_reason": "stop"},
+    "thinking-only-finished": {"thinking": "supported", "response": "", "done": True, "done_reason": "stop"},
+}
+
+
+@pytest.mark.parametrize("case", sorted(_UNFINISHED_VERIFIER_BODIES))
+def test_an_unfinished_verifier_reply_is_never_a_status(main_module, ollama, case):
+    ollama.verifier_body = _UNFINISHED_VERIFIER_BODIES[case]
+    records = [type("R", (), {"citation_id": "C1", "evidence_text": "Term: two years."})()]
+
+    status = main_module._ollama_claim_verifier(
+        "The term is two years [C1].", records, main_module._MODEL_REGISTRY.verifier_call()
+    )
+
+    assert status is None
+
+
+@pytest.mark.parametrize("case", ["done-false", "reason-missing", "reason-load", "reason-unknown"])
+def test_an_unfinished_verifier_reply_is_malformed_and_the_answer_still_saves(client, db, ollama, case):
+    ollama.verifier_body = _UNFINISHED_VERIFIER_BODIES[case]
+
+    response = _ask(client, "tok-alice", active_document_id=10)
+
+    events = _events(response)
+    assert events[-1] == {"type": "done", "ok": True}, "a verifier reply never decides the answer"
+    [verification] = [e for e in events if e["type"] == "verification"]
+    assert [(c["status"], c["reason"]) for c in verification["claims"]] == [
+        ("unverified", "verifier_malformed")
+    ]
+    assert len(ollama.verifications) == 1
+    assert [e["type"] for e in events if e["type"] == "entry_id"] == ["entry_id"]
+    [(_, params)] = db.inserts
+    assert params[3] == _ANSWER
+
+
+def test_a_verifier_error_outranks_its_completion_fields(client, db, ollama):
+    ollama.verifier_body = {
+        "error": "SECRET-VERIFIER-ERROR at /srv/models", "response": "supported",
+        "done": True, "done_reason": "stop",
+    }
+
+    response = _ask(client, "tok-alice", active_document_id=10)
+
+    events = _events(response)
+    assert events[-1] == {"type": "done", "ok": True}
+    [verification] = [e for e in events if e["type"] == "verification"]
+    assert [(c["status"], c["reason"]) for c in verification["claims"]] == [
+        ("unverified", "verifier_unavailable")
+    ]
+    assert "SECRET-VERIFIER-ERROR" not in response.text and "/srv/models" not in response.text
+    assert len(db.inserts) == 1
 
 
 # --- background helpers -------------------------------------------------------
@@ -815,3 +893,318 @@ def test_kb_pair_generation_is_bounded_and_never_probes(monkeypatch, main_module
     assert len(posts) == 2, "one call per excerpt and no probe calls"
     for post in posts:
         _assert_bounded_helper(post["json"], 0.2)
+
+
+# --- background helpers: only a finished reply is parsed or stored -----------
+
+
+class _HelperBody:
+    def __init__(self, body):
+        self._body = body
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._body
+
+
+def _helper_replies(monkeypatch, main_module, *replies):
+    """Serve each helper /api/generate call the next reply: a body, or an
+    exception the transport raises."""
+    posts = []
+    queue = list(replies)
+
+    def post(url, json=None, timeout=None):
+        posts.append({"url": url, "json": json})
+        reply = queue.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        return _HelperBody(reply)
+
+    monkeypatch.setattr(main_module, "get_active_ollama_base_url", lambda: "http://ollama.invalid")
+    monkeypatch.setattr(main_module.requests, "post", post)
+    return posts
+
+
+def _finished(text):
+    return {"response": text, "done": True, "done_reason": "stop"}
+
+
+def _unfinished_replies(text):
+    """Replies whose ``response`` would parse and be used if completion were
+    not checked first."""
+    return {
+        "done-missing": {"response": text, "done_reason": "stop"},
+        "done-false": {"response": text, "done": False, "done_reason": "stop"},
+        "reason-missing": {"response": text, "done": True},
+        "reason-non-string": {"response": text, "done": True, "done_reason": 7},
+        "reason-load": {"response": text, "done": True, "done_reason": "load"},
+        "reason-unknown": {"response": text, "done": True, "done_reason": "something_new"},
+        "reason-length": {"response": text, "done": True, "done_reason": "length"},
+        "blank-response": {"response": " \n\t", "done": True, "done_reason": "stop"},
+        "thinking-only": {"thinking": text, "response": "", "done": True, "done_reason": "stop"},
+        "not-an-object": [text],
+        "model-error": {"error": "runner crashed", "response": text, "done": True, "done_reason": "stop"},
+    }
+
+
+_UNFINISHED_CASES = sorted(_unfinished_replies(""))
+_INSIGHT_DOCUMENT_TEXT = "The lease term is two years. " * 20
+_REPLACEMENT_INSIGHTS = json.dumps(
+    {"doc_type": "Replacement", "keywords": ["new"], "facts": ["A replacement fact."], "entities": ["Bob"]}
+)
+_EXISTING_INSIGHT = (
+    "Lease", json.dumps(["lease term"]), json.dumps(["The term is two years."]),
+    json.dumps(["Alice"]), "2026-01-01T00:00:00",
+)
+
+
+class _InsightsTable:
+    """document_insights holding one existing valid row. The helper's
+    INSERT ... ON CONFLICT (document_id) DO UPDATE is applied on commit, the
+    way PostgreSQL would apply it, so an overwrite would be visible."""
+
+    def __init__(self, rows):
+        self.rows = dict(rows)
+        self.statements = []
+        self.connections = 0
+        self.commits = 0
+
+    def connect(self):
+        self.connections += 1
+        return _InsightsConnection(self)
+
+
+class _InsightsConnection:
+    def __init__(self, table):
+        self._table = table
+        self.pending = {}
+
+    def cursor(self):
+        return _InsightsCursor(self)
+
+    def commit(self):
+        self._table.rows.update(self.pending)
+        self.pending = {}
+        self._table.commits += 1
+
+    def rollback(self):
+        self.pending = {}
+
+    def close(self):
+        pass
+
+
+class _InsightsCursor:
+    def __init__(self, connection):
+        self._connection = connection
+
+    def execute(self, sql, params=()):
+        norm = " ".join(sql.split())
+        self._connection._table.statements.append(norm)
+        assert norm.startswith("INSERT INTO document_insights"), f"unexpected SQL: {norm}"
+        assert "ON CONFLICT (document_id) DO UPDATE" in norm
+        document_id, *values = params
+        self._connection.pending[document_id] = tuple(values)
+
+
+def test_a_finished_insight_reply_upserts_the_row(monkeypatch, main_module):
+    """Control for the test below: this fake really applies the upsert."""
+    table = _InsightsTable({10: _EXISTING_INSIGHT})
+    monkeypatch.setattr(main_module, "connect_to_postgres", table.connect)
+    _helper_replies(monkeypatch, main_module, _finished(_REPLACEMENT_INSIGHTS))
+
+    main_module._extract_document_insights(10, "alice-lease.txt", _INSIGHT_DOCUMENT_TEXT)
+
+    assert table.commits == 1 and len(table.statements) == 1
+    assert table.rows[10][:4] == (
+        "Replacement", json.dumps(["new"]), json.dumps(["A replacement fact."]), json.dumps(["Bob"])
+    )
+
+
+@pytest.mark.parametrize("case", _UNFINISHED_CASES)
+def test_an_unfinished_insight_reply_stores_nothing_and_keeps_the_existing_row(monkeypatch, main_module, case):
+    table = _InsightsTable({10: _EXISTING_INSIGHT})
+    monkeypatch.setattr(main_module, "connect_to_postgres", table.connect)
+    posts = _helper_replies(monkeypatch, main_module, _unfinished_replies(_REPLACEMENT_INSIGHTS)[case])
+
+    main_module._extract_document_insights(10, "alice-lease.txt", _INSIGHT_DOCUMENT_TEXT)
+
+    assert len(posts) == 1
+    assert table.connections == 0, "no database connection is opened for an unfinished reply"
+    assert table.statements == [] and table.commits == 0, "no INSERT and no ON CONFLICT update"
+    assert table.rows == {10: _EXISTING_INSIGHT}, "the existing valid row is untouched"
+
+
+def test_an_unfinished_insight_reply_leaves_the_document_answerable(monkeypatch, main_module, client, db, ollama):
+    connections_before, statements_before = len(db.connections), list(db.statements)
+    _helper_replies(
+        monkeypatch, main_module,
+        {"response": _REPLACEMENT_INSIGHTS, "done": True, "done_reason": "load"},
+    )
+
+    main_module._extract_document_insights(10, "alice-lease.txt", _INSIGHT_DOCUMENT_TEXT)
+
+    assert len(db.connections) == connections_before and db.statements == statements_before, (
+        "the insight helper issued no SQL, so the committed document is untouched"
+    )
+    response = _ask(client, "tok-alice", active_document_id=10)
+    events = _events(response)
+    assert events[-1] == {"type": "done", "ok": True}, "the document still answers"
+    assert len(db.inserts) == 1
+
+
+_QA_TEXT = "The lease term is two years. " * 400
+_QA_REPLY_ONE = "Q: What is the term?\nA: The term is two years in total."
+_QA_REPLY_TWO = "Q: Who is the tenant?\nA: Alice is the tenant of record."
+_QA_PAIR_ONE = {"question": "What is the term?", "answer": "The term is two years in total."}
+_QA_PAIR_TWO = {"question": "Who is the tenant?", "answer": "Alice is the tenant of record."}
+
+
+def test_finished_qa_replies_keep_every_pair(monkeypatch, main_module):
+    _helper_replies(monkeypatch, main_module, _finished(_QA_REPLY_ONE), _finished(_QA_REPLY_TWO))
+    assert main_module._generate_qa_pairs_from_text(_QA_TEXT, "label") == [_QA_PAIR_ONE, _QA_PAIR_TWO]
+
+
+@pytest.mark.parametrize("case", _UNFINISHED_CASES)
+def test_unfinished_qa_replies_contribute_no_pairs(monkeypatch, main_module, case):
+    posts = _helper_replies(
+        monkeypatch, main_module,
+        _unfinished_replies(_QA_REPLY_ONE)[case], _unfinished_replies(_QA_REPLY_TWO)[case],
+    )
+
+    assert main_module._generate_qa_pairs_from_text(_QA_TEXT, "label") == []
+    assert len(posts) == 2, "each excerpt was still asked once"
+
+
+@pytest.mark.parametrize("case", _UNFINISHED_CASES + ["transport-error"])
+@pytest.mark.parametrize("invalid_part", [1, 2])
+def test_only_finished_qa_replies_contribute_pairs(monkeypatch, main_module, case, invalid_part):
+    def invalid(text):
+        if case == "transport-error":
+            return main_module.requests.exceptions.ConnectionError("simulated")
+        return _unfinished_replies(text)[case]
+
+    if invalid_part == 1:
+        replies, expected = (invalid(_QA_REPLY_ONE), _finished(_QA_REPLY_TWO)), [_QA_PAIR_TWO]
+    else:
+        replies, expected = (_finished(_QA_REPLY_ONE), invalid(_QA_REPLY_TWO)), [_QA_PAIR_ONE]
+    _helper_replies(monkeypatch, main_module, *replies)
+
+    assert main_module._generate_qa_pairs_from_text(_QA_TEXT, "label") == expected
+
+
+# --- background helpers log categories and counts, never content -------------
+
+_PRIVATE = "PRIVATE-SENTINEL-3c9e"
+_PRIVATE_TEXT = f"{_PRIVATE} The lease term is two years and the tenant is {_PRIVATE}. " * 20
+_PRIVATE_INSIGHTS = json.dumps({
+    "doc_type": f"{_PRIVATE}-Lease",
+    "keywords": [f"{_PRIVATE}-keyword"],
+    "facts": [f"{_PRIVATE} pays rent monthly."],
+    "entities": [f"{_PRIVATE} Holdings"],
+})
+_PRIVATE_QA = f"Q: Who is {_PRIVATE}?\nA: {_PRIVATE} is the tenant of record here."
+
+
+def _assert_logs_are_private(capsys):
+    captured = capsys.readouterr()
+    for stream in (captured.out, captured.err):
+        assert _PRIVATE not in stream, f"private text reached a log line: {stream!r}"
+        assert "://" not in stream, f"an endpoint reached a log line: {stream!r}"
+    return captured.out
+
+
+def _private_failure(main_module, kind):
+    """A reply, or a transport exception, carrying private text and an endpoint."""
+    if kind == "transport-error":
+        return main_module.requests.exceptions.ConnectionError(
+            f"{_PRIVATE} http://ollama.internal:11434/api/generate refused"
+        )
+    if kind == "model-error":
+        return {"error": f"{_PRIVATE} out of memory at /srv/models/blob"}
+    if kind == "unfinished":
+        return {"response": _PRIVATE_INSIGHTS, "done": True, "done_reason": "load"}
+    if kind == "unparseable":
+        return _finished(f"{_PRIVATE} has no JSON here at all")
+    raise AssertionError(kind)
+
+
+def test_a_stored_insight_logs_counts_only(monkeypatch, main_module, capsys):
+    table = _InsightsTable({})
+    monkeypatch.setattr(main_module, "connect_to_postgres", table.connect)
+    _helper_replies(monkeypatch, main_module, _finished(_PRIVATE_INSIGHTS))
+    capsys.readouterr()
+
+    main_module._extract_document_insights(10, f"{_PRIVATE}-lease.pdf", _PRIVATE_TEXT)
+
+    assert table.commits == 1, "the insight was stored"
+    out = _assert_logs_are_private(capsys)
+    assert out.strip() == "[Insights] Stored: 1 keywords, 1 facts, 1 entities"
+
+
+@pytest.mark.parametrize("kind", ["transport-error", "model-error", "unfinished", "unparseable"])
+def test_a_failed_insight_logs_no_private_text(monkeypatch, main_module, capsys, kind):
+    table = _InsightsTable({})
+    monkeypatch.setattr(main_module, "connect_to_postgres", table.connect)
+    _helper_replies(monkeypatch, main_module, _private_failure(main_module, kind))
+    capsys.readouterr()
+
+    main_module._extract_document_insights(10, f"{_PRIVATE}-lease.pdf", _PRIVATE_TEXT)
+
+    assert table.statements == []
+    assert _assert_logs_are_private(capsys).strip(), "the failure is still logged"
+
+
+def test_an_insight_database_failure_logs_no_private_text(monkeypatch, main_module, capsys):
+    def refuse():
+        raise RuntimeError(f"{_PRIVATE} postgresql://user:pw@db.internal/synerge")
+
+    monkeypatch.setattr(main_module, "connect_to_postgres", refuse)
+    _helper_replies(monkeypatch, main_module, _finished(_PRIVATE_INSIGHTS))
+    capsys.readouterr()
+
+    main_module._extract_document_insights(10, f"{_PRIVATE}-lease.pdf", _PRIVATE_TEXT)
+
+    assert _assert_logs_are_private(capsys).strip() == "[Insights] Extraction failed (non-critical): RuntimeError"
+
+
+@pytest.mark.parametrize("helper", ["insights", "qa"])
+def test_an_unreachable_model_server_logs_no_private_text(monkeypatch, main_module, capsys, helper):
+    def unreachable():
+        raise RuntimeError(f"Ollama is not reachable. Checked http://10.0.0.5:11434: {_PRIVATE}")
+
+    monkeypatch.setattr(main_module, "get_active_ollama_base_url", unreachable)
+    capsys.readouterr()
+
+    if helper == "insights":
+        main_module._extract_document_insights(10, f"{_PRIVATE}-lease.pdf", _PRIVATE_TEXT)
+    else:
+        assert main_module._generate_qa_pairs_from_text(_PRIVATE_TEXT * 10, f"{_PRIVATE}.example") == []
+
+    assert _assert_logs_are_private(capsys).strip()
+
+
+def test_finished_qa_replies_log_counts_only(monkeypatch, main_module, capsys):
+    _helper_replies(monkeypatch, main_module, _finished(_PRIVATE_QA), _finished(_PRIVATE_QA))
+    capsys.readouterr()
+
+    pairs = main_module._generate_qa_pairs_from_text(_PRIVATE_TEXT * 10, f"{_PRIVATE}.example")
+
+    assert len(pairs) == 2 and all(_PRIVATE in pair["answer"] for pair in pairs), "the pairs keep their content"
+    _assert_logs_are_private(capsys)
+
+
+@pytest.mark.parametrize("kind", ["transport-error", "model-error", "unfinished"])
+def test_failed_qa_replies_log_no_private_text(monkeypatch, main_module, capsys, kind):
+    reply = _private_failure(main_module, kind)
+    if kind == "unfinished":
+        reply = {"response": _PRIVATE_QA, "done": True}
+    _helper_replies(monkeypatch, main_module, reply, reply)
+    capsys.readouterr()
+
+    pairs = main_module._generate_qa_pairs_from_text(_PRIVATE_TEXT * 10, f"{_PRIVATE}.example")
+
+    assert pairs == []
+    assert _assert_logs_are_private(capsys).strip(), "the failures are still logged"

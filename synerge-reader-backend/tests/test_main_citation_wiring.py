@@ -83,7 +83,11 @@ from citation_generation import (
     safe_error,
 )
 from generation_profiles import default_model_registry, resolve_answer_generation
-from ollama_generation import FAILURE_OUTPUT_LIMIT, OllamaGenerateStream
+from ollama_generation import (
+    FAILURE_OUTPUT_LIMIT,
+    OllamaGenerateStream,
+    completed_generate_response,
+)
 from answer_provenance import (
     AnswerTimer,
     answer_provenance_json,
@@ -265,14 +269,22 @@ class _FakeGenerationStream:
 
 
 class _FakeVerifierResponse:
-    def __init__(self, word):
-        self._word = word
+    """A non-streamed verifier reply. A word is sent as the ``response`` of a
+    finished generation (``done`` true, ``done_reason`` "stop"), as the real
+    server reports one, so the status parser is what these tests exercise. A
+    dict is sent as the whole body, so a test can send an unfinished or error
+    reply on purpose."""
+
+    def __init__(self, reply):
+        self._reply = reply
 
     def raise_for_status(self):
         pass
 
     def json(self):
-        return {"response": self._word}
+        if isinstance(self._reply, dict):
+            return dict(self._reply)
+        return {"response": self._reply, "done": True, "done_reason": "stop"}
 
 
 class _CapturedStreamingResponse:
@@ -358,6 +370,9 @@ def _route_harness(main_tree, connection, verifier_reply="supported", kb_entries
         "post_ollama": post_ollama,
         "OllamaGenerateStream": OllamaGenerateStream,
         "FAILURE_OUTPUT_LIMIT": FAILURE_OUTPUT_LIMIT,
+        # The real pure validator _ollama_claim_verifier now delegates to;
+        # its rules are proven in tests/test_ollama_generation.py.
+        "completed_generate_response": completed_generate_response,
         "_resolve_answer_generation": resolve_answer_generation_default,
         # Answer provenance is built from the real pure modules; its contents
         # are proven in tests/test_answer_provenance_routes.py.
@@ -998,6 +1013,56 @@ def test_a_negative_ambiguous_or_malformed_reply_never_yields_a_supported_claim(
     assert [(claim["status"], claim["reason"]) for claim in claims] == [
         ("unverified", "verifier_malformed")
     ]
+
+
+# --- the verifier's reply must also be a FINISHED generation ----------------
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"response": "supported", "done_reason": "stop"},
+        {"response": "supported", "done": False, "done_reason": "stop"},
+        {"response": "supported", "done": True},
+        {"response": "supported", "done": True, "done_reason": "load"},
+        {"response": "supported", "done": True, "done_reason": "length"},
+        {"response": "supported", "done": True, "done_reason": "something_new"},
+    ],
+    ids=["done-missing", "done-false", "reason-missing", "reason-load", "reason-length", "reason-unknown"],
+)
+def test_an_unfinished_verifier_reply_is_malformed_and_never_decides_the_answer(main_tree, body):
+    assert _verifier_result(main_tree, body) is None, "a status word alone is not enough"
+
+    connection = _FakeConnection()
+    _, events, calls = _stream_ask(main_tree, connection, verifier_reply=body)
+
+    [verification] = [event for event in events if event["type"] == "verification"]
+    assert [(claim["status"], claim["reason"]) for claim in verification["claims"]] == [
+        ("unverified", "verifier_malformed")
+    ]
+    assert len(_verifier_calls(calls)) == 1
+    assert [event["entry_id"] for event in events if event["type"] == "entry_id"] == [4242]
+    assert "commit" in connection.steps, "the completed answer is still saved"
+    assert events[-1] == {"type": "done", "ok": True}
+
+
+def test_a_verifier_model_error_is_unavailable_whatever_its_completion_fields(main_tree):
+    body = {
+        "error": "SECRET-VERIFIER-ERROR at /srv/models", "response": "supported",
+        "done": True, "done_reason": "stop",
+    }
+    with pytest.raises(RuntimeError) as excinfo:
+        _verifier_result(main_tree, body)
+    assert "SECRET-VERIFIER-ERROR" not in str(excinfo.value)
+
+    payload, events, _ = _stream_ask(main_tree, _FakeConnection(), verifier_reply=body)
+
+    [verification] = [event for event in events if event["type"] == "verification"]
+    assert [(claim["status"], claim["reason"]) for claim in verification["claims"]] == [
+        ("unverified", "verifier_unavailable")
+    ]
+    assert "SECRET-VERIFIER-ERROR" not in payload and "/srv/models" not in payload
+    assert events[-1] == {"type": "done", "ok": True}
 
 
 # --- answer modes: what the caller renders decides what is graded -----------

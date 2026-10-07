@@ -276,10 +276,12 @@ def test_the_evidence_mode_is_recorded_and_the_embedding_profile_is_labelled_con
 
 
 def test_metrics_ollama_did_not_report_are_null_never_zero():
-    stream = _stream({"response": "An answer."}, {"response": "", "done": True})
+    # A finished final record (only "stop" finishes a generation) that reports
+    # no counters or durations at all.
+    stream = _stream({"response": "An answer."}, {"response": "", "done": True, "done_reason": "stop"})
     metrics = _build(stream=stream)["ollama_metrics"]
     assert metrics == {
-        "done_reason": None,
+        "done_reason": "stop",
         "prompt_eval_count": None,
         "eval_count": None,
         "load_duration_ns": None,
@@ -376,6 +378,23 @@ def test_new_trace_ids_are_canonical_uuid4_and_unique():
 def test_an_unfinished_stream_has_no_provenance(records):
     with pytest.raises(AnswerProvenanceError):
         _build(stream=_stream(*records))
+
+
+@pytest.mark.parametrize(
+    "final",
+    [
+        {k: v for k, v in _DONE.items() if k != "done_reason"},
+        dict(_DONE, done_reason=None),
+        dict(_DONE, done_reason=7),
+        dict(_DONE, done_reason="load"),
+        dict(_DONE, done_reason="something_new"),
+        dict(_DONE, done="true"),
+    ],
+    ids=["reason-missing", "reason-null", "reason-non-string", "reason-load", "reason-unknown", "done-not-true"],
+)
+def test_a_final_record_without_a_stop_completion_has_no_provenance(final):
+    with pytest.raises(AnswerProvenanceError):
+        _build(stream=_stream({"response": "The term is two years [C1]."}, final))
 
 
 @pytest.mark.parametrize("calls", [-1, True, 1.0, "1"])

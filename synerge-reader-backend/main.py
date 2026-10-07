@@ -69,7 +69,11 @@ from generation_profiles import (
     default_model_registry,
     resolve_answer_generation,
 )
-from ollama_generation import FAILURE_OUTPUT_LIMIT, OllamaGenerateStream
+from ollama_generation import (
+    FAILURE_OUTPUT_LIMIT,
+    OllamaGenerateStream,
+    completed_generate_response,
+)
 from answer_provenance import (
     AnswerTimer,
     answer_provenance_json,
@@ -497,13 +501,19 @@ def _generate_qa_pairs_from_text(text: str, label: str) -> List[dict]:
     """Ask the LLM to write Q:/A: pairs from arbitrary text (a document excerpt
     or scraped external page). Shared by document-upload seeding and the
     external URL importer — the only difference between those two source
-    kinds is what gets stored alongside the pairs, not how they're generated."""
+    kinds is what gets stored alongside the pairs, not how they're generated.
+
+    Each excerpt's reply must be a finished generation (see
+    completed_generate_response) before it is parsed: an unfinished, cut-off,
+    blank or error reply contributes no pairs, and pairs from the other
+    excerpt are kept. Log lines carry fixed categories and counts only --
+    never ``label``, the text, the model output, or exception text."""
     if len(text.strip()) < 200:
         return []
     try:
         base_url = get_active_ollama_base_url()
     except Exception:
-        print(f"[KB] Ollama not reachable — skipping KB generation for {label}")
+        print("[KB] Ollama not reachable; Q&A generation skipped")
         return []
 
     helper = _MODEL_REGISTRY.helper_call(_KB_HELPER_TEMPERATURE)
@@ -542,8 +552,12 @@ Start with Q:"""
                 timeout=(5, 120),
             )
             resp.raise_for_status()
-            raw = resp.json().get("response", "").strip()
-            print(f"[KB] Raw output part {i+1} (first 300 chars): {raw[:300]}")
+            reply = completed_generate_response(resp.json())
+            if reply is None:
+                print(f"[KB] Excerpt {i+1}: reply was not a completed response; no pairs taken")
+                continue
+            raw = reply.strip()
+            print(f"[KB] Excerpt {i+1}: completed reply of {len(raw)} chars")
 
             current_q = None
             current_a_lines = []
@@ -563,7 +577,7 @@ Start with Q:"""
 
             print(f"[KB] Parsed {len(all_pairs)} pairs so far after part {i+1}")
         except Exception as e:
-            print(f"[KB] LLM call failed for excerpt {i+1}: {e}")
+            print(f"[KB] Excerpt {i+1}: model call failed ({type(e).__name__}); no pairs taken")
             continue
 
     return all_pairs
@@ -656,13 +670,20 @@ def _extract_document_insights(doc_id: int, filename: str, text: str):
     facts, keywords, and named entities/parties — then store one row per
     document for the admin dashboard's Insights tab. Runs in a background
     daemon thread; never blocks the upload response, and any failure here is
-    non-critical (the document itself is already saved and usable)."""
+    non-critical (the document itself is already saved and usable).
+
+    The reply must be a finished generation (see completed_generate_response)
+    before anything is parsed or stored: an unfinished, cut-off, blank or error
+    reply writes nothing, so an existing insights row is never overwritten
+    from it. Log lines carry fixed categories and counts only -- never the
+    filename, the text, the model output or values parsed from it, or
+    exception text."""
     if len(text.strip()) < 200:
         return
     try:
         base_url = get_active_ollama_base_url()
     except Exception:
-        print(f"[Insights] Ollama not reachable — skipping insight extraction for {filename}")
+        print("[Insights] Ollama not reachable; insight extraction skipped")
         return
 
     helper = _MODEL_REGISTRY.helper_call(_INSIGHTS_HELPER_TEMPERATURE)
@@ -689,10 +710,14 @@ JSON:"""
             timeout=(5, 120),
         )
         resp.raise_for_status()
-        raw = resp.json().get("response", "").strip()
+        reply = completed_generate_response(resp.json())
+        if reply is None:
+            print("[Insights] Reply was not a completed response; nothing stored")
+            return
+        raw = reply.strip()
         parsed = _extract_json_block(raw)
         if not parsed:
-            print(f"[Insights] Could not parse JSON for {filename}: {raw[:200]}")
+            print(f"[Insights] No JSON object in a {len(raw)}-char reply; nothing stored")
             return
 
         doc_type = str(parsed.get("doc_type") or "Other").strip()[:60]
@@ -717,9 +742,9 @@ JSON:"""
         )
         conn.commit()
         conn.close()
-        print(f"[Insights] ✓ {filename}: type={doc_type}, {len(keywords)} keywords, {len(facts)} facts, {len(entities)} entities")
+        print(f"[Insights] Stored: {len(keywords)} keywords, {len(facts)} facts, {len(entities)} entities")
     except Exception as e:
-        print(f"[Insights] Extraction failed for {filename} (non-critical): {e}")
+        print(f"[Insights] Extraction failed (non-critical): {type(e).__name__}")
 
 
 async def hash_password(password: str) -> str:
@@ -1280,10 +1305,13 @@ def _ollama_claim_verifier(claim: str, records, verifier) -> Optional[str]:
     ``verifier`` is the registry's fixed Llama call (model, bounded options,
     keep_alive), the same for every answer profile; a request cannot change it.
     Runs through the same local Ollama transport as generation and nothing
-    else. A transport or model failure raises, and a reply that is not exactly
-    one status -- including one cut off at the output limit -- returns None;
-    citation_generation turns either into ``unverified``, never ``supported``.
-    Only the ``response`` field is read, so separate thinking text is ignored.
+    else. A transport or model failure raises (``verifier_unavailable``). A
+    reply that did not finish -- not ``done``, cut off at the output limit, or
+    any completion reason other than ``"stop"`` -- or that is not exactly one
+    status returns None (``verifier_malformed``). citation_generation turns
+    either into ``unverified``, never ``supported``, and neither affects
+    whether the answer itself completed. Only the ``response`` field is read,
+    so separate thinking text is ignored.
     """
     evidence = "\n\n".join(
         f"[{record.citation_id}] {record.evidence_text}" for record in records
@@ -1291,15 +1319,8 @@ def _ollama_claim_verifier(claim: str, records, verifier) -> Optional[str]:
     prompt = _CLAIM_VERIFIER_PROMPT.format(evidence=evidence, claim=claim.strip())
     response = post_ollama("/api/generate", verifier.ollama_payload(prompt), timeout=30)
     response.raise_for_status()
-    body = response.json()
-    if not isinstance(body, dict):
-        return None
-    if "error" in body:
-        # Fixed text: the server's error string is never carried along.
-        raise RuntimeError("verifier reported an error")
-    if body.get("done_reason") == "length":
-        return None
-    return _claim_verifier_status(body.get("response"))
+    # Raises with fixed text on a model error; None for an unfinished reply.
+    return _claim_verifier_status(completed_generate_response(response.json()))
 
 
 def _caller_is_admin(auth_token: Optional[str]) -> bool:

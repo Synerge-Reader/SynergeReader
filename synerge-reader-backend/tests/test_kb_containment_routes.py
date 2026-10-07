@@ -645,7 +645,7 @@ class _FakeVerifierReply:
         pass
 
     def json(self):
-        return {"response": "supported"}
+        return {"response": "supported", "done": True, "done_reason": "stop"}
 
 
 @pytest.fixture

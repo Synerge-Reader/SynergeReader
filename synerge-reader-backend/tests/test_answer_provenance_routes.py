@@ -624,6 +624,12 @@ _FAILING_STREAMS = {
     "model-error": _ndjson({"response": "The lease "}, {"error": "runner crashed: /srv/models/blob"}),
     "no-final-record": _ndjson({"response": "The lease term is two years."}),
     "malformed-line": _ndjson({"response": "The lease "}) + '{"response": "te\n' + _ndjson(_DONE),
+    # The final record arrived after a full answer, but only "stop" says the
+    # model finished it.
+    "done-reason-missing": _ndjson({"response": _ANSWER}, {k: v for k, v in _DONE.items() if k != "done_reason"}),
+    "done-reason-non-string": _ndjson({"response": _ANSWER}, dict(_DONE, done_reason=7)),
+    "done-reason-load": _ndjson({"response": _ANSWER}, dict(_DONE, done_reason="load")),
+    "done-reason-unknown": _ndjson({"response": _ANSWER}, dict(_DONE, done_reason="something_new")),
 }
 
 
