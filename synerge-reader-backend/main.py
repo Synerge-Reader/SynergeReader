@@ -68,6 +68,7 @@ from generation_profiles import (
     UnknownModelProfileError,
     default_model_registry,
     resolve_answer_generation,
+    resolve_default_generation,
 )
 from ollama_generation import (
     FAILURE_OUTPUT_LIMIT,
@@ -488,13 +489,26 @@ def auto_save_to_kb(question: str, answer: str, source: str = "auto"):
         print(f"[KB] Auto-save failed (non-critical): {e}")
 
 
-# Background helper calls use the registry's fixed, bounded Llama call. They
-# used to probe a list of tags (several of them never approved) with a bare
-# "Say OK" generation each -- every probe could load a model at its default,
-# unbounded context -- and then send their temperature at the top level, where
-# Ollama ignores it.
+# Background helper calls are bounded calls derived from the trusted registry
+# default, resolved once per job. They used to probe a list of tags (several
+# of them never approved) with a bare "Say OK" generation each -- every probe
+# could load a model at its default, unbounded context -- and then send their
+# temperature at the top level, where Ollama ignores it.
 _KB_HELPER_TEMPERATURE = 0.2
 _INSIGHTS_HELPER_TEMPERATURE = 0.1
+
+
+def _resolve_helper_generation() -> AnswerGenerationSnapshot:
+    """The trusted registry default for one background helper job.
+
+    Called once when a job starts, before any generation, and never from a
+    request: there is no admin lookup, and an admin's per-request answer
+    override cannot reach a helper. The unqualified control makes no
+    inventory call. A default that requires qualification has its installed
+    identity read first, and an ineligible, missing, unreadable or mismatched
+    identity raises, so the job generates nothing.
+    """
+    return resolve_default_generation(_MODEL_REGISTRY, installed_digest=_installed_model_digest)
 
 
 def _generate_qa_pairs_from_text(text: str, label: str) -> List[dict]:
@@ -507,8 +521,17 @@ def _generate_qa_pairs_from_text(text: str, label: str) -> List[dict]:
     completed_generate_response) before it is parsed: an unfinished, cut-off,
     blank or error reply contributes no pairs, and pairs from the other
     excerpt are kept. Log lines carry fixed categories and counts only --
-    never ``label``, the text, the model output, or exception text."""
+    never ``label``, the text, the model output, or exception text.
+
+    The model is resolved once for the whole job (see
+    _resolve_helper_generation), so every excerpt uses the same snapshot; if
+    it cannot be resolved, nothing is generated and no pairs are returned."""
     if len(text.strip()) < 200:
+        return []
+    try:
+        generation = _resolve_helper_generation()
+    except Exception as exc:
+        print(f"[KB] Helper model unavailable ({type(exc).__name__}); Q&A generation skipped")
         return []
     try:
         base_url = get_active_ollama_base_url()
@@ -516,7 +539,7 @@ def _generate_qa_pairs_from_text(text: str, label: str) -> List[dict]:
         print("[KB] Ollama not reachable; Q&A generation skipped")
         return []
 
-    helper = _MODEL_REGISTRY.helper_call(_KB_HELPER_TEMPERATURE)
+    helper = generation.helper_call(_KB_HELPER_TEMPERATURE)
 
     mid = min(len(text) // 2, 4000)
     excerpts = [text[:4000].strip(), text[mid:mid + 4000].strip()]
@@ -549,7 +572,7 @@ Start with Q:"""
             resp = requests.post(
                 f"{base_url}/api/generate",
                 json=helper.ollama_payload(prompt, stream=False),
-                timeout=(5, 120),
+                timeout=(5, helper.read_timeout_s),
             )
             resp.raise_for_status()
             reply = completed_generate_response(resp.json())
@@ -677,8 +700,17 @@ def _extract_document_insights(doc_id: int, filename: str, text: str):
     reply writes nothing, so an existing insights row is never overwritten
     from it. Log lines carry fixed categories and counts only -- never the
     filename, the text, the model output or values parsed from it, or
-    exception text."""
+    exception text.
+
+    The model is resolved once when the job starts (see
+    _resolve_helper_generation); if it cannot be resolved, nothing is
+    generated or stored."""
     if len(text.strip()) < 200:
+        return
+    try:
+        generation = _resolve_helper_generation()
+    except Exception as exc:
+        print(f"[Insights] Helper model unavailable ({type(exc).__name__}); insight extraction skipped")
         return
     try:
         base_url = get_active_ollama_base_url()
@@ -686,7 +718,7 @@ def _extract_document_insights(doc_id: int, filename: str, text: str):
         print("[Insights] Ollama not reachable; insight extraction skipped")
         return
 
-    helper = _MODEL_REGISTRY.helper_call(_INSIGHTS_HELPER_TEMPERATURE)
+    helper = generation.helper_call(_INSIGHTS_HELPER_TEMPERATURE)
 
     excerpt = text[:6000].strip()
     prompt = f"""Read the legal document excerpt below and respond with ONLY a JSON object — no markdown, no commentary, no code fences. Use exactly this shape:
@@ -707,7 +739,7 @@ JSON:"""
         resp = requests.post(
             f"{base_url}/api/generate",
             json=helper.ollama_payload(prompt, stream=False),
-            timeout=(5, 120),
+            timeout=(5, helper.read_timeout_s),
         )
         resp.raise_for_status()
         reply = completed_generate_response(resp.json())
@@ -1302,8 +1334,11 @@ def _ollama_claim_verifier(claim: str, records, verifier) -> Optional[str]:
     document looks like. The verifier's own result stays public-safe: it
     returns one status word, and the claim payload carries only citation ids.
 
-    ``verifier`` is the registry's fixed Llama call (model, bounded options,
-    keep_alive), the same for every answer profile; a request cannot change it.
+    ``verifier`` is the answer snapshot's verifier call, captured before the
+    answer streamed: the answer profile's exact tag, context window,
+    keep_alive and think policy with the bounded verifier options and the
+    profile's verifier read timeout. A request cannot change it, and it is
+    never rebuilt from the registry here.
     Runs through the same local Ollama transport as generation and nothing
     else. A transport or model failure raises (``verifier_unavailable``). A
     reply that did not finish -- not ``done``, cut off at the output limit, or
@@ -1317,7 +1352,7 @@ def _ollama_claim_verifier(claim: str, records, verifier) -> Optional[str]:
         f"[{record.citation_id}] {record.evidence_text}" for record in records
     )
     prompt = _CLAIM_VERIFIER_PROMPT.format(evidence=evidence, claim=claim.strip())
-    response = post_ollama("/api/generate", verifier.ollama_payload(prompt), timeout=30)
+    response = post_ollama("/api/generate", verifier.ollama_payload(prompt), timeout=verifier.read_timeout_s)
     response.raise_for_status()
     # Raises with fixed text on a model error; None for an unfinished reply.
     return _claim_verifier_status(completed_generate_response(response.json()))
@@ -1357,8 +1392,9 @@ def _caller_is_admin(auth_token: Optional[str]) -> bool:
 def _installed_model_digest(model_tag: str) -> Optional[str]:
     """The manifest digest Ollama lists for exactly this tag, or None.
 
-    Read-only (``/api/tags``) and only consulted for a qualified, non-default
-    profile, so ordinary answers make no extra request.
+    Read-only (``/api/tags``) and only consulted for a profile that requires
+    qualification -- per answer, or once when a background helper job starts
+    -- so ordinary answers make no extra request.
     """
     base_url = get_active_ollama_base_url()
     response = requests.get(f"{base_url}/api/tags", timeout=(OLLAMA_CONNECT_TIMEOUT, 5))

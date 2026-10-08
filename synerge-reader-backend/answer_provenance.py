@@ -15,6 +15,13 @@ Where each value comes from -- never from the request:
   -- profile, exact tag, the registry's expected digest and, separately, the
   digest the installed-model lookup observed for THIS answer (``null`` when no
   lookup was made), and the settings this backend requested;
+* verification (graded answers only): the verifier call captured in that same
+  snapshot -- its profile, exact tag, requested options, ``keep_alive``, think
+  policy (``null`` means no think field was sent), per-read timeout, expected
+  digest and the observed digest copied from the answer's resolution -- plus
+  how many verifier calls were attempted. Schema version 2 added the think,
+  timeout and digest fields; a version 1 record stored earlier lacks them and
+  is never rewritten or filled in;
 * prompt: the template versions in ``release_metadata.py`` and the validated
   answer mode the server answered under. The raw prompt is never stored;
 * retrieval: the evidence mode the planner reported, and the CONFIGURED
@@ -39,12 +46,12 @@ from typing import Callable, Optional
 
 from answer_evidence import EvidenceMode
 from citation_generation import AnswerMode
-from generation_profiles import AnswerGenerationSnapshot, normalize_digest
+from generation_profiles import AnswerGenerationSnapshot, FixedModelCall, normalize_digest
 from ollama_generation import OllamaGenerateStream
 from rag_model_profiles import EmbeddingProfile
 from release_metadata import ReleaseMetadata
 
-PROVENANCE_SCHEMA_VERSION = 1
+PROVENANCE_SCHEMA_VERSION = 2
 
 TIMING_ORIGIN = "ask_request_received"
 TIMING_MARKS = (
@@ -160,6 +167,8 @@ def build_answer_provenance(
     ):
         if not isinstance(value, expected):
             raise AnswerProvenanceError(f"expected a server {expected.__name__}")
+    if not isinstance(generation.verifier, FixedModelCall):
+        raise AnswerProvenanceError("expected the snapshot's own verifier call")
     if stream.failure is not None:
         raise AnswerProvenanceError("an unfinished generation has no answer provenance")
     if generation.selection not in _SELECTIONS:
@@ -199,8 +208,13 @@ def build_answer_provenance(
         "verification": {
             "profile_id": verifier.profile_id,
             "model_tag": verifier.model_tag,
+            "expected_digest": _require_digest(verifier.expected_digest),
+            "observed_digest": _require_digest(verifier.observed_digest),
             "requested_options": verifier.options.as_ollama_options(),
+            # None: no think field was sent. False: ``think: false`` was sent.
+            "think": verifier.think,
             "keep_alive": verifier.keep_alive,
+            "read_timeout_s": verifier.read_timeout_s,
             "calls_attempted": verifier_calls,
         } if graded else None,
         "retrieval": {

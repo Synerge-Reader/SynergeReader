@@ -396,7 +396,6 @@ def _qualified_gemma_registry(default=LLAMA_CONTROL):
     return ModelRegistry(
         profiles=(base.get(LLAMA_CONTROL), gemma),
         default_profile_id=default,
-        verifier_profile_id=LLAMA_CONTROL,
     )
 
 
@@ -493,7 +492,7 @@ def test_a_default_llama_answer_is_saved_with_server_provenance(client, db, olla
     trace_id = row["trace_id"]
     assert str(uuid.UUID(trace_id)) == trace_id and uuid.UUID(trace_id).version == 4
     provenance = row["answer_provenance"]
-    assert provenance["schema_version"] == 1
+    assert provenance["schema_version"] == 2
     assert provenance["trace_id"] == trace_id, "the column and the record name the same attempt"
     assert provenance["release"] == {"app_version": "0.1.0", "build_sha": SYNTHETIC_SHA}
     assert provenance["generation"] == {
@@ -515,8 +514,12 @@ def test_a_default_llama_answer_is_saved_with_server_provenance(client, db, olla
     assert provenance["verification"] == {
         "profile_id": "llama_control",
         "model_tag": "llama3.1:8b",
+        "expected_digest": LLAMA_CONTROL_DIGEST,
+        "observed_digest": None,
         "requested_options": {"temperature": 0.0, "num_ctx": 8192, "num_predict": 16},
+        "think": None,
         "keep_alive": "5m",
+        "read_timeout_s": 30.0,
         "calls_attempted": len(ollama.verifications),
     }
     assert len(ollama.verifications) == 1
@@ -555,7 +558,7 @@ def test_the_answer_stream_carries_no_provenance(client, db):
 
 
 def test_an_authorized_admin_override_records_its_selection_and_observed_digest(
-    monkeypatch, main_module, client, db, inventory
+    monkeypatch, main_module, client, db, ollama, inventory
 ):
     monkeypatch.setattr(main_module, "_MODEL_REGISTRY", _qualified_gemma_registry())
     # The inventory reports the digest in another spelling; the record keeps
@@ -575,7 +578,23 @@ def test_an_authorized_admin_override_records_its_selection_and_observed_digest(
     assert generation["think"] is False
     assert generation["answer_read_timeout_s"] == 150.0
     assert inventory["calls"] == ["gemma4:31b"]
-    assert row["answer_provenance"]["verification"]["model_tag"] == "llama3.1:8b"
+    verification = row["answer_provenance"]["verification"]
+    assert verification == {
+        "profile_id": "gemma_candidate",
+        "model_tag": "gemma4:31b",
+        "expected_digest": SYNTHETIC_DIGEST,
+        "observed_digest": SYNTHETIC_DIGEST,
+        "requested_options": {"temperature": 0.0, "num_ctx": 8192, "num_predict": 16},
+        "think": False,
+        "keep_alive": "5m",
+        "read_timeout_s": 150.0,
+        "calls_attempted": 1,
+    }, "the record matches the verifier call that actually ran"
+    [verifier_call] = [call for call in ollama.calls if not call["stream"]]
+    assert verifier_call["payload"]["model"] == verification["model_tag"]
+    assert verifier_call["payload"]["options"] == verification["requested_options"]
+    assert verifier_call["payload"]["think"] is verification["think"]
+    assert verifier_call["timeout"] == verification["read_timeout_s"]
 
 
 def test_each_answer_attempt_gets_its_own_trace_id(client, db):
@@ -786,6 +805,69 @@ def test_admin_chat_history_returns_provenance_and_null_for_legacy_rows(client, 
             legacy["question"], legacy["answer"], legacy["rating"], legacy["comment"],
         )
     assert db.rows[1] == _LEGACY_ROWS[1] and db.rows[2] == _LEGACY_ROWS[2], "legacy rows unmodified"
+
+
+# A row saved by the schema-version-1 writer (synthetic values): its
+# verification block has no digest, think or read-timeout field.
+_V1_TRACE_ID = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+_V1_ROW = dict(
+    user_id="alice-id", ts="2026-10-05T10:00:00", selected_text="", question="v1 alice question",
+    answer="v1 alice answer", rating=None, comment=None, trace_id=_V1_TRACE_ID,
+    answer_provenance={
+        "schema_version": 1,
+        "trace_id": _V1_TRACE_ID,
+        "release": {"app_version": "0.1.0", "build_sha": None},
+        "generation": {
+            "profile_id": "llama_control", "model_tag": "llama3.1:8b", "selection": "default",
+            "expected_digest": LLAMA_CONTROL_DIGEST, "observed_digest": None,
+            "requested_options": {"temperature": 0.2, "num_ctx": 8192, "num_predict": 1200},
+            "think": None, "keep_alive": "5m", "answer_read_timeout_s": 60.0,
+        },
+        "verification": {
+            "profile_id": "llama_control", "model_tag": "llama3.1:8b",
+            "requested_options": {"temperature": 0.0, "num_ctx": 8192, "num_predict": 16},
+            "keep_alive": "5m", "calls_attempted": 1,
+        },
+    },
+)
+
+
+def test_admin_history_returns_a_stored_v1_record_exactly_as_saved(client, db):
+    db.rows[3] = copy.deepcopy(_V1_ROW)
+    _ask(client, "tok-alice", active_document_id=10)
+    [new_id] = [row_id for row_id in _saved(db) if row_id != 3]
+
+    response = client.get("/admin/chat_history", params={"token": "tok-admin"})
+
+    assert response.status_code == 200
+    items = {item["id"]: item for item in response.json()["items"]}
+    assert items[3]["answer_provenance"] == _V1_ROW["answer_provenance"], "returned exactly as stored"
+    assert items[3]["trace_id"] == _V1_TRACE_ID
+    stored_v1 = items[3]["answer_provenance"]["verification"]
+    for added in ("expected_digest", "observed_digest", "think", "read_timeout_s"):
+        assert added not in stored_v1, f"{added} must not be synthesized for a version 1 row"
+    assert db.rows[3] == _V1_ROW, "the stored version 1 row is never rewritten"
+    current = items[new_id]["answer_provenance"]
+    assert current["schema_version"] == 2 and current["verification"]["read_timeout_s"] == 30.0
+
+
+def test_the_new_verifier_internals_reach_neither_the_stream_nor_owner_history(
+    monkeypatch, main_module, client, db, inventory
+):
+    monkeypatch.setattr(main_module, "_MODEL_REGISTRY", _qualified_gemma_registry())
+    response = _ask(client, "tok-admin", model_profile_id=GEMMA_CANDIDATE, active_document_id=40)
+    assert _events(response)[-1] == {"type": "done", "ok": True}
+    _, row = _only_saved(db)
+    assert row["answer_provenance"]["verification"]["observed_digest"] == SYNTHETIC_DIGEST
+
+    history = client.post("/history", json={"token": "tok-admin"})
+
+    assert history.status_code == 200
+    for text in (response.text, history.text):
+        for leaked in (SYNTHETIC_DIGEST, "read_timeout_s", "expected_digest", "observed_digest", "keep_alive"):
+            assert leaked not in text, leaked
+    [evidence] = [e for e in _events(response) if e["type"] == "evidence"]
+    assert evidence["generation"] == {"profile_id": "gemma_candidate", "model": "gemma4:31b"}
 
 
 @pytest.mark.parametrize("token, status", [(None, 401), ("tok-alice", 403)], ids=["anonymous", "ordinary-user"])

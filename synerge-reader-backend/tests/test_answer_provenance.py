@@ -98,7 +98,6 @@ def _qualified_gemma_override(observed=SYNTHETIC_DIGEST):
     registry = ModelRegistry(
         profiles=(base.get(LLAMA_CONTROL), gemma),
         default_profile_id=LLAMA_CONTROL,
-        verifier_profile_id=LLAMA_CONTROL,
     )
     return resolve_answer_generation(
         registry,
@@ -140,7 +139,7 @@ def test_a_default_llama_record_has_exactly_the_versioned_schema():
     record = _build()
 
     assert record == {
-        "schema_version": 1,
+        "schema_version": 2,
         "trace_id": TRACE_ID,
         "release": {"app_version": "0.1.0", "build_sha": SYNTHETIC_SHA},
         "generation": {
@@ -162,8 +161,12 @@ def test_a_default_llama_record_has_exactly_the_versioned_schema():
         "verification": {
             "profile_id": "llama_control",
             "model_tag": "llama3.1:8b",
+            "expected_digest": LLAMA_CONTROL_DIGEST,
+            "observed_digest": None,
             "requested_options": {"temperature": 0.0, "num_ctx": 8192, "num_predict": 16},
+            "think": None,
             "keep_alive": "5m",
+            "read_timeout_s": 30.0,
             "calls_attempted": 1,
         },
         "retrieval": {
@@ -192,7 +195,7 @@ def test_a_default_llama_record_has_exactly_the_versioned_schema():
             "total_duration_ns": 4_000_000_000,
         },
     }
-    assert PROVENANCE_SCHEMA_VERSION == 1
+    assert PROVENANCE_SCHEMA_VERSION == 2
 
 
 def test_an_unknown_build_is_recorded_as_null_not_guessed():
@@ -222,8 +225,19 @@ def test_an_admin_override_records_its_selection_and_the_observed_digest():
     assert generation["observed_digest"] == SYNTHETIC_DIGEST, "the lookup's value, normalized"
     assert generation["think"] is False, "think: false was sent"
     assert generation["answer_read_timeout_s"] == 150.0
-    # Verification stays the fixed Llama call whichever profile answered.
-    assert record["verification"]["model_tag"] == "llama3.1:8b"
+    # The answer was verified by the model that wrote it, with the same
+    # identity: the pin, and the observation made when the answer resolved.
+    assert record["verification"] == {
+        "profile_id": "gemma_candidate",
+        "model_tag": "gemma4:31b",
+        "expected_digest": SYNTHETIC_DIGEST,
+        "observed_digest": SYNTHETIC_DIGEST,
+        "requested_options": {"temperature": 0.0, "num_ctx": 8192, "num_predict": 16},
+        "think": False,
+        "keep_alive": "5m",
+        "read_timeout_s": 150.0,
+        "calls_attempted": 1,
+    }
 
 
 def test_expected_and_observed_digests_are_each_copied_from_their_own_field():
@@ -243,6 +257,48 @@ def test_a_malformed_digest_is_refused(field):
     snapshot = dataclasses.replace(_llama_default(), **{field: "sha256:" + "AA" * 32})
     with pytest.raises(AnswerProvenanceError):
         _build(generation=snapshot)
+
+
+# --- verification identity ------------------------------------------------------
+
+
+def test_verification_is_copied_only_from_the_captured_verifier_call():
+    """Built directly with values selection could not produce, so a record
+    that took any of them from the answer fields instead would show it."""
+    snapshot = _llama_default()
+    verifier = dataclasses.replace(
+        snapshot.verifier, expected_digest="aa" * 32, observed_digest="bb" * 32, read_timeout_s=42.5,
+    )
+    record = _build(generation=dataclasses.replace(snapshot, verifier=verifier))
+
+    verification = record["verification"]
+    assert (verification["expected_digest"], verification["observed_digest"]) == ("aa" * 32, "bb" * 32)
+    assert verification["read_timeout_s"] == 42.5
+    assert (record["generation"]["expected_digest"], record["generation"]["observed_digest"]) == (
+        LLAMA_CONTROL_DIGEST, None,
+    ), "the answer's own identity is recorded separately and unchanged"
+
+
+def test_the_verifier_think_policy_is_recorded_as_sent():
+    assert _build()["verification"]["think"] is None, "None: no think field was sent"
+    assert _build(generation=_qualified_gemma_override())["verification"]["think"] is False
+
+
+def test_a_stand_in_verifier_is_refused():
+    snapshot = dataclasses.replace(_llama_default(), verifier={"model_tag": "spoofed:latest", "read_timeout_s": 1})
+    with pytest.raises(AnswerProvenanceError):
+        _build(generation=snapshot)
+
+
+def test_the_v2_verification_fields_survive_json_storage():
+    record = _build(generation=_qualified_gemma_override())
+    text = answer_provenance_json(record)
+    stored = json.loads(text)
+    assert stored["schema_version"] == 2
+    assert stored["verification"] == record["verification"]
+    assert stored["verification"]["think"] is False, "false is stored, not dropped"
+    assert stored["verification"]["read_timeout_s"] == 150.0
+    assert "://" not in text, "no endpoint is recorded"
 
 
 # --- graded and ungraded modes ------------------------------------------------
@@ -423,7 +479,9 @@ def test_thinking_text_never_reaches_the_record():
     assert "SECRET-THOUGHT" not in text and "thinking" not in text
 
 
-@pytest.mark.parametrize("value", [{"schema_version": 2}, [], "text", None])
+# A version 1 dict is not what this writer produces: stored v1 rows are
+# returned as they are and never re-serialized (see the admin-history tests).
+@pytest.mark.parametrize("value", [{"schema_version": 1}, [], "text", None])
 def test_only_a_provenance_record_is_serialized(value):
     with pytest.raises(AnswerProvenanceError):
         answer_provenance_json(value)

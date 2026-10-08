@@ -7,6 +7,7 @@ only the production-constant tests compare against the operator-supplied pins.
 """
 
 import dataclasses
+import inspect
 import math
 import os
 import sys
@@ -19,6 +20,7 @@ from generation_profiles import (
     GEMMA_CANDIDATE,
     LLAMA_CONTROL,
     SMOKE_OPTIONS,
+    FixedModelCall,
     GenerationOptions,
     GenerationProfileError,
     ModelIdentityMismatchError,
@@ -32,6 +34,7 @@ from generation_profiles import (
     UnknownModelProfileError,
     default_model_registry,
     resolve_answer_generation,
+    resolve_default_generation,
 )
 
 # Operator-supplied pins, asserted only against the production constants.
@@ -69,7 +72,6 @@ def _registry(gemma, default=LLAMA_CONTROL):
     return ModelRegistry(
         profiles=(default_model_registry().get(LLAMA_CONTROL), gemma),
         default_profile_id=default,
-        verifier_profile_id=LLAMA_CONTROL,
     )
 
 
@@ -131,6 +133,11 @@ def test_answer_profiles_request_the_reviewed_settings_and_timeouts():
     # The observed cold load was 91.783 s; the answer timeout must exceed it.
     assert registry.get(GEMMA_CANDIDATE).answer_read_timeout_s == 150.0 > 91.783
     assert SMOKE_OPTIONS.as_ollama_options() == {"temperature": 0.2, "num_ctx": 4096, "num_predict": 32}
+    # Per-read role timeouts: Llama keeps its call sites' previous values; any
+    # Gemma role call may find the model cold, so each gets the provisional 150 s.
+    llama, gemma = registry.get(LLAMA_CONTROL), registry.get(GEMMA_CANDIDATE)
+    assert (llama.verifier_read_timeout_s, llama.helper_read_timeout_s) == (30.0, 120.0)
+    assert (gemma.verifier_read_timeout_s, gemma.helper_read_timeout_s) == (150.0, 150.0)
 
 
 def test_production_gemma_stays_disabled_for_an_admin_too():
@@ -143,17 +150,25 @@ def test_production_gemma_stays_disabled_for_an_admin_too():
 
 
 def test_verifier_and_helpers_are_bounded_llama_calls_without_think():
-    registry = default_model_registry()
-    verifier = registry.verifier_call().ollama_payload("p")
+    snapshot = resolve_answer_generation(
+        default_model_registry(), requested_profile_id=None,
+        caller_is_admin=_never, installed_digest=_never,
+    )
+    verifier = snapshot.verifier.ollama_payload("p")
     assert verifier == {
         "model": "llama3.1:8b", "prompt": "p", "stream": False,
         "options": {"temperature": 0.0, "num_ctx": 8192, "num_predict": 16},
         "keep_alive": "5m",
     }
-    helper = registry.helper_call(0.1).ollama_payload("p")
-    assert helper["model"] == "llama3.1:8b"
-    assert helper["options"] == {"temperature": 0.1, "num_ctx": 8192, "num_predict": 1200}
-    assert "think" not in helper and "temperature" not in helper
+    assert snapshot.verifier.read_timeout_s == 30.0
+    for temperature in (0.2, 0.1):
+        call = snapshot.helper_call(temperature)
+        assert call.ollama_payload("p") == {
+            "model": "llama3.1:8b", "prompt": "p", "stream": False,
+            "options": {"temperature": temperature, "num_ctx": 8192, "num_predict": 1200},
+            "keep_alive": "5m",
+        }, "no think field and no top-level temperature"
+        assert call.read_timeout_s == 120.0
 
 
 # --- option and profile validation ------------------------------------------
@@ -205,6 +220,7 @@ def test_options_dict_is_a_copy_the_caller_cannot_use_to_mutate_policy():
 _VALID_PROFILE = dict(
     profile_id="candidate", model_tag="model:tag", display_name="Model",
     answer_options=SMOKE_OPTIONS, keep_alive="5m", answer_read_timeout_s=60.0,
+    verifier_read_timeout_s=30.0, helper_read_timeout_s=120.0,
     requires_qualification=False,
 )
 
@@ -229,6 +245,21 @@ _VALID_PROFILE = dict(
         dict(think=False),                     # unevidenced no-thinking control
         dict(think=True, qualification=_evidence()),  # thinking output is never requested
         dict(think="false", qualification=_evidence()),
+        # The role read timeouts use the same finite bounds, and a bool never
+        # passes as a number of seconds.
+        dict(verifier_read_timeout_s=0),
+        dict(verifier_read_timeout_s=601),
+        dict(verifier_read_timeout_s=math.inf),
+        dict(verifier_read_timeout_s=float("nan")),
+        dict(verifier_read_timeout_s=None),
+        dict(verifier_read_timeout_s=True),
+        dict(verifier_read_timeout_s="30"),
+        dict(helper_read_timeout_s=0.5),
+        dict(helper_read_timeout_s=600.5),
+        dict(helper_read_timeout_s=-math.inf),
+        dict(helper_read_timeout_s=None),
+        dict(helper_read_timeout_s=False),
+        dict(helper_read_timeout_s="120"),
     ],
 )
 def test_invalid_profiles_are_rejected(fields):
@@ -248,18 +279,28 @@ def test_expected_digests_are_normalized():
     assert _gemma(expected_digest="sha256:" + SYNTHETIC_DIGEST.upper()).expected_digest == SYNTHETIC_DIGEST
 
 
-def test_registry_rejects_a_missing_default_duplicate_ids_and_an_unsuitable_verifier():
+def test_registry_rejects_a_missing_default_and_duplicate_ids():
     llama = default_model_registry().get(LLAMA_CONTROL)
     with pytest.raises(GenerationProfileError):
-        ModelRegistry(profiles=(llama,), default_profile_id="absent", verifier_profile_id=LLAMA_CONTROL)
+        ModelRegistry(profiles=(llama,), default_profile_id="absent")
     with pytest.raises(GenerationProfileError):
-        ModelRegistry(profiles=(llama, llama), default_profile_id=LLAMA_CONTROL, verifier_profile_id=LLAMA_CONTROL)
+        ModelRegistry(profiles=(llama, llama), default_profile_id=LLAMA_CONTROL)
     with pytest.raises(GenerationProfileError):
+        ModelRegistry(profiles=(), default_profile_id=LLAMA_CONTROL)
+
+
+def test_the_registry_has_no_independent_verifier_or_helper_selector():
+    """Verification and helpers are derived from a resolved profile; a
+    registry can no longer name a separate model for them."""
+    registry = default_model_registry()
+    with pytest.raises(TypeError):
         ModelRegistry(
-            profiles=(llama, _gemma(qualification=_evidence())),
+            profiles=registry.profiles,
             default_profile_id=LLAMA_CONTROL,
-            verifier_profile_id=GEMMA_CANDIDATE,
+            verifier_profile_id=LLAMA_CONTROL,
         )
+    for removed in ("verifier_profile_id", "verifier_call", "helper_call"):
+        assert not hasattr(registry, removed), removed
 
 
 # --- an incomplete candidate can never be the default ----------------------
@@ -287,7 +328,6 @@ def test_the_production_gemma_cannot_be_made_default():
         ModelRegistry(
             profiles=registry.profiles,
             default_profile_id=GEMMA_CANDIDATE,
-            verifier_profile_id=LLAMA_CONTROL,
         )
 
 
@@ -354,7 +394,9 @@ def test_a_qualified_candidate_default_needs_no_admin_but_its_exact_digest():
     assert snapshot.profile_id == GEMMA_CANDIDATE and snapshot.selection == "default"
     assert snapshot.answer_read_timeout_s == 150.0
     assert snapshot.ollama_payload("p")["think"] is False
-    assert snapshot.verifier.model_tag == "llama3.1:8b"
+    # The answer is verified by the model that wrote it, with no second lookup.
+    assert snapshot.verifier.model_tag == "gemma4:31b"
+    assert snapshot.verifier.observed_digest == SYNTHETIC_DIGEST
 
 
 @pytest.mark.parametrize(
@@ -430,7 +472,8 @@ def test_an_explicit_qualified_candidate_needs_its_exact_installed_digest():
     payload = snapshot.ollama_payload("p")
     assert payload["think"] is False
     assert payload["options"] == {"temperature": 0.2, "num_ctx": 8192, "num_predict": 1200}
-    assert "think" not in snapshot.verifier.ollama_payload("p")
+    verifier = snapshot.verifier.ollama_payload("p")
+    assert verifier["model"] == "gemma4:31b" and verifier["think"] is False
 
     with pytest.raises(ModelIdentityMismatchError):
         _resolve(registry, GEMMA_CANDIDATE, digest=None)
@@ -449,3 +492,161 @@ def test_a_snapshot_is_immutable_and_independent_of_later_registry_changes():
         snapshot.model_tag = "gemma4:31b"
     with pytest.raises(dataclasses.FrozenInstanceError):
         snapshot.answer_read_timeout_s = 600.0
+
+
+# --- role calls: the verifier and helpers follow the resolved profile ---------
+
+
+def test_a_qualified_candidate_verifier_has_the_answers_identity_and_bounded_settings():
+    snapshot = _resolve(_qualified_registry(), GEMMA_CANDIDATE, digest="sha256:" + SYNTHETIC_DIGEST.upper())
+
+    verifier = snapshot.verifier
+    assert (verifier.profile_id, verifier.model_tag) == (GEMMA_CANDIDATE, "gemma4:31b")
+    assert (verifier.expected_digest, verifier.observed_digest) == (SYNTHETIC_DIGEST, SYNTHETIC_DIGEST)
+    assert verifier.think is False and verifier.keep_alive == "5m"
+    assert verifier.read_timeout_s == 150.0
+    assert verifier.ollama_payload("p") == {
+        "model": "gemma4:31b", "prompt": "p", "stream": False,
+        "options": {"temperature": 0.0, "num_ctx": 8192, "num_predict": 16},
+        "keep_alive": "5m", "think": False,
+    }
+    helper = snapshot.helper_call(0.1)
+    assert helper.ollama_payload("p") == {
+        "model": "gemma4:31b", "prompt": "p", "stream": False,
+        "options": {"temperature": 0.1, "num_ctx": 8192, "num_predict": 1200},
+        "keep_alive": "5m", "think": False,
+    }
+    assert (helper.read_timeout_s, helper.expected_digest, helper.observed_digest) == (
+        150.0, SYNTHETIC_DIGEST, SYNTHETIC_DIGEST,
+    )
+
+
+def test_the_control_role_calls_carry_its_pin_and_no_observation():
+    snapshot = resolve_answer_generation(
+        default_model_registry(), requested_profile_id=None,
+        caller_is_admin=_never, installed_digest=_never,
+    )
+    for call in (snapshot.verifier, snapshot.helper_call(0.2)):
+        assert call.profile_id == LLAMA_CONTROL and call.model_tag == "llama3.1:8b"
+        assert call.expected_digest == OPERATOR_LLAMA_DIGEST
+        assert call.observed_digest is None, "no inventory lookup was made for the control"
+        assert call.think is None
+
+
+def test_an_admin_override_routes_only_that_answers_verifier():
+    registry = _qualified_registry()
+    override = _resolve(registry, GEMMA_CANDIDATE, digest=SYNTHETIC_DIGEST)
+    default = _resolve(registry, None)
+    assert override.verifier.model_tag == "gemma4:31b"
+    assert default.verifier.model_tag == "llama3.1:8b", "another answer keeps the default's verifier"
+    helper_default = resolve_default_generation(registry, installed_digest=_never)
+    assert helper_default.profile_id == LLAMA_CONTROL and helper_default.selection == "default"
+
+
+def test_role_calls_are_frozen_with_their_snapshot():
+    snapshot = _resolve(_qualified_registry(), None)
+    verifier, helper = snapshot.verifier, snapshot.helper_call(0.2)
+    # A later registry with a different default changes nothing already resolved.
+    replaced = _qualified_registry(default=GEMMA_CANDIDATE)
+    assert _resolve(replaced, None, digest=SYNTHETIC_DIGEST).verifier.model_tag == "gemma4:31b"
+    assert snapshot.verifier is verifier and verifier.model_tag == "llama3.1:8b"
+    assert snapshot.helper_call(0.2) == helper and helper.model_tag == "llama3.1:8b"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        verifier.model_tag = "gemma4:31b"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        verifier.read_timeout_s = 600.0
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        snapshot.verifier = helper
+
+
+_VALID_ROLE_CALL = dict(
+    profile_id="candidate", model_tag="model:tag",
+    options=GenerationOptions(temperature=0.0, num_ctx=8192, num_predict=16),
+    keep_alive="5m", think=None, read_timeout_s=30.0,
+    expected_digest=SYNTHETIC_DIGEST, observed_digest=None,
+)
+
+
+def test_a_valid_role_call_is_accepted_as_given():
+    call = FixedModelCall(**_VALID_ROLE_CALL)
+    assert call.ollama_payload("p") == {
+        "model": "model:tag", "prompt": "p", "stream": False,
+        "options": {"temperature": 0.0, "num_ctx": 8192, "num_predict": 16}, "keep_alive": "5m",
+    }
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        dict(think=True),
+        dict(think="false"),
+        dict(read_timeout_s=0),
+        dict(read_timeout_s=601),
+        dict(read_timeout_s=math.inf),
+        dict(read_timeout_s=True),
+        dict(read_timeout_s=None),
+        dict(expected_digest="sha256:" + SYNTHETIC_DIGEST),
+        dict(observed_digest=SYNTHETIC_DIGEST.upper()),
+        dict(observed_digest="not-a-digest"),
+        dict(model_tag="llama3.1"),
+        dict(keep_alive="-1"),
+        dict(options={"temperature": 0.0}),
+    ],
+)
+def test_an_invalid_role_call_is_rejected(fields):
+    base = dict(_VALID_ROLE_CALL)
+    base.update(fields)
+    with pytest.raises(GenerationProfileError):
+        FixedModelCall(**base)
+
+
+# --- helper jobs: the trusted default, resolved once at job start ------------
+
+
+def test_helper_resolution_takes_no_requested_profile_or_caller():
+    assert list(inspect.signature(resolve_default_generation).parameters) == ["registry", "installed_digest"]
+
+
+def test_the_control_default_for_helpers_needs_no_admin_and_no_inventory():
+    snapshot = resolve_default_generation(default_model_registry(), installed_digest=_never)
+    assert snapshot.profile_id == LLAMA_CONTROL and snapshot.selection == "default"
+    assert snapshot.observed_digest is None
+    assert snapshot.helper_call(0.1).read_timeout_s == 120.0
+
+
+def test_a_qualified_candidate_default_for_helpers_needs_its_exact_digest():
+    lookups = []
+
+    def installed(tag):
+        lookups.append(tag)
+        return "sha256:" + SYNTHETIC_DIGEST.upper()
+
+    snapshot = resolve_default_generation(_qualified_registry(default=GEMMA_CANDIDATE), installed_digest=installed)
+    assert lookups == ["gemma4:31b"], "one inventory read, at job start"
+    assert snapshot.observed_digest == SYNTHETIC_DIGEST
+    helper = snapshot.helper_call(0.2).ollama_payload("p")
+    assert helper["model"] == "gemma4:31b" and helper["think"] is False
+
+
+@pytest.mark.parametrize(
+    "lookup, error",
+    [
+        (lambda tag: None, ModelIdentityMismatchError),
+        (lambda tag: OTHER_DIGEST, ModelIdentityMismatchError),
+        (lambda tag: "not-a-digest", ModelIdentityUnavailableError),
+        (lambda tag: (_ for _ in ()).throw(ConnectionError("ollama down")), ModelIdentityUnavailableError),
+    ],
+    ids=["absent", "changed", "malformed", "unreadable"],
+)
+def test_a_qualified_helper_default_with_the_wrong_identity_fails_closed(lookup, error):
+    with pytest.raises(error) as excinfo:
+        resolve_default_generation(_qualified_registry(default=GEMMA_CANDIDATE), installed_digest=lookup)
+    assert "ollama down" not in str(excinfo.value)
+
+
+def test_an_ineligible_helper_default_is_refused_before_any_lookup():
+    registry = _registry(_gemma())
+    # Simulate a registry whose invariant was broken after construction.
+    object.__setattr__(registry, "default_profile_id", GEMMA_CANDIDATE)
+    with pytest.raises(ProfileNotQualifiedError):
+        resolve_default_generation(registry, installed_digest=_never)

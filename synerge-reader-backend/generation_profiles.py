@@ -11,12 +11,16 @@ What the registry decides, and what a client can never override:
 
 * which exact local model tags may answer a question at all;
 * the native Ollama ``options`` each call sends (sampling, context window,
-  output limit), its ``keep_alive``, and how long the answer transport may
+  output limit), its ``keep_alive``, and how long each role's transport may
   wait on a read;
 * whether a ``think`` field is sent, which only happens as ``think: false``
   for a profile whose no-thinking behaviour has been evidenced;
-* the fixed, bounded Llama call used for claim verification and for the
-  background helper prompts, whichever profile wrote the answer.
+* the bounded claim-verification and background-helper calls. There is no
+  separate verifier or helper model: each role call is derived from one
+  resolved profile -- its exact tag, context window, ``keep_alive`` and think
+  policy -- with the role's own temperature, output limit and read timeout.
+  An answer's verifier comes from that answer's snapshot; a helper job uses
+  the registry default, resolved once when the job starts.
 
 The option values are the settings this backend REQUESTS. Ollama may still
 apply its own limits (for example a server-wide ``OLLAMA_NUM_PARALLEL`` or a
@@ -72,14 +76,25 @@ ANSWER_NUM_CTX = 8192
 ANSWER_NUM_PREDICT = 1200
 ANSWER_KEEP_ALIVE = "5m"
 
-# How long the answer transport may wait for one read, including the wait for
-# the first byte, which covers a cold model load. Llama keeps the previous 60 s.
+# How long each role's transport may wait for one read, including the wait for
+# the first byte, which covers a cold model load. These are per-read timeouts,
+# not caps on a whole answer or job.
+#
+# Llama keeps the values its call sites already used: 60 s for an answer, 30 s
+# for a verifier call and 120 s for a background helper call.
+#
 # Gemma's bounded smoke took 102.527 s in total, 91.783 s of it loading, so
 # 60 s would time out a cold Gemma answer before its first token. 150 s leaves
-# margin for that load plus prompt evaluation. This only removes a guaranteed
-# premature timeout; it says nothing about acceptable website latency.
+# margin for that load plus prompt evaluation. Any Gemma role call can be the
+# one that finds the model cold, so its verifier and helpers get the same
+# provisional 150 s. Gemma remains unqualified: this only removes a
+# guaranteed premature timeout and says nothing about acceptable latency.
 LLAMA_ANSWER_READ_TIMEOUT_S = 60.0
+LLAMA_VERIFIER_READ_TIMEOUT_S = 30.0
+LLAMA_HELPER_READ_TIMEOUT_S = 120.0
 GEMMA_ANSWER_READ_TIMEOUT_S = 150.0
+GEMMA_VERIFIER_READ_TIMEOUT_S = 150.0
+GEMMA_HELPER_READ_TIMEOUT_S = 150.0
 _MIN_READ_TIMEOUT_S = 1.0
 _MAX_READ_TIMEOUT_S = 600.0
 
@@ -167,6 +182,15 @@ def _require_int(name: str, value: object, low: int, high: int) -> int:
 def _require_match(name: str, pattern: re.Pattern, value: object) -> str:
     if not isinstance(value, str) or not pattern.match(value):
         raise GenerationProfileError(f"{name} is not valid: {value!r}")
+    return value
+
+
+def _require_read_timeout(name: str, value: object) -> float:
+    # _is_real_number rejects bool, so True can never pass as 1 second.
+    if not _is_real_number(value) or not _MIN_READ_TIMEOUT_S <= value <= _MAX_READ_TIMEOUT_S:
+        raise GenerationProfileError(
+            f"{name} must be a finite number in [{_MIN_READ_TIMEOUT_S}, {_MAX_READ_TIMEOUT_S}]"
+        )
     return value
 
 
@@ -278,7 +302,10 @@ class ModelProfile:
     display_name: str
     answer_options: GenerationOptions
     keep_alive: str
+    # Per-read transport timeouts for each role this profile serves.
     answer_read_timeout_s: float
+    verifier_read_timeout_s: float
+    helper_read_timeout_s: float
     # Explicit policy, never inferred from default status: True means the
     # profile may answer only with complete qualification evidence and only
     # after its installed digest matches ``expected_digest``.
@@ -298,13 +325,8 @@ class ModelProfile:
             raise GenerationProfileError("display_name must be a non-empty string")
         if not isinstance(self.answer_options, GenerationOptions):
             raise GenerationProfileError("answer_options must be GenerationOptions")
-        if not _is_real_number(self.answer_read_timeout_s) or not (
-            _MIN_READ_TIMEOUT_S <= self.answer_read_timeout_s <= _MAX_READ_TIMEOUT_S
-        ):
-            raise GenerationProfileError(
-                f"answer_read_timeout_s must be a finite number in "
-                f"[{_MIN_READ_TIMEOUT_S}, {_MAX_READ_TIMEOUT_S}]"
-            )
+        for name in ("answer_read_timeout_s", "verifier_read_timeout_s", "helper_read_timeout_s"):
+            _require_read_timeout(name, getattr(self, name))
         if not isinstance(self.requires_qualification, bool):
             raise GenerationProfileError("requires_qualification must be a bool")
         if self.qualification is not None and not isinstance(self.qualification, Qualification):
@@ -372,18 +394,77 @@ def build_generate_payload(
 
 @dataclass(frozen=True)
 class FixedModelCall:
-    """A backend-fixed call that no request can redirect: the verifier and the
-    background helpers. It never sends a think field."""
+    """A trusted role call that no request can redirect: one answer's claim
+    verifier, or one background helper call.
+
+    It is derived from a single resolved profile -- the exact tag, context
+    window, ``keep_alive`` and think policy the snapshot holds -- with the
+    role's own bounded options and per-read timeout. It holds values, never a
+    reference to the registry, so nothing that happens after resolution can
+    change it.
+
+    ``expected_digest`` is the profile's pin. ``observed_digest`` is copied
+    from the snapshot it was derived from: the installed identity read when
+    that answer or helper job was resolved, or None when no lookup was made
+    (the unqualified control). It is not a separate per-call measurement and
+    does not prove the shared tag was unchanged afterwards.
+    """
 
     profile_id: str
     model_tag: str
     options: GenerationOptions
     keep_alive: str
+    # None: no think field is sent. False: ``think: false`` is sent.
+    think: Optional[bool]
+    read_timeout_s: float
+    expected_digest: Optional[str]
+    observed_digest: Optional[str]
+
+    def __post_init__(self) -> None:
+        _require_match("profile_id", _PROFILE_ID_PATTERN, self.profile_id)
+        _require_match("model_tag", _MODEL_TAG_PATTERN, self.model_tag)
+        _require_match("keep_alive", _KEEP_ALIVE_PATTERN, self.keep_alive)
+        if not isinstance(self.options, GenerationOptions):
+            raise GenerationProfileError("options must be GenerationOptions")
+        if self.think is not None and self.think is not False:
+            raise GenerationProfileError("think may only be None or False")
+        _require_read_timeout("read_timeout_s", self.read_timeout_s)
+        for name in ("expected_digest", "observed_digest"):
+            value = getattr(self, name)
+            if value is not None and normalize_digest(value) != value:
+                raise GenerationProfileError(f"{name} must be None or 64 lowercase hex characters")
 
     def ollama_payload(self, prompt: str, *, stream: bool = False) -> dict:
         return build_generate_payload(
-            self.model_tag, prompt, self.options, self.keep_alive, stream=stream
+            self.model_tag, prompt, self.options, self.keep_alive, stream=stream, think=self.think
         )
+
+
+def _role_call(
+    *,
+    profile_id: str,
+    model_tag: str,
+    num_ctx: int,
+    keep_alive: str,
+    think: Optional[bool],
+    expected_digest: Optional[str],
+    observed_digest: Optional[str],
+    temperature: float,
+    num_predict: int,
+    read_timeout_s: float,
+) -> FixedModelCall:
+    """One bounded role call. Only the role's temperature, output limit and
+    read timeout differ from the profile the identity fields come from."""
+    return FixedModelCall(
+        profile_id=profile_id,
+        model_tag=model_tag,
+        options=GenerationOptions(temperature=temperature, num_ctx=num_ctx, num_predict=num_predict),
+        keep_alive=keep_alive,
+        think=think,
+        read_timeout_s=float(read_timeout_s),
+        expected_digest=expected_digest,
+        observed_digest=observed_digest,
+    )
 
 
 Selection = Literal["default", "admin_override"]
@@ -393,14 +474,19 @@ Selection = Literal["default", "admin_override"]
 class AnswerGenerationSnapshot:
     """Everything one answer is generated and verified with, fixed up front.
 
-    Built once per /ask request, before anything streams. It holds values, not
-    a reference to the registry, so a later selection or registry change
-    cannot alter an answer already in progress.
+    Built once per /ask request, before anything streams, and once at the
+    start of each background helper job. It holds values, not a reference to
+    the registry, so a later selection or registry change cannot alter an
+    answer or job already in progress.
 
     ``expected_digest`` is the registry's pin for this profile.
     ``observed_digest`` is what the installed-model lookup reported while
-    resolving THIS answer, and is None whenever no lookup was made (the
+    resolving THIS answer or job, and is None whenever no lookup was made (the
     unqualified control). The two are never interchangeable.
+
+    ``verifier`` is derived from this same profile and identity when the
+    snapshot is built; ``helper_call`` derives a helper call from the values
+    held here. Neither consults the registry.
     """
 
     profile_id: str
@@ -410,6 +496,7 @@ class AnswerGenerationSnapshot:
     keep_alive: str
     think: Optional[bool]
     answer_read_timeout_s: float
+    helper_read_timeout_s: float
     selection: Selection
     expected_digest: Optional[str]
     observed_digest: Optional[str]
@@ -435,6 +522,22 @@ class AnswerGenerationSnapshot:
             settings["think"] = self.think
         return settings
 
+    def helper_call(self, temperature: float) -> FixedModelCall:
+        """One bounded background helper call (insights, KB Q&A import) from
+        this snapshot's profile and identity."""
+        return _role_call(
+            profile_id=self.profile_id,
+            model_tag=self.model_tag,
+            num_ctx=self.options.num_ctx,
+            keep_alive=self.keep_alive,
+            think=self.think,
+            expected_digest=self.expected_digest,
+            observed_digest=self.observed_digest,
+            temperature=temperature,
+            num_predict=HELPER_NUM_PREDICT,
+            read_timeout_s=self.helper_read_timeout_s,
+        )
+
 
 # --------------------------------------------------------------------------
 # Registry
@@ -443,12 +546,12 @@ class AnswerGenerationSnapshot:
 
 @dataclass(frozen=True)
 class ModelRegistry:
+    """The registered profiles and the default. There is no separate verifier
+    or helper profile: those role calls are derived from whichever profile a
+    snapshot resolved."""
+
     profiles: Tuple[ModelProfile, ...]
     default_profile_id: str
-    # The profile whose tag serves verification and helpers. It must be an
-    # unqualified-control profile without a think field: those calls are made
-    # without a per-call identity check and never send a thinking field.
-    verifier_profile_id: str
     _by_id: Mapping[str, ModelProfile] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -467,13 +570,6 @@ class ModelRegistry:
             raise GenerationProfileError(
                 "the default profile requires qualification and its evidence is incomplete"
             )
-        verifier = by_id.get(self.verifier_profile_id)
-        if verifier is None:
-            raise GenerationProfileError("verifier_profile_id is not a registered profile")
-        if verifier.think is not None or verifier.requires_qualification:
-            raise GenerationProfileError(
-                "the verifier profile must be an unqualified control without a think field"
-            )
         object.__setattr__(self, "profiles", profiles)
         object.__setattr__(self, "_by_id", MappingProxyType(by_id))
 
@@ -483,27 +579,6 @@ class ModelRegistry:
     @property
     def default(self) -> ModelProfile:
         return self._by_id[self.default_profile_id]
-
-    def _fixed_call(self, temperature: float, num_predict: int) -> FixedModelCall:
-        profile = self._by_id[self.verifier_profile_id]
-        return FixedModelCall(
-            profile_id=profile.profile_id,
-            model_tag=profile.model_tag,
-            options=GenerationOptions(
-                temperature=temperature,
-                num_ctx=profile.answer_options.num_ctx,
-                num_predict=num_predict,
-            ),
-            keep_alive=profile.keep_alive,
-        )
-
-    def verifier_call(self) -> FixedModelCall:
-        """Fixed Llama verification, for answers from every profile."""
-        return self._fixed_call(VERIFIER_TEMPERATURE, VERIFIER_NUM_PREDICT)
-
-    def helper_call(self, temperature: float) -> FixedModelCall:
-        """Bounded background helper call (insights, KB Q&A import)."""
-        return self._fixed_call(temperature, HELPER_NUM_PREDICT)
 
     def is_selectable(self, profile: ModelProfile) -> bool:
         return profile.selectable
@@ -537,6 +612,8 @@ def default_model_registry() -> ModelRegistry:
                 answer_options=ANSWER_OPTIONS,
                 keep_alive=ANSWER_KEEP_ALIVE,
                 answer_read_timeout_s=LLAMA_ANSWER_READ_TIMEOUT_S,
+                verifier_read_timeout_s=LLAMA_VERIFIER_READ_TIMEOUT_S,
+                helper_read_timeout_s=LLAMA_HELPER_READ_TIMEOUT_S,
                 requires_qualification=False,
                 expected_digest=LLAMA_CONTROL_DIGEST,
             ),
@@ -547,6 +624,8 @@ def default_model_registry() -> ModelRegistry:
                 answer_options=ANSWER_OPTIONS,
                 keep_alive=ANSWER_KEEP_ALIVE,
                 answer_read_timeout_s=GEMMA_ANSWER_READ_TIMEOUT_S,
+                verifier_read_timeout_s=GEMMA_VERIFIER_READ_TIMEOUT_S,
+                helper_read_timeout_s=GEMMA_HELPER_READ_TIMEOUT_S,
                 requires_qualification=True,
                 expected_digest=GEMMA_CANDIDATE_DIGEST,
                 think=False,
@@ -554,7 +633,6 @@ def default_model_registry() -> ModelRegistry:
             ),
         ),
         default_profile_id=LLAMA_CONTROL,
-        verifier_profile_id=LLAMA_CONTROL,
     )
 
 
@@ -564,11 +642,25 @@ def default_model_registry() -> ModelRegistry:
 
 
 def _snapshot(
-    registry: ModelRegistry,
     profile: ModelProfile,
     selection: Selection,
     observed_digest: Optional[str],
 ) -> AnswerGenerationSnapshot:
+    # The verifier is this exact profile and identity with the bounded
+    # verifier options, fixed here with the answer: verification never
+    # rebuilds it from whatever the registry holds later.
+    verifier = _role_call(
+        profile_id=profile.profile_id,
+        model_tag=profile.model_tag,
+        num_ctx=profile.answer_options.num_ctx,
+        keep_alive=profile.keep_alive,
+        think=profile.think,
+        expected_digest=profile.expected_digest,
+        observed_digest=observed_digest,
+        temperature=VERIFIER_TEMPERATURE,
+        num_predict=VERIFIER_NUM_PREDICT,
+        read_timeout_s=profile.verifier_read_timeout_s,
+    )
     return AnswerGenerationSnapshot(
         profile_id=profile.profile_id,
         model_tag=profile.model_tag,
@@ -577,10 +669,11 @@ def _snapshot(
         keep_alive=profile.keep_alive,
         think=profile.think,
         answer_read_timeout_s=float(profile.answer_read_timeout_s),
+        helper_read_timeout_s=float(profile.helper_read_timeout_s),
         selection=selection,
         expected_digest=profile.expected_digest,
         observed_digest=observed_digest,
-        verifier=registry.verifier_call(),
+        verifier=verifier,
     )
 
 
@@ -601,6 +694,9 @@ def resolve_answer_generation(
     * Either way the profile must be selectable, and a profile that requires
       qualification answers only after its installed digest equals its
       expected digest. The unqualified control makes no inventory call.
+
+    The snapshot's verifier is derived from the same profile and identity, so
+    an answer is verified by the model that wrote it.
     """
     if requested_profile_id is None:
         profile, selection = registry.default, "default"
@@ -619,7 +715,7 @@ def resolve_answer_generation(
     if not profile.selectable:
         raise ProfileNotQualifiedError("model profile is not qualified for selection")
     if not profile.requires_qualification:
-        return _snapshot(registry, profile, selection, None)
+        return _snapshot(profile, selection, None)
 
     try:
         observed = installed_digest(profile.model_tag)
@@ -632,4 +728,32 @@ def resolve_answer_generation(
         raise ModelIdentityUnavailableError("installed model identity is unreadable")
     if observed != profile.expected_digest:
         raise ModelIdentityMismatchError("installed model digest differs from the expected digest")
-    return _snapshot(registry, profile, selection, observed)
+    return _snapshot(profile, selection, observed)
+
+
+def _no_admin_lookup_for_a_default() -> bool:
+    raise RuntimeError("a default resolution never consults admin authority")
+
+
+def resolve_default_generation(
+    registry: ModelRegistry,
+    *,
+    installed_digest: Callable[[str], Optional[str]],
+) -> AnswerGenerationSnapshot:
+    """The trusted registry default for one background helper job, or a
+    ModelSelectionError.
+
+    There is no requested profile and no caller here, so nothing a request
+    carries -- including an admin's per-request answer override -- can reach
+    a helper. The default goes through the same policy as an answer's
+    default: no admin lookup, the unqualified control makes no inventory call
+    (``observed_digest`` None), and a profile that requires qualification is
+    used only once its installed digest equals its expected digest. Resolve it
+    once when the job starts and use the snapshot for every call of that job.
+    """
+    return resolve_answer_generation(
+        registry,
+        requested_profile_id=None,
+        caller_is_admin=_no_admin_lookup_for_a_default,
+        installed_digest=installed_digest,
+    )

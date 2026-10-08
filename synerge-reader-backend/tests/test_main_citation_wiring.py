@@ -905,17 +905,28 @@ def test_the_runtime_claim_verifier_is_local_only(main_tree):
     ]
 
 
+def _default_verifier():
+    """The verifier call a default answer's snapshot carries."""
+    return resolve_answer_generation(
+        default_model_registry(),
+        requested_profile_id=None,
+        caller_is_admin=lambda: pytest.fail("no admin lookup for a default answer"),
+        installed_digest=lambda tag: pytest.fail("no inventory lookup for a default answer"),
+    ).verifier
+
+
 def test_the_claim_verifier_sends_bounded_native_options(main_tree):
     """Ollama reads runtime generation settings from ``options`` and ignores an
     unknown top-level ``temperature``, so the deterministic verifier setting,
-    its context window and its output cap must all travel there. The model is
-    the registry's fixed Llama verifier, never a request value, and no think
-    field is sent to it."""
+    its context window and its output cap must all travel there. The verifier
+    call is the one the resolved default answer snapshot carries (the Llama
+    control here), never a request value; no think field is sent to it and
+    its own read timeout reaches the transport."""
     namespace, calls = _route_harness(main_tree, _FakeConnection())
     records = CitationRegistry.from_bundle(_evidence_bundle()).records
 
     status = namespace["_ollama_claim_verifier"](
-        "The term is three years [C1].", records, default_model_registry().verifier_call()
+        "The term is three years [C1].", records, _default_verifier()
     )
 
     assert status == "supported"
@@ -940,7 +951,7 @@ def _verifier_result(main_tree, reply):
     namespace, _ = _route_harness(main_tree, _FakeConnection(), reply)
     records = CitationRegistry.from_bundle(_evidence_bundle()).records
     return namespace["_ollama_claim_verifier"](
-        _VERIFIED_CLAIM, records, default_model_registry().verifier_call()
+        _VERIFIED_CLAIM, records, _default_verifier()
     )
 
 

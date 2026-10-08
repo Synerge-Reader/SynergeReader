@@ -56,7 +56,6 @@ def _synthetic_registry():
             dataclasses.replace(p, expected_digest=_SYNTHETIC_DIGESTS[p.model_tag]) for p in base.profiles
         ),
         default_profile_id=LLAMA_CONTROL,
-        verifier_profile_id=LLAMA_CONTROL,
     )
 
 

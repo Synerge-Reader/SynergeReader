@@ -668,6 +668,18 @@ def test_real_ask_persists_real_provenance_with_answer_and_entry_id(monkeypatch,
     }
     assert stored["verification"]["calls_attempted"] == len(route.calls["verify"]) == 1
     assert stored["verification"]["model_tag"] == "llama3.1:8b"
+    # Schema version 2: the verifier settings that actually ran, as stored in
+    # real JSONB and read back -- the control's pin, no observation, no think
+    # field, and the 30 s verifier read timeout that reached the transport.
+    assert stored["schema_version"] == 2
+    added = ("expected_digest", "observed_digest", "think", "read_timeout_s")
+    assert {key: stored["verification"][key] for key in added} == {
+        "expected_digest": LLAMA_CONTROL_DIGEST, "observed_digest": None, "think": None, "read_timeout_s": 30.0,
+    }
+    [verify_call] = route.calls["verify"]
+    assert verify_call["timeout"] == stored["verification"]["read_timeout_s"]
+    assert "think" not in verify_call["payload"]
+    assert verify_call["payload"]["options"] == stored["verification"]["requested_options"]
     assert stored["ollama_metrics"]["done_reason"] == "stop"
     assert (stored["ollama_metrics"]["prompt_eval_count"], stored["ollama_metrics"]["eval_count"]) == (321, 9)
 

@@ -13,9 +13,13 @@ registered, qualified profile whose installed digest matches; resolution is
 fixed before streaming; generation options are native and bounded; separate
 thinking, model errors, malformed or unfinished streams, the output limit and
 any completion reason other than "stop" never produce a persisted success;
-verification uses the fixed Llama call and grades only a finished reply;
-background helpers no longer probe models, are bounded, parse or store only a
-finished reply, and log fixed categories and counts rather than content.
+verification uses the verifier call fixed in the answer's own snapshot (the
+model that wrote the answer, with bounded verifier options and its own read
+timeout) and grades only a finished reply; background helpers no longer probe
+models, resolve the trusted registry default once per job (never an admin's
+per-request override), generate and write nothing when that identity is
+unusable, are bounded, parse or store only a finished reply, and log fixed
+categories and counts rather than content.
 
 REQUIRES THE SOCKETPAIR-AWARE SIBLING GUARD (see test_main_route_harness.py):
 entering a TestClient builds a real asyncio loop.
@@ -40,6 +44,7 @@ from generation_profiles import (
     ModelRegistry,
     Qualification,
     default_model_registry,
+    resolve_answer_generation,
 )
 
 _EMBEDDING_PROFILE_KEYS = (
@@ -303,8 +308,18 @@ def _qualified_gemma_registry(default=LLAMA_CONTROL):
     return ModelRegistry(
         profiles=(base.get(LLAMA_CONTROL), gemma),
         default_profile_id=default,
-        verifier_profile_id=LLAMA_CONTROL,
     )
+
+
+def _default_verifier(main_module):
+    """The verifier call a default answer's snapshot carries, resolved from
+    the application's own registry the way /ask resolves an omitted profile."""
+    return resolve_answer_generation(
+        main_module._MODEL_REGISTRY,
+        requested_profile_id=None,
+        caller_is_admin=lambda: pytest.fail("no admin lookup for a default answer"),
+        installed_digest=lambda tag: pytest.fail("no inventory lookup for the control"),
+    ).verifier
 
 
 def _events(response):
@@ -510,12 +525,14 @@ def test_admin_override_of_a_qualified_candidate_with_its_exact_digest(
     assert generation["model"] == "gemma4:31b"
     assert generation["options"] == _BOUNDED_ANSWER_OPTIONS
     assert generation["think"] is False
-    # Verification stays on the fixed, bounded Llama call.
+    # The answer is verified by the model that wrote it: the same exact tag and
+    # think policy, with the bounded verifier options and Gemma's role timeout.
     assert ollama.verifications and all(
-        v["model"] == "llama3.1:8b" and v["options"] == _BOUNDED_VERIFIER_OPTIONS and "think" not in v
+        v["model"] == "gemma4:31b" and v["options"] == _BOUNDED_VERIFIER_OPTIONS and v["think"] is False
         for v in ollama.verifications
     )
-    assert inventory["calls"] == ["gemma4:31b"]
+    assert {c["timeout"] for c in ollama.calls if not c["stream"]} == {150.0}
+    assert inventory["calls"] == ["gemma4:31b"], "verification makes no second inventory lookup"
 
 
 def test_an_ordinary_user_still_cannot_reach_a_qualified_candidate(
@@ -571,6 +588,72 @@ def test_resolution_is_fixed_before_streaming(monkeypatch, main_module, client, 
     assert answer_call["timeout"] == 60.0, "the timeout was snapshotted with the profile too"
     [evidence] = [e for e in _events(response) if e["type"] == "evidence"]
     assert evidence["generation"]["model"] == "llama3.1:8b"
+
+
+def test_the_verifier_is_fixed_with_the_answer_even_if_the_registry_changes_mid_stream(
+    monkeypatch, main_module, client, db, ollama, inventory
+):
+    """A Gemma-default registry swapped in after resolution cannot redirect
+    the Llama answer's verification, and verification makes no lookup."""
+    real_scope = main_module._resolve_authorized_scope
+
+    def scope_then_swap(token):
+        monkeypatch.setattr(main_module, "_MODEL_REGISTRY", _qualified_gemma_registry(default=GEMMA_CANDIDATE))
+        return real_scope(token)
+
+    monkeypatch.setattr(main_module, "_resolve_authorized_scope", scope_then_swap)
+
+    response = _ask(client, "tok-alice", active_document_id=10)
+
+    assert _events(response)[-1] == {"type": "done", "ok": True}
+    [verification] = [call for call in ollama.calls if not call["stream"]]
+    assert verification["payload"]["model"] == "llama3.1:8b" and "think" not in verification["payload"]
+    assert verification["payload"]["options"] == _BOUNDED_VERIFIER_OPTIONS
+    assert verification["timeout"] == 30.0
+    assert inventory["calls"] == []
+
+
+def test_an_override_answer_keeps_its_verifier_if_the_registry_changes_mid_stream(
+    monkeypatch, main_module, client, db, ollama, inventory
+):
+    monkeypatch.setattr(main_module, "_MODEL_REGISTRY", _qualified_gemma_registry())
+    real_scope = main_module._resolve_authorized_scope
+
+    def scope_then_swap(token):
+        # The production registry, in which Gemma is unqualified again.
+        monkeypatch.setattr(main_module, "_MODEL_REGISTRY", default_model_registry())
+        return real_scope(token)
+
+    monkeypatch.setattr(main_module, "_resolve_authorized_scope", scope_then_swap)
+
+    response = _ask(client, "tok-admin", model_profile_id=GEMMA_CANDIDATE, active_document_id=40)
+
+    assert _events(response)[-1] == {"type": "done", "ok": True}
+    [verification] = [call for call in ollama.calls if not call["stream"]]
+    assert verification["payload"]["model"] == "gemma4:31b" and verification["payload"]["think"] is False
+    assert verification["payload"]["options"] == _BOUNDED_VERIFIER_OPTIONS
+    assert verification["timeout"] == 150.0
+    assert inventory["calls"] == ["gemma4:31b"], "one lookup, at resolution; none per verifier call"
+
+
+def test_a_qualified_gemma_default_answer_is_verified_by_gemma(
+    monkeypatch, main_module, client, db, ollama, inventory
+):
+    monkeypatch.setattr(main_module, "_MODEL_REGISTRY", _qualified_gemma_registry(default=GEMMA_CANDIDATE))
+
+    response = _ask(client, "tok-alice", active_document_id=10)
+
+    events = _events(response)
+    assert events[-1] == {"type": "done", "ok": True}
+    [verification] = [call for call in ollama.calls if not call["stream"]]
+    assert verification["payload"] == {
+        "model": "gemma4:31b", "prompt": verification["payload"]["prompt"], "stream": False,
+        "options": _BOUNDED_VERIFIER_OPTIONS, "keep_alive": "5m", "think": False,
+    }
+    assert verification["timeout"] == 150.0
+    [claims] = [e["claims"] for e in events if e["type"] == "verification"]
+    assert [c["status"] for c in claims] == ["supported"]
+    assert _ACTIVE_ADMIN not in db.statements and inventory["calls"] == ["gemma4:31b"]
 
 
 # --- a qualified candidate as the default (synthetic registry only) -----------
@@ -632,8 +715,9 @@ def test_each_resolved_profile_reaches_the_transport_with_its_own_timeout(
     assert answers == [("llama3.1:8b", 60.0), ("gemma4:31b", 150.0)], (
         "a request field cannot change the transport timeout"
     )
-    assert {c["timeout"] for c in ollama.calls if not c["stream"]} == {30}, (
-        "the verifier keeps its existing finite timeout"
+    verifications = [(c["payload"]["model"], c["timeout"]) for c in ollama.calls if not c["stream"]]
+    assert verifications == [("llama3.1:8b", 30.0), ("gemma4:31b", 150.0)], (
+        "each verifier call carries its own profile's finite role timeout"
     )
 
 
@@ -750,13 +834,14 @@ def test_the_verifier_reads_only_a_complete_response(main_module, ollama, body, 
     records = [type("R", (), {"citation_id": "C1", "evidence_text": "Term: two years."})()]
 
     status = main_module._ollama_claim_verifier(
-        "The term is two years [C1].", records, main_module._MODEL_REGISTRY.verifier_call()
+        "The term is two years [C1].", records, _default_verifier(main_module)
     )
 
     assert status == expected
     [call] = ollama.calls
     assert call["payload"]["model"] == "llama3.1:8b"
     assert call["payload"]["options"] == _BOUNDED_VERIFIER_OPTIONS
+    assert call["timeout"] == 30.0, "the captured verifier read timeout reaches the transport"
 
 
 def test_a_verifier_error_reply_is_unavailable_never_supported(client, db, ollama):
@@ -793,7 +878,7 @@ def test_an_unfinished_verifier_reply_is_never_a_status(main_module, ollama, cas
     records = [type("R", (), {"citation_id": "C1", "evidence_text": "Term: two years."})()]
 
     status = main_module._ollama_claim_verifier(
-        "The term is two years [C1].", records, main_module._MODEL_REGISTRY.verifier_call()
+        "The term is two years [C1].", records, _default_verifier(main_module)
     )
 
     assert status is None
@@ -853,7 +938,7 @@ def _record_helper_posts(monkeypatch, main_module, reply_text):
     posts = []
 
     def post(url, json=None, timeout=None):
-        posts.append({"url": url, "json": json})
+        posts.append({"url": url, "json": json, "timeout": timeout})
         return _HelperReply(reply_text)
 
     monkeypatch.setattr(main_module, "get_active_ollama_base_url", lambda: "http://ollama.invalid")
@@ -882,6 +967,7 @@ def test_insight_extraction_is_one_bounded_llama_call(monkeypatch, main_module, 
 
     assert [p["url"] for p in posts] == ["http://ollama.invalid/api/generate"]
     _assert_bounded_helper(posts[0]["json"], 0.1)
+    assert posts[0]["timeout"] == (5, 120.0), "5 s connect, the control's 120 s helper read timeout"
 
 
 def test_kb_pair_generation_is_bounded_and_never_probes(monkeypatch, main_module):
@@ -893,6 +979,7 @@ def test_kb_pair_generation_is_bounded_and_never_probes(monkeypatch, main_module
     assert len(posts) == 2, "one call per excerpt and no probe calls"
     for post in posts:
         _assert_bounded_helper(post["json"], 0.2)
+        assert post["timeout"] == (5, 120.0)
 
 
 # --- background helpers: only a finished reply is parsed or stored -----------
@@ -916,8 +1003,10 @@ def _helper_replies(monkeypatch, main_module, *replies):
     queue = list(replies)
 
     def post(url, json=None, timeout=None):
-        posts.append({"url": url, "json": json})
+        posts.append({"url": url, "json": json, "timeout": timeout})
         reply = queue.pop(0)
+        if callable(reply) and not isinstance(reply, BaseException):
+            reply = reply()  # a reply that acts (e.g. replaces the registry) when served
         if isinstance(reply, BaseException):
             raise reply
         return _HelperBody(reply)
@@ -1208,3 +1297,192 @@ def test_failed_qa_replies_log_no_private_text(monkeypatch, main_module, capsys,
 
     assert pairs == []
     assert _assert_logs_are_private(capsys).strip(), "the failures are still logged"
+
+
+# --- background helpers: the trusted default, resolved once per job ----------
+
+
+def _assert_gemma_helper(payload, temperature):
+    assert payload == {
+        "model": "gemma4:31b",
+        "prompt": payload["prompt"],
+        "stream": False,
+        "options": {"temperature": temperature, "num_ctx": 8192, "num_predict": 1200},
+        "keep_alive": "5m",
+        "think": False,
+    }
+
+
+def _no_admin_lookup(monkeypatch, main_module):
+    monkeypatch.setattr(
+        main_module, "_caller_is_admin", lambda token: pytest.fail("a helper never consults admin authority")
+    )
+
+
+def test_control_helpers_make_no_inventory_or_admin_lookup(monkeypatch, main_module, inventory):
+    _no_admin_lookup(monkeypatch, main_module)
+    table = _InsightsTable({})
+    monkeypatch.setattr(main_module, "connect_to_postgres", table.connect)
+    posts = _helper_replies(
+        monkeypatch, main_module,
+        _finished(_REPLACEMENT_INSIGHTS), _finished(_QA_REPLY_ONE), _finished(_QA_REPLY_TWO),
+    )
+
+    main_module._extract_document_insights(10, "alice-lease.txt", _INSIGHT_DOCUMENT_TEXT)
+    pairs = main_module._generate_qa_pairs_from_text(_QA_TEXT, "label")
+
+    assert inventory["calls"] == [], "the unqualified control is never looked up"
+    assert pairs == [_QA_PAIR_ONE, _QA_PAIR_TWO] and table.commits == 1
+    _assert_bounded_helper(posts[0]["json"], 0.1)
+    for post in posts[1:]:
+        _assert_bounded_helper(post["json"], 0.2)
+    assert {post["timeout"] for post in posts} == {(5, 120.0)}
+
+
+def test_a_qualified_candidate_default_routes_both_helpers_with_its_identity(monkeypatch, main_module, inventory):
+    monkeypatch.setattr(main_module, "_MODEL_REGISTRY", _qualified_gemma_registry(default=GEMMA_CANDIDATE))
+    _no_admin_lookup(monkeypatch, main_module)
+    table = _InsightsTable({})
+    monkeypatch.setattr(main_module, "connect_to_postgres", table.connect)
+    posts = _helper_replies(
+        monkeypatch, main_module,
+        _finished(_REPLACEMENT_INSIGHTS), _finished(_QA_REPLY_ONE), _finished(_QA_REPLY_TWO),
+    )
+
+    main_module._extract_document_insights(10, "alice-lease.txt", _INSIGHT_DOCUMENT_TEXT)
+    assert inventory["calls"] == ["gemma4:31b"], "the insight job read the identity once, before generating"
+    pairs = main_module._generate_qa_pairs_from_text(_QA_TEXT, "label")
+    assert inventory["calls"] == ["gemma4:31b", "gemma4:31b"], "one read per job, never one per excerpt"
+
+    assert pairs == [_QA_PAIR_ONE, _QA_PAIR_TWO] and table.commits == 1
+    _assert_gemma_helper(posts[0]["json"], 0.1)
+    for post in posts[1:]:
+        _assert_gemma_helper(post["json"], 0.2)
+    assert {post["timeout"] for post in posts} == {(5, 150.0)}, "5 s connect, Gemma's helper read timeout"
+
+
+def test_an_admin_answer_override_never_reaches_a_helper(monkeypatch, main_module, client, db, ollama, inventory):
+    monkeypatch.setattr(main_module, "_MODEL_REGISTRY", _qualified_gemma_registry())
+    response = _ask(client, "tok-admin", model_profile_id=GEMMA_CANDIDATE, active_document_id=40)
+    assert _events(response)[-1] == {"type": "done", "ok": True}
+    assert [generation["model"] for generation in ollama.generations] == ["gemma4:31b"]
+
+    table = _InsightsTable({})
+    monkeypatch.setattr(main_module, "connect_to_postgres", table.connect)
+    posts = _helper_replies(monkeypatch, main_module, _finished(_REPLACEMENT_INSIGHTS))
+    main_module._extract_document_insights(40, "admin-memo.txt", _INSIGHT_DOCUMENT_TEXT)
+
+    [post] = posts
+    _assert_bounded_helper(post["json"], 0.1)
+    assert post["timeout"] == (5, 120.0)
+    assert inventory["calls"] == ["gemma4:31b"], "only the answer's own lookup; the helper used the default"
+
+
+_UNUSABLE_HELPER_IDENTITIES = {
+    "absent": (None, None, "ModelIdentityMismatchError"),
+    "digest-changed": ("77" * 32, None, "ModelIdentityMismatchError"),
+    "inventory-unavailable": (
+        None, ConnectionError(f"{_PRIVATE} http://ollama.internal:11434 refused"), "ModelIdentityUnavailableError",
+    ),
+    "malformed-digest": ("not-a-digest", None, "ModelIdentityUnavailableError"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_UNUSABLE_HELPER_IDENTITIES))
+def test_an_unusable_candidate_identity_stops_both_helpers_before_generation(
+    monkeypatch, main_module, inventory, capsys, case
+):
+    digest, error, refusal = _UNUSABLE_HELPER_IDENTITIES[case]
+    monkeypatch.setattr(main_module, "_MODEL_REGISTRY", _qualified_gemma_registry(default=GEMMA_CANDIDATE))
+    inventory["digest"], inventory["error"] = digest, error
+    table = _InsightsTable({10: _EXISTING_INSIGHT})
+    monkeypatch.setattr(main_module, "connect_to_postgres", table.connect)
+    posts = _helper_replies(monkeypatch, main_module)  # nothing queued: any request would be recorded
+    capsys.readouterr()
+
+    main_module._extract_document_insights(10, f"{_PRIVATE}-lease.pdf", _PRIVATE_TEXT)
+    pairs = main_module._generate_qa_pairs_from_text(_PRIVATE_TEXT * 10, f"{_PRIVATE}.example")
+
+    assert posts == [], "no generation request was made"
+    assert pairs == [], "Q&A contributes no pairs"
+    assert table.connections == 0 and table.statements == [] and table.commits == 0, "no INSERT or upsert"
+    assert table.rows == {10: _EXISTING_INSIGHT}, "the existing row is untouched"
+    assert inventory["calls"] == ["gemma4:31b", "gemma4:31b"]
+    assert _assert_logs_are_private(capsys).splitlines() == [
+        f"[Insights] Helper model unavailable ({refusal}); insight extraction skipped",
+        f"[KB] Helper model unavailable ({refusal}); Q&A generation skipped",
+    ]
+
+
+def test_an_ineligible_default_stops_both_helpers_without_any_lookup(monkeypatch, main_module, inventory, capsys):
+    registry = default_model_registry()
+    # Simulate a registry whose default invariant was broken after
+    # construction: the production Gemma is unqualified.
+    object.__setattr__(registry, "default_profile_id", GEMMA_CANDIDATE)
+    monkeypatch.setattr(main_module, "_MODEL_REGISTRY", registry)
+    table = _InsightsTable({10: _EXISTING_INSIGHT})
+    monkeypatch.setattr(main_module, "connect_to_postgres", table.connect)
+    posts = _helper_replies(monkeypatch, main_module)
+    capsys.readouterr()
+
+    main_module._extract_document_insights(10, "alice-lease.txt", _INSIGHT_DOCUMENT_TEXT)
+    pairs = main_module._generate_qa_pairs_from_text(_QA_TEXT, "label")
+
+    assert posts == [] and pairs == [] and inventory["calls"] == []
+    assert table.connections == 0 and table.rows == {10: _EXISTING_INSIGHT}
+    assert _assert_logs_are_private(capsys).splitlines() == [
+        "[Insights] Helper model unavailable (ProfileNotQualifiedError); insight extraction skipped",
+        "[KB] Helper model unavailable (ProfileNotQualifiedError); Q&A generation skipped",
+    ]
+
+
+@pytest.mark.parametrize("case", ["reason-load", "reason-length", "thinking-only", "model-error", "not-an-object"])
+def test_an_unfinished_candidate_insight_reply_stores_nothing(monkeypatch, main_module, inventory, case):
+    monkeypatch.setattr(main_module, "_MODEL_REGISTRY", _qualified_gemma_registry(default=GEMMA_CANDIDATE))
+    table = _InsightsTable({10: _EXISTING_INSIGHT})
+    monkeypatch.setattr(main_module, "connect_to_postgres", table.connect)
+    posts = _helper_replies(monkeypatch, main_module, _unfinished_replies(_REPLACEMENT_INSIGHTS)[case])
+
+    main_module._extract_document_insights(10, "alice-lease.txt", _INSIGHT_DOCUMENT_TEXT)
+
+    [post] = posts
+    _assert_gemma_helper(post["json"], 0.1)
+    assert table.connections == 0 and table.statements == [] and table.rows == {10: _EXISTING_INSIGHT}
+
+
+def test_the_qa_job_keeps_its_snapshot_across_excerpts(monkeypatch, main_module, inventory):
+    gemma_default = _qualified_gemma_registry(default=GEMMA_CANDIDATE)
+
+    def swap_then_reply():
+        # Served for the first excerpt: the registry changes mid-job.
+        monkeypatch.setattr(main_module, "_MODEL_REGISTRY", gemma_default)
+        return _finished(_QA_REPLY_ONE)
+
+    posts = _helper_replies(monkeypatch, main_module, swap_then_reply, _finished(_QA_REPLY_TWO))
+
+    pairs = main_module._generate_qa_pairs_from_text(_QA_TEXT, "label")
+
+    assert main_module._MODEL_REGISTRY is gemma_default, "the swap really happened between excerpts"
+    assert pairs == [_QA_PAIR_ONE, _QA_PAIR_TWO]
+    for post in posts:
+        _assert_bounded_helper(post["json"], 0.2)
+        assert post["timeout"] == (5, 120.0)
+    assert inventory["calls"] == [], "the job was not resolved again for its second excerpt"
+
+
+def test_a_candidate_qa_job_keeps_its_snapshot_if_the_registry_reverts(monkeypatch, main_module, inventory):
+    monkeypatch.setattr(main_module, "_MODEL_REGISTRY", _qualified_gemma_registry(default=GEMMA_CANDIDATE))
+    production = default_model_registry()
+
+    def revert_then_reply():
+        monkeypatch.setattr(main_module, "_MODEL_REGISTRY", production)
+        return _finished(_QA_REPLY_ONE)
+
+    posts = _helper_replies(monkeypatch, main_module, revert_then_reply, _finished(_QA_REPLY_TWO))
+
+    assert main_module._generate_qa_pairs_from_text(_QA_TEXT, "label") == [_QA_PAIR_ONE, _QA_PAIR_TWO]
+    assert main_module._MODEL_REGISTRY is production
+    for post in posts:
+        _assert_gemma_helper(post["json"], 0.2)
+    assert {post["timeout"] for post in posts} == {(5, 150.0)}
+    assert inventory["calls"] == ["gemma4:31b"]
