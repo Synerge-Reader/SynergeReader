@@ -1059,6 +1059,8 @@ class _InsightsTable:
         self.statements = []
         self.connections = 0
         self.commits = 0
+        self.connection_closes = 0
+        self.cursor_closes = 0
 
     def connect(self):
         self.connections += 1
@@ -1082,7 +1084,7 @@ class _InsightsConnection:
         self.pending = {}
 
     def close(self):
-        pass
+        self._table.connection_closes += 1
 
 
 class _InsightsCursor:
@@ -1097,6 +1099,9 @@ class _InsightsCursor:
         document_id, *values = params
         self._connection.pending[document_id] = tuple(values)
 
+    def close(self):
+        self._connection._table.cursor_closes += 1
+
 
 def test_a_finished_insight_reply_upserts_the_row(monkeypatch, main_module):
     """Control for the test below: this fake really applies the upsert."""
@@ -1110,6 +1115,7 @@ def test_a_finished_insight_reply_upserts_the_row(monkeypatch, main_module):
     assert table.rows[10][:4] == (
         "Replacement", json.dumps(["new"]), json.dumps(["A replacement fact."]), json.dumps(["Bob"])
     )
+    assert (table.cursor_closes, table.connection_closes) == (1, 1), "cursor and connection closed once"
 
 
 @pytest.mark.parametrize("case", _UNFINISHED_CASES)

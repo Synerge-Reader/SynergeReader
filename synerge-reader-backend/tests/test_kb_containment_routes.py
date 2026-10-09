@@ -62,6 +62,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from helper_jobs import EnqueueOutcome
+
 
 _MAIN_PY_PATH = Path(__file__).resolve().parents[1] / "main.py"
 
@@ -919,11 +921,23 @@ def test_deleting_a_user_requires_an_admin(client, db, params, status):
 
 @pytest.fixture
 def followups(monkeypatch, main_module):
-    started = []
-    monkeypatch.setattr(
-        main_module, "_start_background_task", lambda target, args: started.append(target)
-    )
-    return started
+    """Document ids admitted to the bounded insights queue -- the only
+    post-commit follow-up. Nothing runs: no worker, model or extra query."""
+    admitted = []
+
+    class _RecordingInsightsQueue:
+        def start(self):
+            return True
+
+        def close(self):
+            pass
+
+        def enqueue(self, document_id):
+            admitted.append(document_id)
+            return EnqueueOutcome.ACCEPTED
+
+    monkeypatch.setattr(main_module, "_INSIGHTS_QUEUE", _RecordingInsightsQueue())
+    return admitted
 
 
 @pytest.fixture
@@ -956,7 +970,7 @@ def test_an_active_user_uploads_asks_with_citations_and_sees_history(
         "the uploaded document belongs to the uploader"
     )
     assert document_id in db.chunks
-    assert followups == [main_module._extract_document_insights]
+    assert followups == [document_id], "only the committed id is queued, for insights"
 
     ask = client.post(
         "/ask",

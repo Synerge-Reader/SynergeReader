@@ -82,6 +82,8 @@ from answer_provenance import (
     new_trace_id,
 )
 from release_metadata import API_CONTRACT_VERSION, release_metadata_from_env
+from generation_admission import HelperCall
+from helper_jobs import EnqueueOutcome, HelperJobQueue, HelperQueueSettings
 import requests
 import json
 import time
@@ -104,7 +106,15 @@ load_dotenv()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Initialize required database state before accepting requests."""
+    """Initialize required database state before accepting requests.
+
+    The background-insights workers start only after initialization has
+    succeeded. A failed worker start leaves that queue unavailable while the
+    application still serves. Shutdown closes the same queue's intake and
+    signals its workers without waiting for them; it proves nothing about
+    model work already submitted, and its in-memory accounting is kept for a
+    later lifespan in the same process.
+    """
     try:
         _initialize_application()
     except VectorSchemaError as exc:
@@ -115,7 +125,12 @@ async def lifespan(_app: FastAPI):
             flush=True,
         )
         raise
-    yield
+    insights_queue = _INSIGHTS_QUEUE
+    _start_insights_queue(insights_queue)
+    try:
+        yield
+    finally:
+        _close_insights_queue(insights_queue)
 
 
 app = FastAPI(title="SynergeReader API", version=API_CONTRACT_VERSION, lifespan=lifespan)
@@ -688,23 +703,31 @@ def _extract_json_block(raw: str) -> Optional[dict]:
         return None
 
 
-def _extract_document_insights(doc_id: int, filename: str, text: str):
+def _extract_document_insights(doc_id: int, filename: str, text: str, *, recorder: Optional[HelperCall] = None):
     """Ask the LLM to read a document and pull out a type classification, key
     facts, keywords, and named entities/parties — then store one row per
-    document for the admin dashboard's Insights tab. Runs in a background
-    daemon thread; never blocks the upload response, and any failure here is
-    non-critical (the document itself is already saved and usable).
+    document for the admin dashboard's Insights tab. Runs on a background
+    insights-queue worker (see _run_insight_job); never blocks the upload
+    response, and any failure here is non-critical (the document itself is
+    already saved and usable).
 
     The reply must be a finished generation (see completed_generate_response)
     before anything is parsed or stored: an unfinished, cut-off, blank or error
     reply writes nothing, so an existing insights row is never overwritten
     from it. Log lines carry fixed categories and counts only -- never the
     filename, the text, the model output or values parsed from it, or
-    exception text.
+    exception text. The insights connection and cursor are closed on every
+    path, and an uncommitted write is rolled back.
 
     The model is resolved once when the job starts (see
     _resolve_helper_generation); if it cannot be resolved, nothing is
-    generated or stored."""
+    generated or stored.
+
+    ``recorder`` (optional, keyword-only) is the queue's record of this job's
+    model call: it is told immediately before the POST is invoked, and is
+    shown the decoded reply body, so a call whose termination was never
+    observed stays accounted for even though this function swallows its own
+    errors. Direct calls without it behave exactly as before."""
     if len(text.strip()) < 200:
         return
     try:
@@ -736,13 +759,19 @@ Document excerpt ({filename}):
 JSON:"""
 
     try:
+        payload = helper.ollama_payload(prompt, stream=False)
+        if recorder is not None:
+            recorder.dispatching()
         resp = requests.post(
             f"{base_url}/api/generate",
-            json=helper.ollama_payload(prompt, stream=False),
+            json=payload,
             timeout=(5, helper.read_timeout_s),
         )
         resp.raise_for_status()
-        reply = completed_generate_response(resp.json())
+        body = resp.json()
+        if recorder is not None:
+            recorder.observed(body)
+        reply = completed_generate_response(body)
         if reply is None:
             print("[Insights] Reply was not a completed response; nothing stored")
             return
@@ -758,25 +787,119 @@ JSON:"""
         entities = [str(e).strip() for e in (parsed.get("entities") or []) if str(e).strip()][:10]
 
         conn = connect_to_postgres()
-        c = conn.cursor()
-        c.execute(
-            """
-            INSERT INTO document_insights (document_id, doc_type, keywords, facts, entities, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (document_id) DO UPDATE SET
-                doc_type = EXCLUDED.doc_type,
-                keywords = EXCLUDED.keywords,
-                facts = EXCLUDED.facts,
-                entities = EXCLUDED.entities,
-                created_at = EXCLUDED.created_at
-            """,
-            (doc_id, doc_type, json.dumps(keywords), json.dumps(facts), json.dumps(entities), datetime.datetime.now().isoformat()),
-        )
-        conn.commit()
-        conn.close()
+        if conn is None:
+            print("[Insights] Extraction failed (non-critical): connection unavailable")
+            return
+        c = None
+        committed = False
+        try:
+            c = conn.cursor()
+            c.execute(
+                """
+                INSERT INTO document_insights (document_id, doc_type, keywords, facts, entities, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (document_id) DO UPDATE SET
+                    doc_type = EXCLUDED.doc_type,
+                    keywords = EXCLUDED.keywords,
+                    facts = EXCLUDED.facts,
+                    entities = EXCLUDED.entities,
+                    created_at = EXCLUDED.created_at
+                """,
+                (doc_id, doc_type, json.dumps(keywords), json.dumps(facts), json.dumps(entities), datetime.datetime.now().isoformat()),
+            )
+            conn.commit()
+            committed = True
+        finally:
+            if not committed:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            _close_db_quietly(c, conn)
         print(f"[Insights] Stored: {len(keywords)} keywords, {len(facts)} facts, {len(entities)} entities")
     except Exception as e:
         print(f"[Insights] Extraction failed (non-critical): {type(e).__name__}")
+
+
+def _close_db_quietly(cursor, connection) -> bool:
+    """Close an acquired cursor and connection, each at most once; ``None`` is
+    never closed. Returns False if either close raised. Nothing about the
+    failure is logged or kept."""
+    closed = True
+    if cursor is not None:
+        try:
+            cursor.close()
+        except Exception:
+            closed = False
+    if connection is not None:
+        try:
+            connection.close()
+        except Exception:
+            closed = False
+    return closed
+
+
+class _InsightSourceUnavailable(Exception):
+    """The queued document's current row could not be read. Carries no detail."""
+
+
+# The CURRENT row of one document that still has no insights row, by its exact
+# id: the same eligibility the pending-analysis selection uses. Insights stay
+# a per-document row derived only from that document's own stored text.
+_PENDING_INSIGHT_SOURCE_SQL = """
+    SELECT d.filename, d.content
+    FROM documents d
+    LEFT JOIN document_insights di ON di.document_id = d.id
+    WHERE d.id = %s AND di.id IS NULL
+"""
+
+
+def _load_pending_insight_source(document_id: int):
+    """``(filename, content)`` for a document still awaiting insights, or None
+    when it was deleted or already analysed. Opens its own connection and
+    closes cursor and connection before returning; any database failure raises
+    the detail-free _InsightSourceUnavailable."""
+    conn = None
+    cursor = None
+    row = None
+    failed = False
+    try:
+        conn = connect_to_postgres()
+        if conn is None:
+            failed = True
+        else:
+            cursor = conn.cursor()
+            cursor.execute(_PENDING_INSIGHT_SOURCE_SQL, (document_id,))
+            row = cursor.fetchone()
+    except Exception:
+        failed = True
+    _close_db_quietly(cursor, conn)
+    if failed:
+        # Raised outside the except block: nothing chains onto it.
+        raise _InsightSourceUnavailable()
+    return row
+
+
+def _run_insight_job(document_id: int, call: HelperCall) -> None:
+    """One queued insights job, run by an insights-queue worker that already
+    holds background model capacity. Reloads the current row by its exact id
+    when the job actually starts -- nothing private ever waited in the queue --
+    and skips a document that was deleted or analysed meanwhile. ``call``
+    records whether the model was invoked and whether its termination was
+    observed."""
+    try:
+        row = _load_pending_insight_source(document_id)
+    except _InsightSourceUnavailable:
+        print("[Insights] Queued document could not be loaded; skipped")
+        return
+    if row is None:
+        print("[Insights] Queued document is no longer pending; skipped")
+        return
+    filename, content = row[0], row[1]
+    if not isinstance(filename, str) or not isinstance(content, str):
+        print("[Insights] Queued document is not readable text; skipped")
+        return
+    _extract_document_insights(document_id, filename, content, recorder=call)
 
 
 async def hash_password(password: str) -> str:
@@ -864,30 +987,53 @@ class _PostCommitDispatchError(RuntimeError):
     """
 
 
-def _start_background_task(target, args) -> None:
-    """Construct and start one daemon follow-up thread.
+# Background insights run through ONE bounded, id-only queue per process:
+# ``workers`` threads sharing as many background model slots, and at most
+# ``max_queued`` waiting document ids (see helper_jobs.py). These are
+# provisional local values, not measured production capacity. Constructing the
+# queue starts no thread and does no I/O; the lifespan starts its workers.
+_INSIGHTS_QUEUE_SETTINGS = HelperQueueSettings(workers=1, max_queued=100)
+_INSIGHTS_QUEUE = HelperJobQueue(
+    settings=_INSIGHTS_QUEUE_SETTINGS,
+    # Looked up when each job runs, never captured per item.
+    run_job=lambda document_id, call: _run_insight_job(document_id, call),
+)
 
-    Deliberately does NOT suppress a construction or start failure. A follow-up
-    that never began is something the caller has to know about, so that the
-    ingestion service can record its fixed post-commit warning; swallowing it
-    here would report a clean ingestion for work that never ran.
+_ENQUEUE_FAILURE_LABELS = {
+    EnqueueOutcome.FULL: "queue full",
+    EnqueueOutcome.UNAVAILABLE: "queue unavailable",
+}
 
-    Isolated as its own module-level function so the post-commit dispatcher can
-    be exercised without spawning real threads.
-    """
-    from threading import Thread
-    Thread(target=target, args=args, daemon=True).start()
+
+def _start_insights_queue(queue) -> None:
+    """Start the background-insights workers; a failure leaves the queue
+    unavailable (its own fixed log line) and never stops the application."""
+    try:
+        queue.start()
+    except Exception:
+        print("[Insights] Queue worker could not start; background insights unavailable")
+
+
+def _close_insights_queue(queue) -> None:
+    """Close intake and signal the workers; never waits and never raises."""
+    try:
+        queue.close()
+    except Exception:
+        print("[Insights] Queue could not be closed cleanly")
 
 
 def _dispatch_upload_followups(committed: CommittedDocument) -> None:
-    """Post-commit work for one ingested document.
+    """Post-commit work for one ingested document: queue its insights.
 
     DocumentIngestionService calls this only after the document's transaction
     has committed and its connection has been closed, and treats any failure
     here as a warning on an already-indexed result -- so a follow-up can never
-    turn a committed document into a reported ingestion failure. Each
-    follow-up receives the committed document id, the service-sanitized
-    filename, and the server-extracted text.
+    turn a committed document into a reported ingestion failure.
+
+    Only the committed document id is queued. The filename and server-extracted
+    text stay out of the queue: the worker reloads the current row by that id
+    when the job actually starts (see _run_insight_job). An id that is already
+    queued, running or unresolved is a no-op.
 
     Security containment (PR #54): generate_kb_from_document is deliberately
     NOT dispatched. It writes Q&A pairs derived from the uploaded text into
@@ -896,33 +1042,25 @@ def _dispatch_upload_followups(committed: CommittedDocument) -> None:
     disabled until the knowledge base is user-owned. Document insights are a
     per-document row and are unaffected.
 
-    Every follow-up is attempted even if an earlier one cannot be started, and
-    only the FACT of a failed start is recorded -- never the exception, its
-    text, or anything about the document. If any start failed, one generic
-    _PostCommitDispatchError is raised after all attempts.
-
-    Scope of what this can detect: only a failure to START a thread. Once a
-    follow-up thread is running, it owns its own errors (its target already
-    swallows and logs its own failures), and nothing that happens inside it
-    afterwards can be observed synchronously here or turned into a warning on
-    the ingestion result.
+    A full or unavailable queue, or any admission failure, raises one generic
+    _PostCommitDispatchError; only a fixed category is logged -- never the
+    exception, its text, or anything about the document. Once admitted, the
+    job's own outcome cannot be observed here or turned into a warning on the
+    ingestion result.
     """
-    payload = (committed.document_id, committed.filename, committed.text)
-    failed_starts = 0
-    for follow_up in (_extract_document_insights,):
-        try:
-            _start_background_task(follow_up, payload)
-        except Exception:
-            # Only the count is kept. The exception object is never bound,
-            # logged, re-raised, or attached to anything that leaves here.
-            failed_starts += 1
-
-    if failed_starts:
-        # Raised outside the except block on purpose: with no active exception
-        # context there is no implicit chaining, so the original error cannot
-        # ride along on __context__ into any caller's log.
-        print(f"[Upload] post-commit follow-ups not started: {failed_starts}")
-        raise _PostCommitDispatchError("post-commit follow-up could not be started")
+    outcome = None
+    try:
+        outcome = _INSIGHTS_QUEUE.enqueue(committed.document_id)
+    except Exception:
+        # Not bound, logged, re-raised or chained: only the fact is kept.
+        outcome = None
+    if outcome in (EnqueueOutcome.ACCEPTED, EnqueueOutcome.DUPLICATE):
+        return
+    # Raised outside the except block on purpose: with no active exception
+    # context there is no implicit chaining, so the original error cannot
+    # ride along on __context__ into any caller's log.
+    print(f"[Upload] post-commit insights not queued: {_ENQUEUE_FAILURE_LABELS.get(outcome, 'admission failed')}")
+    raise _PostCommitDispatchError("post-commit follow-up could not be started")
 
 
 def _build_ingestion_service() -> DocumentIngestionService:
@@ -3599,58 +3737,99 @@ async def admin_document_insights(token: Optional[str] = None, limit: int = 40):
         raise HTTPException(500, str(e))
 
 
+# Documents still without an insights row, newest first. Ids only: the queue
+# never holds content or filenames, and each job reloads its own row.
+_PENDING_INSIGHT_IDS_SQL = """
+    SELECT d.id
+    FROM documents d
+    LEFT JOIN document_insights di ON di.document_id = d.id
+    WHERE di.id IS NULL
+    ORDER BY d.upload_timestamp DESC
+    LIMIT %s
+"""
+_INSIGHTS_BACKFILL_UNAVAILABLE = "Insight analysis is temporarily unavailable. Please try again shortly."
+
+
 @app.post("/admin/document_insights/analyze_pending")
 async def admin_analyze_pending_documents(token: Optional[str] = None, max_docs: int = 15):
     """Backfill insight extraction for documents uploaded before this feature
-    existed (or any that failed the first time). Kicks off background
-    extraction threads and returns immediately — the admin refreshes the
-    Insights tab a little later to see results land."""
-    conn = connect_to_postgres()
+    existed (or any that failed the first time). Queues the ids of up to
+    ``max_docs`` (1..50) documents that still have no insights row and returns
+    immediately -- the admin refreshes the Insights tab a little later to see
+    results land.
+
+    ``queued`` counts only ids newly accepted now; ``already_pending`` counts
+    ids already queued, running or unresolved, and ``capacity_rejected`` ids
+    turned away because the queue was full. A database or queue that cannot
+    serve the request is a fixed 503 with nothing queued; 401/403 are kept."""
+    conn = None
+    cursor = None
+    denied = None
+    pending_ids = None
     try:
-        c = conn.cursor()
-        _require_admin(c, token)
-
-        c.execute(
-            """
-            SELECT d.id, d.filename, d.content
-            FROM documents d
-            LEFT JOIN document_insights di ON di.document_id = d.id
-            WHERE di.id IS NULL
-            ORDER BY d.upload_timestamp DESC
-            LIMIT %s
-            """,
-            (max(1, min(max_docs, 50)),),
-        )
-        pending = c.fetchall()
-        conn.close()
-
-        from threading import Thread
-        for doc_id, filename, content in pending:
-            Thread(target=_extract_document_insights, args=(doc_id, filename, content), daemon=True).start()
-
-        return {"queued": len(pending)}
-    except HTTPException:
-        conn.close()
-        raise
-    except Exception as e:
-        conn.close()
-        raise HTTPException(500, str(e))
+        conn = connect_to_postgres()
+        if conn is not None:
+            cursor = conn.cursor()
+            _require_admin(cursor, token)
+            cursor.execute(_PENDING_INSIGHT_IDS_SQL, (max(1, min(max_docs, 50)),))
+            pending_ids = [row[0] for row in cursor.fetchall()]
+    except HTTPException as exc:
+        denied = exc
+    except Exception:
+        pending_ids = None
+    _close_db_quietly(cursor, conn)
+    if denied is not None:
+        raise denied
+    admission = None
+    if pending_ids is not None:
+        try:
+            admission = _INSIGHTS_QUEUE.enqueue_batch(pending_ids)
+        except Exception:
+            admission = None
+    if admission is None:
+        print("[Insights] Pending analysis could not be queued")
+        raise HTTPException(503, _INSIGHTS_BACKFILL_UNAVAILABLE)
+    return {
+        "queued": admission.accepted,
+        "already_pending": admission.already_pending,
+        "capacity_rejected": admission.capacity_rejected,
+    }
 
 
 @app.get("/admin/system_status")
 async def admin_system_status(token: Optional[str] = None):
     """Operational health for the admin dashboard: is the LLM backend reachable,
-    which models are installed, and is Postgres up."""
-    conn = connect_to_postgres()
+    which models are installed, and is Postgres up.
+
+    Only a verified admin whose authorization connection also closed cleanly
+    reaches the health checks. A missing token is 401 and an untrusted one
+    403; any failure of the authorization lookup itself -- including a close
+    failure after it -- is a fixed 503 that never reaches the probes, the
+    endpoint lookup or a model HTTP call, and never hides an established
+    401/403."""
+    conn = None
+    denied = None
+    verified = False
     try:
-        c = conn.cursor()
-        _require_admin(c, token)
-        conn.close()
-    except HTTPException:
-        conn.close()
-        raise
+        conn = connect_to_postgres()
+        if conn is not None:
+            _require_admin(conn.cursor(), token)
+            verified = True
+    except HTTPException as exc:
+        denied = exc
     except Exception:
-        conn.close()
+        verified = False
+    closed = True
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            closed = False
+    if denied is not None:
+        raise denied
+    if not (verified and closed):
+        print("[Admin] System status authorization could not be verified")
+        raise HTTPException(503, "Could not verify your session. Please try again shortly.")
 
     db_ok = False
     try:
