@@ -74,7 +74,12 @@ from ollama_generation import OllamaGenerateStream  # noqa: E402
 HARNESS_REVISION = "c1-generation-diagnostic-v2"
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 GRADING_PATH = Path(__file__).resolve().parent / "grading" / "ircot_gold_anchors.json"
+BASELINE_GRADING_PATH = Path(__file__).resolve().parent / "grading" / "baseline_gold_anchors.json"
+GRADING_PATHS = (GRADING_PATH, BASELINE_GRADING_PATH)
 DEFAULT_FIXTURES = ("C04", "C05")
+# A multi-source fixture names at most this many evidence files, in citation
+# order (C1, C2, ...).
+MAX_FIXTURE_SOURCES = 8
 DEFAULT_PROFILES = (LLAMA_CONTROL, GEMMA_CANDIDATE)
 # The same cap the /ask route applies; the prompt builder reads it only for
 # its evidence budget, so the serialization matches production.
@@ -123,9 +128,15 @@ def _utc_now() -> str:
 # Fixtures and prompt serialization
 # --------------------------------------------------------------------------
 
+# The single-source fixture shape (C04/C05 and other one-excerpt fixtures).
 _FIXTURE_KEYS = {
     "fixture_id", "fixture_revision", "question", "task_prefix", "evidence_supply",
     "prompt_evidence_mode", "evidence_file", "evidence_text_sha256",
+}
+# The multi-source shape: an ordered list of evidence files, one pinned text
+# hash each. List order is citation order.
+_MULTI_SOURCE_FIXTURE_KEYS = (_FIXTURE_KEYS - {"evidence_file", "evidence_text_sha256"}) | {
+    "evidence_files", "evidence_text_sha256s",
 }
 _EVIDENCE_KEYS = {
     "evidence_id", "filename", "page_start", "page_end", "source_kind",
@@ -138,58 +149,110 @@ class Fixture:
     fixture_id: str
     revision: int
     question: str
-    evidence: dict
+    # The one evidence excerpt of a single-source fixture; None for a
+    # multi-source fixture, whose excerpts are in ``sources``.
+    evidence: Optional[dict]
     fixture_sha256: str
     evidence_sha256: str
+    # Every evidence excerpt in citation order: C1 is sources[0].
+    sources: tuple = ()
+
+    @property
+    def source_text_sha256s(self) -> tuple:
+        return tuple(sha256_hex(source["text"]) for source in self.sources)
+
+
+def _load_evidence(fixture_dir: Path, name: object) -> dict:
+    if not isinstance(name, str):
+        raise FixtureError("fixture evidence must be a file in the fixture directory")
+    evidence_path = Path(fixture_dir) / name
+    if evidence_path.parent != Path(fixture_dir) or not evidence_path.is_file():
+        raise FixtureError("fixture evidence must be a file in the fixture directory")
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    if set(evidence) != _EVIDENCE_KEYS:
+        raise FixtureError(f"{evidence_path.name} does not have the frozen evidence shape")
+    return evidence
 
 
 def load_fixture(fixture_id: str, fixture_dir: Path = FIXTURE_DIR) -> Fixture:
     """A frozen fixture, or FixtureError. Hashes are over canonical JSON, so a
-    CRLF checkout of the same files hashes identically."""
+    CRLF checkout of the same files hashes identically.
+
+    A single-source fixture's identity is the canonical hash of
+    ``{"fixture": spec, "evidence": evidence}`` and its evidence hash is the
+    hash of the excerpt text -- unchanged for every existing fixture. A
+    multi-source fixture hashes ``{"fixture": spec, "evidence": [excerpts in
+    order]}``, and its evidence hash is the canonical hash of the ordered list
+    of per-excerpt text hashes."""
     if not re.fullmatch(r"C\d{2}", fixture_id):
         raise FixtureError(f"unknown fixture id {fixture_id!r}")
     path = Path(fixture_dir) / f"{fixture_id.lower()}.json"
     if not path.is_file():
         raise FixtureError(f"no fixture file for {fixture_id}")
     spec = json.loads(path.read_text(encoding="utf-8"))
-    if set(spec) != _FIXTURE_KEYS or spec["fixture_id"] != fixture_id:
+    keys = set(spec)
+    if keys not in (_FIXTURE_KEYS, _MULTI_SOURCE_FIXTURE_KEYS) or spec["fixture_id"] != fixture_id:
         raise FixtureError(f"{path.name} does not have the frozen fixture shape")
-    evidence_path = Path(fixture_dir) / spec["evidence_file"]
-    if evidence_path.parent != Path(fixture_dir) or not evidence_path.is_file():
-        raise FixtureError("fixture evidence must be a file in the fixture directory")
-    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-    if set(evidence) != _EVIDENCE_KEYS:
-        raise FixtureError(f"{evidence_path.name} does not have the frozen evidence shape")
-    evidence_sha = sha256_hex(evidence["text"])
-    if evidence_sha != spec["evidence_text_sha256"]:
+    if keys == _FIXTURE_KEYS:
+        evidence = _load_evidence(fixture_dir, spec["evidence_file"])
+        evidence_sha = sha256_hex(evidence["text"])
+        if evidence_sha != spec["evidence_text_sha256"]:
+            raise FixtureError("evidence text does not match its pinned hash; the fixture is not frozen")
+        return Fixture(
+            fixture_id=fixture_id,
+            revision=spec["fixture_revision"],
+            question=spec["question"],
+            evidence=evidence,
+            fixture_sha256=sha256_hex(_canonical({"fixture": spec, "evidence": evidence})),
+            evidence_sha256=evidence_sha,
+            sources=(evidence,),
+        )
+    names, pins = spec["evidence_files"], spec["evidence_text_sha256s"]
+    if (not isinstance(names, list) or not isinstance(pins, list) or len(names) != len(pins)
+            or not 2 <= len(names) <= MAX_FIXTURE_SOURCES or len(set(map(str, names))) != len(names)):
+        raise FixtureError(f"{path.name} must name 2-{MAX_FIXTURE_SOURCES} distinct evidence files, one pinned hash each")
+    sources = tuple(_load_evidence(fixture_dir, name) for name in names)
+    hashes = [sha256_hex(source["text"]) for source in sources]
+    if hashes != pins:
         raise FixtureError("evidence text does not match its pinned hash; the fixture is not frozen")
     return Fixture(
         fixture_id=fixture_id,
         revision=spec["fixture_revision"],
         question=spec["question"],
-        evidence=evidence,
-        fixture_sha256=sha256_hex(_canonical({"fixture": spec, "evidence": evidence})),
-        evidence_sha256=evidence_sha,
+        evidence=None,
+        fixture_sha256=sha256_hex(_canonical({"fixture": spec, "evidence": list(sources)})),
+        evidence_sha256=sha256_hex(_canonical(hashes)),
+        sources=sources,
     )
+
+
+def evidence_items(fixture: Fixture) -> tuple:
+    """The fixture's excerpts as application evidence items, in citation
+    order. The one builder every harness uses, so prompts stay identical."""
+    items = []
+    for evidence in fixture.sources:
+        pages = list(range(evidence["page_start"], evidence["page_end"] + 1))
+        items.append(EvidenceItem(
+            text=evidence["text"],
+            source_type="document_chunk",
+            filename=evidence["filename"],
+            chunk_id=f"diagnostic:{evidence['evidence_id']}",
+            page_start=evidence["page_start"],
+            page_end=evidence["page_end"],
+            locator_json={"locator_type": "pdf_pages", "page_numbers": pages},
+        ))
+    return tuple(items)
+
+
+def evidence_bundle(fixture: Fixture) -> EvidenceBundle:
+    return EvidenceBundle(mode=EvidenceMode.HYBRID_RETRIEVAL, items=evidence_items(fixture))
 
 
 def build_prompt(fixture: Fixture) -> str:
     """The application's prompt for this fixture, as /ask would build it for
     retrieved passages. The evidence carries only the document text, its file
     name and page -- no question, no answer."""
-    evidence = fixture.evidence
-    pages = list(range(evidence["page_start"], evidence["page_end"] + 1))
-    item = EvidenceItem(
-        text=evidence["text"],
-        source_type="document_chunk",
-        filename=evidence["filename"],
-        chunk_id=f"diagnostic:{evidence['evidence_id']}",
-        page_start=evidence["page_start"],
-        page_end=evidence["page_end"],
-        locator_json={"locator_type": "pdf_pages", "page_numbers": pages},
-    )
-    bundle = EvidenceBundle(mode=EvidenceMode.HYBRID_RETRIEVAL, items=(item,))
-    registry = CitationRegistry.from_bundle(bundle, _ROUTE_CITATION_LIMITS)
+    registry = CitationRegistry.from_bundle(evidence_bundle(fixture), _ROUTE_CITATION_LIMITS)
     return build_generation_prompt(fixture.question, registry)
 
 
@@ -502,7 +565,8 @@ def run_one(
             "sha256": fixture.fixture_sha256,
             "evidence_sha256": fixture.evidence_sha256,
             "evidence_supply": "manual_evidence",
-            "evidence_source_kind": fixture.evidence["source_kind"],
+            "evidence_source_kind": (fixture.evidence["source_kind"] if fixture.evidence is not None
+                                     else [source["source_kind"] for source in fixture.sources]),
         },
         "prompt": {
             "sha256": sha256_hex(prompt),
@@ -562,6 +626,18 @@ def status_line(record: dict) -> str:
 # --------------------------------------------------------------------------
 
 
+def load_anchors(paths=GRADING_PATHS) -> dict:
+    """Every gold-anchor file merged by fixture id. Read only after generation;
+    never part of a request. A fixture id defined in two files is refused."""
+    merged = {}
+    for path in paths:
+        for fixture_id, spec in json.loads(Path(path).read_text(encoding="utf-8"))["fixtures"].items():
+            if fixture_id in merged:
+                raise FixtureError(f"gold anchors for {fixture_id} are defined more than once")
+            merged[fixture_id] = spec
+    return {"fixtures": merged}
+
+
 def grade_record(record: dict, anchors: dict) -> Optional[dict]:
     if record.get("record_type") != "generation" or not record.get("generated"):
         return None
@@ -577,18 +653,24 @@ def grade_record(record: dict, anchors: dict) -> Optional[dict]:
         else:
             hit = any(re.search(p, text, re.IGNORECASE) for p in group["any"])
         groups.append({"fact": group["fact"], "hit": bool(hit)})
-    return {
+    # Without declared citation ids the fixture supplies one evidence block,
+    # [C1]; a multi-source fixture declares each id and each is graded.
+    declared = spec.get("expected_citation_ids")
+    expected_ids = ["C1"] if declared is None else list(declared)
+    graded = {
         "evaluation_id": record["evaluation_id"],
         "fixture": fixture_id,
         "profile_id": record["profile"]["profile_id"],
         "anchor_groups": groups,
         "all_anchor_groups_hit": all(g["hit"] for g in groups),
-        # The fixture supplies exactly one evidence block, [C1] = page 4.
-        "cites_supplied_page": "[C1]" in text,
+        "cites_supplied_page": all(f"[{citation_id}]" in text for citation_id in expected_ids),
         "stream_failure": record["stream"]["failure"],
         "error": record["error"],
         "note": "Heuristic anchors only; the operator grades each answer manually.",
     }
+    if declared is not None:
+        graded["citation_ids_present"] = {citation_id: f"[{citation_id}]" in text for citation_id in expected_ids}
+    return graded
 
 
 # --------------------------------------------------------------------------
@@ -598,7 +680,8 @@ def grade_record(record: dict, anchors: dict) -> Optional[dict]:
 
 def _parse(argv):
     parser = argparse.ArgumentParser(description="C04/C05 native-API generation diagnostic")
-    parser.add_argument("--fixture", action="append", dest="fixtures", help="C04 or C05 (repeatable)")
+    parser.add_argument("--fixture", action="append", dest="fixtures",
+                        help="a frozen fixture id such as C04 (repeatable; default C04 and C05)")
     parser.add_argument("--profile", action="append", dest="profiles", help="registry profile id (repeatable)")
     parser.add_argument("--ollama-url", help="Ollama server root; required for live runs")
     parser.add_argument("--out", help="new JSONL file for live results (never overwritten)")
@@ -626,7 +709,7 @@ def main(argv=None, *, http_factory=OllamaHttp, stdout=sys.stdout,
     args = _parse(argv)
 
     if args.grade:
-        anchors = json.loads(GRADING_PATH.read_text(encoding="utf-8"))
+        anchors = load_anchors()
         for line in Path(args.grade).read_text(encoding="utf-8").splitlines():
             if line.strip():
                 graded = grade_record(json.loads(line), anchors)

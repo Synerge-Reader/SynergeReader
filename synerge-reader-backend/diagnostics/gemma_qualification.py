@@ -39,8 +39,11 @@ Scope: C04/C05 use frozen manual evidence and native Ollama inference only.
 No retrieval, embedding, database, chat history, rating, SynergeReader API,
 login or upload is involved, and nothing here qualifies a model for
 production; heuristic anchors and a green verifier status are not question
-completeness, legal truth or qualification. The wider C01-C06 baseline is not
-represented: only C04 and C05 run, with their frozen identities.
+completeness, legal truth or qualification. By default only C04 and C05 run,
+with their frozen identities (revision ``gemma-qualification-v1``).
+``--fixtures`` runs another list of frozen manual-evidence fixtures in order
+(revision ``gemma-qualification-v2``, at most 1 + 3n model calls); those are
+newly prepared fixtures, not reproductions of historical website attempts.
 
 Never: pull, delete, copy, create, push, unload or stop a model; signal any
 process other than the worker this parent started; read a .env file,
@@ -52,6 +55,9 @@ Usage (operator, inside an agreed single-profile resource window):
     python diagnostics/gemma_qualification.py --live --profile gemma_candidate \\
         --ollama-url http://127.0.0.1:11434 --client-budget-seconds 600 \\
         --out C:/protected/gemma_c04_c05.jsonl
+    python diagnostics/gemma_qualification.py --live --profile gemma_candidate \\
+        --fixtures C01,C02,C03,C04,C05,C06 --ollama-url http://127.0.0.1:11434 \\
+        --client-budget-seconds 600 --out C:/protected/gemma_c01_c06.jsonl
 
 ``--out`` receives protected raw answers; ``<out>.summary.json`` (or
 ``--summary-out``) receives a shareable summary of counts, hashes, safe
@@ -246,7 +252,6 @@ _BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from answer_evidence import EvidenceBundle, EvidenceItem, EvidenceMode  # noqa: E402
 from citation_generation import (  # noqa: E402
     CitationLimits,
     CitationRegistry,
@@ -267,6 +272,8 @@ from generation_profiles import (  # noqa: E402
 from ollama_generation import OllamaGenerateStream, completed_generate_response  # noqa: E402
 
 HARNESS_REVISION = "gemma-qualification-v1"
+# Any fixture list other than the default C04, C05 is an expanded run.
+EXPANDED_HARNESS_REVISION = "gemma-qualification-v2"
 FIXTURES = ("C04", "C05")
 INTENDED_FIRST_PROFILE = GEMMA_CANDIDATE
 MAX_VERIFIER_CALLS_PER_ANSWER = 2
@@ -278,6 +285,9 @@ REAP_SECONDS = 10.0
 MAIN_PATH = _BACKEND_DIR / "main.py"
 OBSERVATION_PATHS = frozenset({"/api/version", "/api/tags", "/api/show", "/api/ps"})
 GENERATE_PATH = "/api/generate"
+# Permitted only by a supervisor constructed with allow_embedding=True (the
+# capacity probe); an embedding request is a model call like a generation.
+EMBED_PATH = "/api/embed"
 
 # main.py definitions the verifier adapter compiles, and the only names they
 # may read besides each other and builtins.
@@ -388,23 +398,53 @@ class FixturePlan:
         return self.fixture.fixture_id
 
 
-def plan_fixture(fixture: base.Fixture, limits: CitationLimits) -> FixturePlan:
-    """The fixture's prompt and citation registry, built exactly as the
-    existing diagnostic's ``build_prompt`` builds them; the prompt bytes are
-    checked against that builder."""
-    evidence = fixture.evidence
-    pages = list(range(evidence["page_start"], evidence["page_end"] + 1))
-    item = EvidenceItem(
-        text=evidence["text"],
-        source_type="document_chunk",
-        filename=evidence["filename"],
-        chunk_id=f"diagnostic:{evidence['evidence_id']}",
-        page_start=evidence["page_start"],
-        page_end=evidence["page_end"],
-        locator_json={"locator_type": "pdf_pages", "page_numbers": pages},
+def require_fixtures(value: Optional[str]) -> tuple:
+    """The fixture ids of one batch, in order: the default C04, C05, or an
+    explicit comma-separated list of distinct ids (each loaded and its pinned
+    hashes checked before any network contact)."""
+    if value is None:
+        return FIXTURES
+    if not isinstance(value, str) or not value or any(ch.isspace() for ch in value):
+        raise UsageError("--fixtures must be a comma-separated list such as C01,C05")
+    ids = tuple(value.split(","))
+    if any(not re.fullmatch(r"C\d{2}", fixture_id) for fixture_id in ids):
+        raise UsageError("--fixtures takes fixture ids such as C01")
+    if len(set(ids)) != len(ids):
+        raise UsageError("--fixtures must not repeat a fixture")
+    return ids
+
+
+@dataclass(frozen=True)
+class RunSettings:
+    """What a batch reports about itself: the default C04/C05 batch keeps the
+    first revision and notes; any other fixture list is an expanded run."""
+
+    harness_revision: str
+    scope_note: str
+    baseline_note: str
+
+
+def run_settings(fixture_ids) -> RunSettings:
+    fixture_ids = tuple(fixture_ids)
+    if fixture_ids == FIXTURES:
+        return RunSettings(HARNESS_REVISION, SCOPE_NOTE, BASELINE_NOTE)
+    listed = ", ".join(fixture_ids)
+    return RunSettings(
+        EXPANDED_HARNESS_REVISION,
+        f"{listed}: frozen manual evidence and native Ollama inference only: no retrieval, embedding, database, "
+        "chat history, rating, login, upload or SynergeReader API. Not a production qualification; anchors and "
+        "verifier statuses are not question completeness or legal truth.",
+        f"Manual-evidence fixtures {listed}. These are not reproductions of the historical website attempts, "
+        "which used retrieval over uploaded documents; C06 here is the controlled two-paper scope (IRCoT and "
+        "Step-Back), not the historical three-document attempt. L01 is not represented.",
     )
-    bundle = EvidenceBundle(mode=EvidenceMode.HYBRID_RETRIEVAL, items=(item,))
-    registry = CitationRegistry.from_bundle(bundle, limits)
+
+
+def plan_fixture(fixture: base.Fixture, limits: CitationLimits) -> FixturePlan:
+    """The fixture's prompt and citation registry, built from the existing
+    diagnostic's shared evidence builder; the prompt bytes are checked against
+    that diagnostic's ``build_prompt``."""
+    registry = CitationRegistry.from_bundle(base.evidence_bundle(fixture), limits)
     prompt = build_generation_prompt(fixture.question, registry)
     if prompt != base.build_prompt(fixture):
         raise AdapterError("fixture prompt differs from the existing diagnostic's prompt")
@@ -512,6 +552,29 @@ def _refuse_dispatch(*args, **kwargs):
 CHILD_ENVIRONMENT_NAMES = ("SYSTEMROOT", "SYSTEMDRIVE")
 
 
+class StopLatch:
+    """The one stop decision a supervisor consults before it starts a worker.
+
+    Each supervisor owns one by default. A caller that runs several
+    supervisors at once (the capacity probe) passes them one shared latch
+    whose ``__enter__``/``__exit__`` hold a lock, so a stop recorded by any of
+    them fences every later start at once."""
+
+    def __init__(self) -> None:
+        self.stopped: Optional[str] = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+    def stop(self, category: str) -> None:
+        with self:
+            if self.stopped is None:
+                self.stopped = category
+
+
 def child_environment() -> dict:
     """The worker's whole environment: SYSTEMROOT and SYSTEMDRIVE only.
     Windows networking needs the first; without the second, Windows expands
@@ -555,12 +618,17 @@ class OwnedWorkerSupervisor:
 
     Any outcome other than a body read to its end latches ``stopped``; every
     later call then raises BatchStopped before a process is started.
+
+    Model endpoints are ``/api/generate`` only, unless the supervisor is
+    constructed with ``allow_embedding=True``, which also permits
+    ``/api/embed`` as a model call (the capacity probe's one embedding).
     """
 
     def __init__(self, base_url: str, *, budget_s: float, work_root: Optional[Path] = None,
                  launcher: Callable = subprocess.Popen, python: Optional[str] = None,
                  worker_script: Optional[Path] = None, clock: Callable[[], float] = time.monotonic,
-                 reap_s: float = REAP_SECONDS) -> None:
+                 reap_s: float = REAP_SECONDS, latch: Optional[StopLatch] = None,
+                 allow_embedding: bool = False) -> None:
         self.base_url = require_root_url(base_url)
         self.budget_s = require_budget(budget_s)
         self._work_root = None if work_root is None else str(work_root)
@@ -570,40 +638,54 @@ class OwnedWorkerSupervisor:
         self._clock = clock
         self._reap_s = reap_s
         self._active = False
-        self.stopped: Optional[str] = None
+        self._latch = latch if latch is not None else StopLatch()
+        self._model_paths = frozenset({GENERATE_PATH, EMBED_PATH} if allow_embedding is True else {GENERATE_PATH})
         self.events = []  # process-level log: pid, deadline, kill, reap; no content
 
+    @property
+    def stopped(self) -> Optional[str]:
+        return self._latch.stopped
+
     def stop(self, category: str) -> None:
-        if self.stopped is None:
-            self.stopped = category
+        self._latch.stop(category)
 
     def call(self, *, model_call: bool, method: str, path: str, body: Optional[dict],
-             read_timeout_s: float, max_body_bytes: int, watch_stream: bool) -> WorkerOutcome:
-        if self.stopped is not None:
-            raise BatchStopped(self.stopped)
-        if path != GENERATE_PATH and path not in OBSERVATION_PATHS:
-            raise AdapterError("only native observation endpoints and /api/generate are permitted")
-        if path == GENERATE_PATH and not model_call:
-            raise AdapterError("/api/generate is a model call")
-        if self._active:
-            raise AdapterError("one worker at a time")
-        self._active = True
+             read_timeout_s: float, max_body_bytes: int, watch_stream: bool,
+             budget_s: Optional[float] = None) -> WorkerOutcome:
+        """One worker call. ``budget_s`` may only shorten this supervisor's
+        client wait for this one call (a caller's whole-run deadline)."""
+        if budget_s is not None:
+            budget_s = min(require_budget(budget_s), self.budget_s)
+        with self._latch:
+            # Checked and claimed under the latch, so a stop recorded by any
+            # supervisor sharing it fences every later start.
+            if self._latch.stopped is not None:
+                raise BatchStopped(self._latch.stopped)
+            if path not in self._model_paths and path not in OBSERVATION_PATHS:
+                raise AdapterError("only native observation endpoints and /api/generate are permitted")
+            if path in self._model_paths and not model_call:
+                raise AdapterError(f"{path} is a model call")
+            if self._active:
+                raise AdapterError("one worker at a time")
+            self._active = True
         try:
-            outcome = self._run(model_call, method, path, body, read_timeout_s, max_body_bytes, watch_stream)
+            outcome = self._run(model_call, method, path, body, read_timeout_s, max_body_bytes, watch_stream,
+                                self.budget_s if budget_s is None else budget_s)
         finally:
             self._active = False
         if outcome.category != "end_of_body":
             self.stop(outcome.category)
         return outcome
 
-    def _run(self, model_call, method, path, body, read_timeout_s, max_body_bytes, watch_stream) -> WorkerOutcome:
+    def _run(self, model_call, method, path, body, read_timeout_s, max_body_bytes, watch_stream,
+             budget_s) -> WorkerOutcome:
         nonce = uuid.uuid4().hex
         workdir = Path(tempfile.mkdtemp(prefix="gq-", dir=self._work_root))
         files = (workdir / "request.json", workdir / "result.json", workdir / "body.bin")
         request_path, result_path, body_path = files
         request = {
             "protocol": WORKER_PROTOCOL, "nonce": nonce, "base_url": self.base_url, "method": method,
-            "path": path, "body": body, "read_timeout_s": min(float(read_timeout_s), self.budget_s),
+            "path": path, "body": body, "read_timeout_s": min(float(read_timeout_s), budget_s),
             "max_body_bytes": int(max_body_bytes), "watch_stream": bool(watch_stream),
         }
         started = self._clock()
@@ -637,7 +719,7 @@ class OwnedWorkerSupervisor:
                 return outcome("worker_start_failed", phase="not_started", error_type=type(exc).__name__)
             event["pid"] = getattr(process, "pid", None)
             try:
-                process.wait(timeout=self.budget_s)
+                process.wait(timeout=budget_s)
             except subprocess.TimeoutExpired:
                 event["deadline"] = True
                 event["reaped"] = self._stop_owned(process, event)
@@ -943,10 +1025,12 @@ def _status(record: dict) -> str:
 def run_batch(*, profile: ModelProfile, supervisor: OwnedWorkerSupervisor, sink: _Sink,
               plans, adapter_factory: Callable[[Callable], ApplicationVerifier] = load_application_verifier,
               clock: Callable[[], float] = time.monotonic, now: Callable[[], str] = _utc_now,
-              grading_path: Optional[Path] = None) -> dict:
-    """Identity, smoke, C04, C05 -- sequentially, one model call at a time,
-    each only after the previous one showed native terminal evidence, and the
-    answers only after the smoke was accepted (exact "stop", non-blank text)."""
+              grading_path: Optional[Path] = None, settings: Optional[RunSettings] = None) -> dict:
+    """Identity, smoke, then each fixture in order -- sequentially, one model
+    call at a time, each only after the previous one showed native terminal
+    evidence, and the answers only after the smoke was accepted (exact "stop",
+    non-blank text)."""
+    settings = settings or run_settings(p.fixture_id for p in plans)
 
     def emit(record: dict) -> None:
         sink.write({"record_type": "call", **record})
@@ -957,11 +1041,12 @@ def run_batch(*, profile: ModelProfile, supervisor: OwnedWorkerSupervisor, sink:
     http = SupervisedHttp(supervisor)
     run_id = f"gq-{uuid.uuid4().hex}"
     sink.write({
-        "record_type": "run", "run_id": run_id, "harness_revision": HARNESS_REVISION, "started_at": now(),
+        "record_type": "run", "run_id": run_id, "harness_revision": settings.harness_revision, "started_at": now(),
         "ollama_url": supervisor.base_url, "profile_id": profile.profile_id, "model_tag": profile.model_tag,
         "client_budget_seconds": supervisor.budget_s, "fixtures": [p.fixture_id for p in plans],
         "verifier_adapter": adapter.label, "verifier_source_sha256": adapter.source_sha256,
-        "main_sha256": adapter.main_sha256, "scope_note": SCOPE_NOTE, "baseline_note": BASELINE_NOTE,
+        "main_sha256": adapter.main_sha256, "scope_note": settings.scope_note,
+        "baseline_note": settings.baseline_note,
         "persists_answers_in_application": False, "qualification": _qualification_flags(profile),
     })
     started = clock()
@@ -1040,7 +1125,7 @@ def run_batch(*, profile: ModelProfile, supervisor: OwnedWorkerSupervisor, sink:
         run_id=run_id, profile=profile, supervisor=supervisor, identity=identity, decision=decision,
         transport=transport, answers=answers, verifications=verifications, grading=grading,
         residency=residency, outcome=outcome, stop_category=stop_category, unknown=unknown, total_s=total_s,
-        adapter=adapter, plans=plans,
+        adapter=adapter, plans=plans, settings=settings,
     )
     sink.write({"record_type": "end", "finished_at": now(), "outcome": outcome, "stop_category": stop_category,
                 "unknown_server_execution": unknown, "note": UNKNOWN_NOTE if unknown else None})
@@ -1049,10 +1134,11 @@ def run_batch(*, profile: ModelProfile, supervisor: OwnedWorkerSupervisor, sink:
 
 
 def grade_answers(answers: dict, profile: ModelProfile, grading_path: Optional[Path]) -> list:
-    path = Path(grading_path) if grading_path is not None else base.GRADING_PATH
+    """Heuristic anchors, read only now -- after the last network call. The
+    default is every gold-anchor file merged; ``grading_path`` names one."""
     if not answers:
         return []
-    anchors = json.loads(path.read_text(encoding="utf-8"))
+    anchors = base.load_anchors() if grading_path is None else base.load_anchors((Path(grading_path),))
     graded = []
     for fixture_id, answer in answers.items():
         if not answer.get("accepted"):
@@ -1072,9 +1158,22 @@ def _counts(values) -> dict:
     return dict(sorted(counts.items()))
 
 
+def _fixture_entry(plan: FixturePlan) -> dict:
+    """A fixture's identity for reports: hashes only. A multi-source fixture
+    also lists each excerpt's text hash in citation order."""
+    fixture = plan.fixture
+    entry = {"id": fixture.fixture_id, "revision": fixture.revision, "fixture_sha256": fixture.fixture_sha256,
+             "evidence_sha256": fixture.evidence_sha256, "prompt_sha256": _sha(plan.prompt)}
+    if fixture.evidence is None:
+        entry["source_text_sha256s"] = list(fixture.source_text_sha256s)
+    return entry
+
+
 def build_summary(*, run_id, profile, supervisor, identity, decision, transport, answers, verifications,
-                  grading, residency, outcome, stop_category, unknown, total_s, adapter, plans) -> dict:
+                  grading, residency, outcome, stop_category, unknown, total_s, adapter, plans,
+                  settings: Optional[RunSettings] = None) -> dict:
     """Shareable: counts, hashes, safe categories and timings only."""
+    settings = settings or run_settings(p.fixture_id for p in plans)
     safe_calls = [
         {k: c.get(k) for k in ("seq", "role", "fixture", "model", "payload_sha256", "category", "state",
                                 "http_status", "error_type", "body_bytes", "body_sha256", "timing", "wall_s",
@@ -1090,9 +1189,9 @@ def build_summary(*, run_id, profile, supervisor, identity, decision, transport,
     return {
         "record_type": "summary",
         "run_id": run_id,
-        "harness_revision": HARNESS_REVISION,
-        "scope_note": SCOPE_NOTE,
-        "baseline_note": BASELINE_NOTE,
+        "harness_revision": settings.harness_revision,
+        "scope_note": settings.scope_note,
+        "baseline_note": settings.baseline_note,
         "profile": {"profile_id": profile.profile_id, "model_tag": profile.model_tag,
                     **_qualification_flags(profile)},
         "identity": None if identity is None else {
@@ -1108,8 +1207,7 @@ def build_summary(*, run_id, profile, supervisor, identity, decision, transport,
         "stop_category": stop_category,
         "unknown_server_execution": unknown,
         "unknown_note": UNKNOWN_NOTE if unknown else None,
-        "fixtures": [{"id": p.fixture_id, "revision": p.fixture.revision, "fixture_sha256": p.fixture.fixture_sha256,
-                      "evidence_sha256": p.fixture.evidence_sha256, "prompt_sha256": _sha(p.prompt)} for p in plans],
+        "fixtures": [_fixture_entry(p) for p in plans],
         "calls": safe_calls,
         "verification": [
             {"fixture": fid, "skipped": v.get("skipped"),
@@ -1120,7 +1218,8 @@ def build_summary(*, run_id, profile, supervisor, identity, decision, transport,
             for fid, v in verifications.items()
         ],
         "anchors": [{"fixture": g["fixture"], "groups_hit": sum(1 for x in g["anchor_groups"] if x["hit"]),
-                     "groups_total": len(g["anchor_groups"]), "cites_supplied_page": g["cites_supplied_page"]}
+                     "groups_total": len(g["anchor_groups"]), "cites_supplied_page": g["cites_supplied_page"],
+                     **({"citation_ids_present": g["citation_ids_present"]} if "citation_ids_present" in g else {})}
                     for g in grading],
         "timing": {
             "smoke_first_token_s": None if smoke is None else smoke["timing"].get("first_response_token_s"),
@@ -1146,14 +1245,16 @@ def build_summary(*, run_id, profile, supervisor, identity, decision, transport,
 # --------------------------------------------------------------------------
 
 
-def dry_run_report(profile: ModelProfile, plans, adapter: ApplicationVerifier) -> dict:
+def dry_run_report(profile: ModelProfile, plans, adapter: ApplicationVerifier,
+                   settings: Optional[RunSettings] = None) -> dict:
     """Hashes, options and counts only: never a prompt, excerpt or answer."""
+    settings = settings or run_settings(p.fixture_id for p in plans)
     snapshot = _snapshot(profile, "admin_override", None)
     return {
         "record_type": "dry_run",
-        "harness_revision": HARNESS_REVISION,
-        "scope_note": SCOPE_NOTE,
-        "baseline_note": BASELINE_NOTE,
+        "harness_revision": settings.harness_revision,
+        "scope_note": settings.scope_note,
+        "baseline_note": settings.baseline_note,
         "profile": {
             "profile_id": profile.profile_id, "model_tag": profile.model_tag,
             "expected_digest": profile.expected_digest, "think": profile.think, "keep_alive": profile.keep_alive,
@@ -1165,10 +1266,8 @@ def dry_run_report(profile: ModelProfile, plans, adapter: ApplicationVerifier) -
             **_qualification_flags(profile),
         },
         "smoke": {"prompt_sha256": _sha(base.SMOKE_PROMPT), "options": SMOKE_OPTIONS.as_ollama_options()},
-        "fixtures": [{"id": p.fixture_id, "revision": p.fixture.revision, "fixture_sha256": p.fixture.fixture_sha256,
-                      "evidence_sha256": p.fixture.evidence_sha256, "prompt_sha256": _sha(p.prompt),
-                      "prompt_chars": len(p.prompt), "answer_payload_sha256":
-                          _sha(base._canonical(snapshot.ollama_payload(p.prompt, stream=True)))} for p in plans],
+        "fixtures": [{**_fixture_entry(p), "prompt_chars": len(p.prompt), "answer_payload_sha256":
+                      _sha(base._canonical(snapshot.ollama_payload(p.prompt, stream=True)))} for p in plans],
         "verifier_adapter": {"label": adapter.label, "source_sha256": adapter.source_sha256,
                              "template_sha256": _sha(adapter.template),
                              "max_claims_verified": adapter.citation_limits.max_claims_verified,
@@ -1187,10 +1286,13 @@ def dry_run_report(profile: ModelProfile, plans, adapter: ApplicationVerifier) -
 
 
 def _parse(argv):
-    parser = argparse.ArgumentParser(description="Bounded single-profile C04/C05 answer + verifier evaluation")
+    parser = argparse.ArgumentParser(description="Bounded single-profile answer + verifier evaluation "
+                                                 "(default fixtures C04, C05)")
     parser.add_argument("--dry-run", action="store_true", help="print hashes, options and counts; no network")
     parser.add_argument("--live", action="store_true", help="explicit opt-in to contact the given Ollama root")
     parser.add_argument("--profile", help="exactly one registry profile id (live: required)")
+    parser.add_argument("--fixtures", help="comma-separated frozen fixture ids in run order, e.g. "
+                                           "C01,C02,C03,C04,C05,C06 (default C04,C05)")
     parser.add_argument("--ollama-url", help="the Ollama server root, e.g. http://127.0.0.1:11434 (live: required)")
     parser.add_argument("--client-budget-seconds", type=float,
                         help="hard client wait per worker call, finite, in (0, 3600] (live: required)")
@@ -1215,13 +1317,18 @@ def main(argv=None, *, stdout=sys.stdout, registry_factory: Callable[[], ModelRe
     args = _parse(argv)
     if args.dry_run == args.live:
         raise UsageError("choose exactly one of --dry-run or --live")
+    fixture_ids = require_fixtures(args.fixtures)
+    # Every fixture is loaded and its pinned hashes checked before any output
+    # file, supervisor or network contact.
+    fixtures = [base.load_fixture(f) for f in fixture_ids]
+    settings = run_settings(fixture_ids)
     registry = registry_factory()
 
     if args.dry_run:
         profile = require_profile(args.profile or INTENDED_FIRST_PROFILE, registry)
         adapter = adapter_factory(_refuse_dispatch)
-        plans = [plan_fixture(base.load_fixture(f), adapter.citation_limits) for f in FIXTURES]
-        report = dry_run_report(profile, plans, adapter)
+        plans = [plan_fixture(fixture, adapter.citation_limits) for fixture in fixtures]
+        report = dry_run_report(profile, plans, adapter, settings)
         stdout.write(json.dumps(report, sort_keys=True) + "\n")
         if args.out:
             with _new_output(args.out).open("x", encoding="utf-8") as handle:
@@ -1242,12 +1349,12 @@ def main(argv=None, *, stdout=sys.stdout, registry_factory: Callable[[], ModelRe
         raise UsageError("--summary-out must differ from --out")
     # Everything that cannot touch the network is prepared before it is.
     check_adapter = adapter_factory(_refuse_dispatch)
-    plans = [plan_fixture(base.load_fixture(f), check_adapter.citation_limits) for f in FIXTURES]
+    plans = [plan_fixture(fixture, check_adapter.citation_limits) for fixture in fixtures]
     supervisor = supervisor_factory(url, budget_s=budget, work_root=out_path.parent)
 
     with out_path.open("x", encoding="utf-8") as out, summary_path.open("x", encoding="utf-8") as summary_file:
         summary = run_batch(profile=profile, supervisor=supervisor, sink=_Sink(out, stdout), plans=plans,
-                            adapter_factory=adapter_factory, clock=clock, now=now)
+                            adapter_factory=adapter_factory, clock=clock, now=now, settings=settings)
         summary_file.write(json.dumps(summary, ensure_ascii=True, sort_keys=True) + "\n")
     return 0 if summary["outcome"] == "completed" else 3
 

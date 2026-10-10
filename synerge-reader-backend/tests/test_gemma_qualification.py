@@ -65,6 +65,23 @@ _C04_ANSWER = (
     "The loop continues until an answer is reached [C1]."
 )
 _C05_ANSWER = "IRCoT stops when the reasoning says the answer is reached [C1]. It also stops at a step limit [C1]."
+_ALL_FIXTURES = ("C01", "C02", "C03", "C04", "C05", "C06")
+_OTHER_ANSWERS = {
+    "C01": "PaLM-2L gains 7% on MMLU Physics and 11% on MMLU Chemistry [C1]. TimeQA rises 27% and MuSiQue 7% [C1].",
+    "C02": "The big Transformer reached 28.4 BLEU [C1]. Training took 3.5 days [C1].",
+    "C03": "Abstraction asks a step-back question about a higher-level principle [C1]. Reasoning answers the "
+           "original question grounded on it [C1].",
+    "C06": "IRCoT interleaves retrieval with chain-of-thought steps [C1]. Step-Back abstracts first and then "
+           "reasons [C2].",
+}
+# Answer payload sha256 per (profile, fixture): the default C04/C05 bytes are
+# the ones sent on 9 Oct 2026 (Gemma) and recorded in the preparation dry run.
+_PAYLOAD_SHAS = {
+    (GEMMA_CANDIDATE, "C04"): "4cc910aabe41a0ef55501f5cad644b9d0dc96b6393feab211832202f72142350",
+    (GEMMA_CANDIDATE, "C05"): "719e56ce5f630f829c6257ccec86753af24e2f7dc0afcead6b30a63c49b011ab",
+    (LLAMA_CONTROL, "C04"): "168d3907d5eacd396e6141ab2e65594e7e491dbddff905605cbd8cf4ee5409a6",
+    (LLAMA_CONTROL, "C05"): "53a038877519019a2e7e2f67129cdcc32b77cb6b806c8ef428500cfc61b35cf1",
+}
 
 
 def _synthetic_registry():
@@ -109,7 +126,8 @@ class FakeOllama:
         self.capabilities = None if capabilities is None else list(capabilities)
         self.chunk_size = chunk_size
         self.requests = []
-        self.answers = {"C04": _stream(_C04_ANSWER, thinking=_THINKING), "C05": _stream(_C05_ANSWER)}
+        self.answers = {"C04": _stream(_C04_ANSWER, thinking=_THINKING), "C05": _stream(_C05_ANSWER),
+                        **{fid: _stream(text) for fid, text in _OTHER_ANSWERS.items()}}
         self.smoke = _stream("ready")
         self.verifier_replies = []
         self.refuse_connect = False
@@ -157,7 +175,8 @@ def _role(body):
 
 
 def _fixture_of(body):
-    return "C04" if base.load_fixture("C04").question in body["prompt"] else "C05"
+    [fixture_id] = [f for f in _ALL_FIXTURES if base.load_fixture(f).question in body["prompt"]]
+    return fixture_id
 
 
 class FakeConnection:
@@ -925,6 +944,128 @@ def test_llama_control_uses_the_same_harness_as_a_single_profile(tmp_path):
     assert run.summary["identity"]["observed_digest"] == SYNTHETIC_LLAMA
 
 
+# --------------------------------------------------------------------------
+# Fixture lists, expanded runs and grading separation
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("profile", [GEMMA_CANDIDATE, LLAMA_CONTROL])
+def test_the_default_run_is_v1_with_unchanged_prompts_and_payloads_for_both_profiles(tmp_path, profile):
+    run = _live(tmp_path, FakeOllama(), profile=profile)
+    assert run.summary["harness_revision"] == gq.HARNESS_REVISION == "gemma-qualification-v1"
+    assert run.summary["scope_note"] == gq.SCOPE_NOTE and run.summary["baseline_note"] == gq.BASELINE_NOTE
+    answers = {c["fixture"]: c["payload_sha256"] for c in _calls(run) if c["role"] == "answer"}
+    assert answers == {fid: _PAYLOAD_SHAS[(profile, fid)] for fid in ("C04", "C05")}
+    assert [(f["id"], f["fixture_sha256"], f["prompt_sha256"]) for f in run.summary["fixtures"]] == [
+        (fid, _FIXTURE_SHAS[fid], _PROMPT_SHAS[fid]) for fid in ("C04", "C05")]
+    assert len(_calls(run)) <= 7
+    (tmp_path / "explicit").mkdir()
+    explicit = _live(tmp_path / "explicit", FakeOllama(), profile=profile, extra=("--fixtures", "C04,C05"))
+    assert explicit.summary["harness_revision"] == "gemma-qualification-v1"
+    assert [c["payload_sha256"] for c in _calls(explicit)] == [c["payload_sha256"] for c in _calls(run)]
+
+
+def test_an_expanded_run_reports_its_revision_case_list_and_at_most_1_plus_3n_calls(tmp_path):
+    fixtures = ("C01", "C02", "C03", "C04", "C05", "C06")
+    run = _live(tmp_path, FakeOllama(), extra=("--fixtures", ",".join(fixtures)))
+    assert run.code == 0 and run.summary["outcome"] == "completed"
+    assert run.summary["harness_revision"] == gq.EXPANDED_HARNESS_REVISION == "gemma-qualification-v2"
+    assert [f["id"] for f in run.summary["fixtures"]] == list(fixtures)
+    assert "C01, C02, C03, C04, C05, C06" in run.summary["scope_note"]
+    assert "not reproductions of the historical website attempts" in run.summary["baseline_note"]
+    assert "three-document" in run.summary["baseline_note"] and "L01 is not represented" in run.summary["baseline_note"]
+    assert [c["fixture"] for c in _calls(run) if c["role"] == "answer"] == list(fixtures)
+    assert len(_calls(run)) <= 1 + 3 * len(fixtures)
+    c06 = next(f for f in run.summary["fixtures"] if f["id"] == "C06")
+    assert c06["source_text_sha256s"][0] == _EVIDENCE_SHA and len(c06["source_text_sha256s"]) == 2
+    assert all("source_text_sha256s" not in f for f in run.summary["fixtures"] if f["id"] != "C06")
+    grading = {a["fixture"]: a for a in run.summary["anchors"]}
+    assert grading["C06"]["citation_ids_present"] == {"C1": True, "C2": True}
+    assert "citation_ids_present" not in grading["C04"]
+    out = io.StringIO()
+    gq.main(["--dry-run", "--fixtures", ",".join(fixtures)], stdout=out)
+    report = json.loads(out.getvalue())
+    assert report["harness_revision"] == "gemma-qualification-v2"
+    assert report["planned_model_calls"] == {"smoke": 1, "answers": 6, "verifier_max": 12, "max_total": 19}
+
+
+@pytest.mark.parametrize("value", ["C07", "C04,C04", "c04", "C04, C05", "", "C04,,C05", "../c04", "C4"])
+def test_fixture_lists_are_validated_before_any_supervisor_output_or_network(tmp_path, value):
+    out = tmp_path / "out.jsonl"
+    with pytest.raises((gq.UsageError, base.FixtureError)):
+        gq.main(["--live", "--profile", GEMMA_CANDIDATE, "--ollama-url", "http://fake-ollama:11434",
+                 "--client-budget-seconds", "30", "--out", str(out), "--fixtures", value],
+                stdout=io.StringIO(), registry_factory=_synthetic_registry,
+                supervisor_factory=lambda *a, **k: pytest.fail("no supervisor before the fixtures are valid"))
+    assert not out.exists() and not list(tmp_path.iterdir())
+
+
+def test_grading_files_are_read_only_after_the_last_network_call_of_an_expanded_run(tmp_path, monkeypatch):
+    server = FakeOllama()
+    reads = []
+    anchors = {base.GRADING_PATH.resolve(), base.BASELINE_GRADING_PATH.resolve()}
+    original = Path.read_text
+
+    def recording(self, *args, **kwargs):
+        if self.resolve() in anchors:
+            reads.append((self.name, len(server.requests)))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", recording)
+    run = _live(tmp_path, server, extra=("--fixtures", "C01,C02,C03,C04,C05,C06"))
+    total = len(run.server.requests)
+    assert sorted(name for name, _ in reads) == ["baseline_gold_anchors.json", "ircot_gold_anchors.json"]
+    assert all(at == total for _, at in reads), "no grading file is read before the last network call"
+    gold = []
+    for path in sorted(anchors):
+        for spec in json.loads(original(path, encoding="utf-8"))["fixtures"].values():
+            gold += spec["required_facts"] + spec.get("supplementary_facts", [])
+    for body in run.server.generate_bodies:
+        rendered = json.dumps(body)
+        for fact in gold:
+            assert fact not in body["prompt"] and fact not in rendered
+
+
+def test_embedding_is_refused_unless_a_supervisor_explicitly_allows_it(tmp_path):
+    server = FakeOllama()
+    default = _supervisor(FakeLauncher(server), tmp_path)
+    with pytest.raises(gq.AdapterError):
+        default.call(model_call=True, method="POST", path=gq.EMBED_PATH, body={}, read_timeout_s=1,
+                     max_body_bytes=1, watch_stream=False)
+    allowed = _supervisor(FakeLauncher(server), tmp_path, allow_embedding=True)
+    with pytest.raises(gq.AdapterError):
+        allowed.call(model_call=False, method="POST", path=gq.EMBED_PATH, body={}, read_timeout_s=1,
+                     max_body_bytes=1, watch_stream=False)
+    assert default.events == [] and allowed.events == []
+    assert gq.OBSERVATION_PATHS == {"/api/version", "/api/tags", "/api/show", "/api/ps"}
+
+
+def test_a_per_call_budget_may_only_shorten_the_client_wait(tmp_path):
+    waits = []
+
+    class RecordingLauncher(FakeLauncher):
+        def __call__(self, argv, **kwargs):
+            process = super().__call__(argv, **kwargs)
+            original_wait = process.wait
+
+            def wait(timeout=None):
+                waits.append(timeout)
+                return original_wait(timeout)
+
+            process.wait = wait
+            return process
+
+    supervisor = _supervisor(RecordingLauncher(FakeOllama()), tmp_path, budget_s=30)
+    for budget, expected in ((5, 5.0), (90, 30.0), (None, 30.0)):
+        supervisor.call(model_call=False, method="GET", path="/api/version", body=None, read_timeout_s=60,
+                        max_body_bytes=1024, watch_stream=False, budget_s=budget)
+        assert waits[-1] == expected
+    for bad in (0, -1, float("nan"), float("inf")):
+        with pytest.raises(gq.UsageError):
+            supervisor.call(model_call=False, method="GET", path="/api/version", body=None, read_timeout_s=1,
+                            max_body_bytes=1024, watch_stream=False, budget_s=bad)
+
+
 def test_the_harness_imports_and_endpoints_stay_inside_their_boundary():
     tree = ast.parse(_HARNESS_PATH.read_text(encoding="utf-8"))
     boundary = next(index for index, node in enumerate(tree.body)
@@ -1036,7 +1177,14 @@ def test_the_real_supervisor_stops_waiting_kills_and_reaps_only_its_owned_child(
     # Only SYSTEMROOT and SYSTEMDRIVE are passed (asserted on the launch
     # arguments elsewhere); the Microsoft Store interpreter package also
     # injects PYTHONUSERBASE at process creation, which -I ignores.
-    assert set(probe["environment"]) <= {"SYSTEMROOT", "SYSTEMDRIVE", "PYTHONUSERBASE"}
+    if sys.platform == "linux":
+        # CPython adds LC_CTYPE inside the isolated Linux child.
+        # The launch-shape test separately checks the supplied environment.
+        assert set(probe["environment"]) == {"LC_CTYPE"}
+    else:
+        assert set(probe["environment"]) <= {
+            "SYSTEMROOT", "SYSTEMDRIVE", "PYTHONUSERBASE"
+        }
     assert probe["flags"] == [1, 1, 1] and probe["argv_tail"] == ["--worker"]
     assert list(work.iterdir()) == [], "the per-call work directory is removed after the reap"
 

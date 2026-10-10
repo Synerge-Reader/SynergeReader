@@ -1,0 +1,16 @@
+{
+  "fixture_id": "C06",
+  "fixture_revision": 1,
+  "question": "How do IRCoT and Step-Back Prompting differ in the way they improve multi-step reasoning?",
+  "task_prefix": "none (Research & Q&A mode)",
+  "evidence_supply": "manual_evidence",
+  "prompt_evidence_mode": "hybrid_retrieval",
+  "evidence_files": [
+    "ircot_page4_evidence.json",
+    "stepback_c03_evidence.json"
+  ],
+  "evidence_text_sha256s": [
+    "0bc45a825ae0a2bce85877d30f6a6fcced4802713bf3fb66db9b13af50f9c8c7",
+    "0be557ab22ada5b610402f8259bf80c5dcf08e8effcb45894b34c5274f849766"
+  ]
+}

@@ -200,9 +200,135 @@ def test_tampered_evidence_is_refused(tmp_path):
 
 
 def test_unknown_fixture_ids_are_refused():
-    for bad in ("C06", "../c04", "c04"):
+    # C06 is a frozen fixture since the two-source format; C07 has no file.
+    for bad in ("C07", "../c04", "c04"):
         with pytest.raises(harness.FixtureError):
             harness.load_fixture(bad)
+
+
+# --- newly prepared manual-evidence fixtures (C01, C02, C03, C06) ------------------
+
+# (fixture_sha256, evidence_sha256, prompt_sha256), pinned after the excerpts were
+# extracted from the public papers and checked against the rendered pages.
+_NEW_PINS = {
+    "C01": ("854a86bf9469b7b6cdfdae3088191355259a44f2b7779289c6edcbddb2c8cbe1",
+            "7803ed6a5cacc7692b48ce3ad6b71b4a5c98ce0dd2e20391233568950c5220b1",
+            "37a7901e17b4e806dfabea739fb54fd0b80480c32b28d1b756ba068f377aff49"),
+    "C02": ("e940fedf92b02c02089281bd13af1e92a9f9c5082529bfe73366c82076681a87",
+            "720f3f61ad85d089e98c2974c61150f32b3114e5aed10e6a23c8ca104f23d3c2",
+            "52be30a58be816974daebeab76bb01d8b306506c1acb8a8902faa35972881daf"),
+    "C03": ("f7fffb6c7165aa205bf3724d5314f71ab557c38f40e92e6622145c5f9a40d3bf",
+            "0be557ab22ada5b610402f8259bf80c5dcf08e8effcb45894b34c5274f849766",
+            "a858371fec22672380796728481d137ec70d994000dc2dab5750772fd49570e5"),
+    "C06": ("9782405630a428bad072d444262351fb19dbd2481d65d97b0ef30c4a3ce05263",
+            "a4b18b68a4a5c2706f44bd8836e2752119e00bd2f55678a8cb70620adf4aeb99",
+            "d231108846f4bc10b7d2bb2410dbf0139cbe348824118a889546aafe90518a55"),
+}
+_NEW_QUESTIONS = {
+    "C01": "What improvements did Step-Back Prompting report for PaLM-2L on MMLU Physics, MMLU Chemistry, TimeQA, "
+           "and MuSiQue?",
+    "C02": "What BLEU score did the big Transformer achieve on WMT 2014 English-to-German, and how long did its "
+           "training take?",
+    "C03": "What are the two stages of Step-Back Prompting, and what does each stage do?",
+    "C06": "How do IRCoT and Step-Back Prompting differ in the way they improve multi-step reasoning?",
+}
+_STEP_BACK_PDF = "5133e42bd76de3b31be5fd21a3d36ebb45bfdf58db00047839175829f214eb72"
+_ATTENTION_PDF = "bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697"
+
+
+def test_new_fixtures_are_frozen_with_the_exact_questions_and_verified_public_sources():
+    expected_sources = {
+        "C01": [("Step back.pdf", 1, _STEP_BACK_PDF)],
+        "C02": [("Attention is all you need.pdf", 8, _ATTENTION_PDF)],
+        "C03": [("Step back.pdf", 3, _STEP_BACK_PDF)],
+        "C06": [("IR-CoT.pdf", 4, None), ("Step back.pdf", 3, _STEP_BACK_PDF)],
+    }
+    for fixture_id, (fixture_sha, evidence_sha, prompt_sha) in _NEW_PINS.items():
+        fixture = harness.load_fixture(fixture_id)
+        assert fixture.question == _NEW_QUESTIONS[fixture_id] and fixture.revision == 1
+        assert (fixture.fixture_sha256, fixture.evidence_sha256) == (fixture_sha, evidence_sha)
+        assert harness.sha256_hex(harness.build_prompt(fixture)) == prompt_sha
+        sources = [(s["filename"], s["page_start"], pdf) for s, (_, _, pdf) in
+                   zip(fixture.sources, expected_sources[fixture_id])]
+        assert sources == expected_sources[fixture_id]
+        for source, (_, _, pdf) in zip(fixture.sources, expected_sources[fixture_id]):
+            assert source["page_start"] == source["page_end"], "each excerpt comes from one physical page"
+            if pdf is not None:
+                assert pdf in source["provenance_note"] and "physical page" in source["provenance_note"]
+                assert "whitespace only" in source["excerpt_scope_note"]
+    assert "7% and 11% respectively, TimeQA by 27%, and MuSiQue by 7%" in harness.load_fixture("C01").evidence["text"]
+    c02 = harness.load_fixture("C02").evidence["text"]
+    assert "BLEU score of 28.4" in c02 and "Training took 3.5 days on 8 P100 GPUs." in c02
+    c03 = harness.load_fixture("C03").evidence["text"]
+    assert "• Abstraction:" in c03 and "• Reasoning:" in c03 and c03.count("\n") == 2
+
+
+def test_a_two_source_fixture_keeps_citation_order_locators_and_its_hash_formula():
+    fixture = harness.load_fixture("C06")
+    assert fixture.evidence is None and len(fixture.sources) == 2
+    ircot = harness.load_fixture("C04").evidence
+    assert fixture.sources[0] == ircot, "C1 is the existing IRCoT page-4 excerpt, unchanged"
+    assert fixture.sources[1] == harness.load_fixture("C03").evidence, "C2 is the Step-Back stages excerpt"
+    assert fixture.source_text_sha256s == (_EVIDENCE_SHA, _NEW_PINS["C03"][1])
+    assert fixture.evidence_sha256 == harness.sha256_hex(harness._canonical(list(fixture.source_text_sha256s)))
+    spec = json.loads((harness.FIXTURE_DIR / "c06.json").read_text(encoding="utf-8"))
+    assert fixture.fixture_sha256 == harness.sha256_hex(
+        harness._canonical({"fixture": spec, "evidence": list(fixture.sources)}))
+
+    prompt = harness.build_prompt(fixture)
+    first = prompt.index("[C1]\nDocument: IR-CoT.pdf\nLocation: page 4\nEvidence:\n" + ircot["text"])
+    second = prompt.index("[C2]\nDocument: Step back.pdf\nLocation: page 3\nEvidence:\n")
+    assert first < second and "[C3]" not in prompt
+    items = harness.evidence_items(fixture)
+    assert [item.chunk_id for item in items] == ["diagnostic:ircot-page4-normalized-v1",
+                                                 "diagnostic:stepback-c03-page3-v1"]
+
+
+def test_the_single_source_shape_and_hash_formula_are_unchanged():
+    fixture = harness.load_fixture("C04")
+    spec = json.loads((harness.FIXTURE_DIR / "c04.json").read_text(encoding="utf-8"))
+    evidence = json.loads((harness.FIXTURE_DIR / "ircot_page4_evidence.json").read_text(encoding="utf-8"))
+    assert fixture.fixture_sha256 == harness.sha256_hex(harness._canonical({"fixture": spec, "evidence": evidence}))
+    assert fixture.evidence == evidence and fixture.sources == (evidence,)
+    assert fixture.evidence_sha256 == harness.sha256_hex(evidence["text"]) == _EVIDENCE_SHA
+
+
+@pytest.mark.parametrize("change", ["tampered-second-source", "pins-reordered", "one-file-only",
+                                    "duplicate-file", "outside-directory", "extra-key"])
+def test_a_two_source_fixture_is_refused_when_not_frozen(tmp_path, change):
+    copy = tmp_path / "fixtures"
+    shutil.copytree(harness.FIXTURE_DIR, copy)
+    spec_path = copy / "c06.json"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    if change == "tampered-second-source":
+        path = copy / "stepback_c03_evidence.json"
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+        evidence["text"] = evidence["text"].replace("original question", "first question")
+        path.write_text(json.dumps(evidence), encoding="utf-8")
+    elif change == "pins-reordered":
+        spec["evidence_text_sha256s"].reverse()
+    elif change == "one-file-only":
+        spec["evidence_files"], spec["evidence_text_sha256s"] = spec["evidence_files"][:1], spec["evidence_text_sha256s"][:1]
+    elif change == "duplicate-file":
+        spec["evidence_files"][1] = spec["evidence_files"][0]
+        spec["evidence_text_sha256s"][1] = spec["evidence_text_sha256s"][0]
+    elif change == "outside-directory":
+        spec["evidence_files"][1] = "../stepback_c03_evidence.json"
+    else:
+        spec["evidence_file"] = "ircot_page4_evidence.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    with pytest.raises(harness.FixtureError):
+        harness.load_fixture("C06", copy)
+
+
+def test_two_source_hashes_do_not_depend_on_line_endings(tmp_path):
+    copy = tmp_path / "fixtures"
+    shutil.copytree(harness.FIXTURE_DIR, copy)
+    for path in copy.glob("*.json"):
+        path.write_bytes(path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+    for fixture_id, (fixture_sha, evidence_sha, _) in _NEW_PINS.items():
+        loaded = harness.load_fixture(fixture_id, copy)
+        assert (loaded.fixture_sha256, loaded.evidence_sha256) == (fixture_sha, evidence_sha)
 
 
 # --- request serialization ----------------------------------------------------
@@ -561,6 +687,69 @@ def test_grading_reports_anchor_hits_after_the_fact_and_ignores_skipped_runs(tmp
     assert len(graded) == 2, "a skipped run has nothing to grade"
     assert graded[0]["all_anchor_groups_hit"] is True and graded[0]["cites_supplied_page"] is True
     assert graded[1]["all_anchor_groups_hit"] is False and graded[1]["cites_supplied_page"] is False
+
+
+def _generated(fixture_id, text):
+    return {"record_type": "generation", "generated": True, "evaluation_id": f"{fixture_id}-1",
+            "fixture": {"id": fixture_id}, "profile": {"profile_id": GEMMA_CANDIDATE},
+            "response": {"text": text}, "stream": {"failure": None}, "error": None}
+
+
+def test_a_two_source_answer_is_graded_for_each_citation_id_separately():
+    anchors = harness.load_anchors()
+    both = harness.grade_record(_generated("C06", (
+        "IRCoT interleaves retrieval with chain-of-thought steps [C1]. Step-Back abstracts to a high-level "
+        "principle first, then reasons from it [C2].")), anchors)
+    only_first = harness.grade_record(_generated("C06", (
+        "IRCoT interleaves retrieval with chain-of-thought steps, while Step-Back abstracts and then reasons [C1].")),
+        anchors)
+    assert both["citation_ids_present"] == {"C1": True, "C2": True} and both["cites_supplied_page"] is True
+    assert both["all_anchor_groups_hit"] is True
+    assert only_first["citation_ids_present"] == {"C1": True, "C2": False}
+    assert only_first["cites_supplied_page"] is False, "every declared source must be cited"
+
+
+def test_single_source_grading_output_is_unchanged():
+    graded = harness.grade_record(_generated("C04", "IRCoT alternates CoT generation and retrieval [C1]."),
+                                  harness.load_anchors())
+    assert set(graded) == {"evaluation_id", "fixture", "profile_id", "anchor_groups", "all_anchor_groups_hit",
+                           "cites_supplied_page", "stream_failure", "error", "note"}
+    assert graded["cites_supplied_page"] is True
+
+
+@pytest.mark.parametrize("fixture_id, text, hits", [
+    ("C01", "PaLM-2L gains 7% on MMLU Physics, 11% on MMLU Chemistry, 27% on TimeQA and 7% on MuSiQue [C1].",
+     [True, True, True, True]),
+    ("C01", "PaLM-2L gains 7% and 11% on Physics. Chemistry is not stated [C1].", [True, False, False, False]),
+    ("C02", "It reached 28.4 BLEU and training took 3.5 days on 8 P100 GPUs [C1].", [True, True]),
+    ("C03", "Abstraction asks a step-back question about a higher-level principle; Reasoning then answers the "
+            "original question grounded on it [C1].", [True, True]),
+])
+def test_the_new_anchors_are_heuristic_hits_on_answer_text_only(fixture_id, text, hits):
+    graded = harness.grade_record(_generated(fixture_id, text), harness.load_anchors())
+    assert [group["hit"] for group in graded["anchor_groups"]] == hits
+
+
+def test_gold_anchor_files_are_merged_and_a_duplicate_fixture_is_refused(tmp_path):
+    merged = harness.load_anchors()
+    assert sorted(merged["fixtures"]) == ["C01", "C02", "C03", "C04", "C05", "C06"]
+    duplicate = tmp_path / "duplicate.json"
+    duplicate.write_text(harness.GRADING_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(harness.FixtureError):
+        harness.load_anchors((harness.GRADING_PATH, duplicate))
+
+
+def test_no_gold_anchor_data_reaches_any_fixture_request():
+    # The facts themselves naturally appear in the supplied evidence; what must
+    # never appear is anything taken from the grading files.
+    anchors = harness.load_anchors()
+    gold = [fact for spec in anchors["fixtures"].values() for fact in spec["required_facts"]]
+    gold += [fact for spec in anchors["fixtures"].values() for fact in spec.get("supplementary_facts", [])]
+    gold += [group["fact"] for spec in anchors["fixtures"].values() for group in spec["anchor_groups"]]
+    for fixture_id in ("C01", "C02", "C03", "C04", "C05", "C06"):
+        prompt = harness.build_prompt(harness.load_fixture(fixture_id))
+        for item in gold + ["Expected:", "anchor_groups", "required_facts", "expected_citation"]:
+            assert item not in prompt
 
 
 # --- isolation -------------------------------------------------------------------
