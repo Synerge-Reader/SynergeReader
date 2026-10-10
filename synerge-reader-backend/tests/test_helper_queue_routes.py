@@ -11,14 +11,19 @@ committed document's id; pending analysis reads ids only, never content or
 filenames, queues them without blocking and reports truthful counts, and keeps
 its 401/403 and a sanitized 503; a queued job reloads the CURRENT row by its
 exact id, skips deleted or already-analysed documents, closes every connection
-and cursor it opens, resolves the trusted helper default exactly once at job
-start and sends the same helper payload as before; model capacity is released
+and cursor it opens, builds its snapshot exactly once at job start from the
+shared selection its helper ticket captured when the worker took the job, and
+sends the same helper payload as before; model capacity is released
 only for a call that was never dispatched or whose reply carried the terminal
 marker (``done`` exactly True and ``done_reason`` exactly "stop" or
 "length"), and is otherwise held -- with its document key -- through every
 local cleanup, with no further model call or retry; only a valid "stop"
 completion can store an insight; and a failed queue admission leaves an
 already committed document committed, with the existing generic warning.
+
+The worker queue here draws on a generation ledger this process owns (what
+the lifespan installs once ownership is held), through its helper pool,
+exactly as main's queue does -- without any database session.
 
 What these do NOT prove: anything about a real Ollama server (whether it
 stopped work), a real PostgreSQL, an ASGI server's lifecycle, a restart, or GPU
@@ -43,6 +48,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from generation_admission import DispatchIntents, GenerationLedger, HelperPool, SharedSelection
 from generation_profiles import GEMMA_CANDIDATE, LLAMA_CONTROL, ModelRegistry, Qualification, default_model_registry
 
 _EMBEDDING_PROFILE_KEYS = (
@@ -300,17 +306,44 @@ def _install(monkeypatch, main_module, db, ollama):
     monkeypatch.setattr(main_module.requests, "post", ollama)
 
 
+class _NoIntents(DispatchIntents):
+    def record_dispatch(self, intent):
+        pass
+
+    def record_outcome(self, intent, state):
+        pass
+
+
 @pytest.fixture
-def worker_queue(monkeypatch, main_module):
+def generation(monkeypatch, main_module):
+    """A generation ledger this process owns, admitting under the shared
+    control selection, installed as main._GENERATION_LEDGER."""
+    ledger = GenerationLedger(main_module._ADMISSION_SETTINGS, clock=time.monotonic)
+    assert ledger.install_owner(intents=_NoIntents(), owner_seq=1, selection=SharedSelection(LLAMA_CONTROL, 1),
+                                paused_by=None, recovered={})
+    monkeypatch.setattr(main_module, "_GENERATION_LEDGER", ledger)
+    return ledger
+
+
+def _switch(ledger, profile_id, epoch):
+    """A committed switch as the coordinator applies it to admission."""
+    assert ledger.pause("switch-under-test") is not None
+    assert ledger.resume("switch-under-test", SharedSelection(profile_id, epoch))
+
+
+@pytest.fixture
+def worker_queue(monkeypatch, main_module, generation):
     """A real HelperJobQueue running the real _run_insight_job on one worker
-    thread, installed as main._INSIGHTS_QUEUE. ``finished`` yields
-    (document_id, state) after each job's accounting is complete."""
+    thread, drawing on the ledger's helper pool, installed as
+    main._INSIGHTS_QUEUE. ``finished`` yields (document_id, state) after each
+    job's accounting is complete."""
     helper_jobs = _helper_jobs()
     finished = stdlib_queue.Queue()
     queue = helper_jobs.HelperJobQueue(
         settings=helper_jobs.HelperQueueSettings(workers=1, max_queued=4),
         run_job=lambda document_id, call: main_module._run_insight_job(document_id, call),
         on_finished=lambda document_id, state: finished.put((document_id, state)),
+        capacity=HelperPool(generation),
     )
     monkeypatch.setattr(main_module, "_INSIGHTS_QUEUE", queue)
     assert queue.start() is True
@@ -666,12 +699,15 @@ def _qualified_gemma_default():
     return ModelRegistry(profiles=(base.get(LLAMA_CONTROL), gemma), default_profile_id=GEMMA_CANDIDATE)
 
 
-def test_an_identity_failure_at_job_start_frees_capacity_without_a_model_call(monkeypatch, main_module, worker_queue):
+def test_an_identity_failure_at_job_start_frees_capacity_without_a_model_call(
+    monkeypatch, main_module, worker_queue, generation
+):
     queue, finished = worker_queue
     db = _DB(documents={16: ("sixteen.txt", _DOC_TEXT)})
     ollama = _Ollama()
     _install(monkeypatch, main_module, db, ollama)
     monkeypatch.setattr(main_module, "_MODEL_REGISTRY", _qualified_gemma_default())
+    _switch(generation, GEMMA_CANDIDATE, 3)
     lookups = []
     monkeypatch.setattr(main_module, "_installed_model_digest", lambda tag: lookups.append(tag) or "77" * 32)
 
@@ -683,7 +719,7 @@ def test_an_identity_failure_at_job_start_frees_capacity_without_a_model_call(mo
 
 
 def test_a_qualified_candidate_job_keeps_one_snapshot_and_its_expected_and_observed_digest(
-    monkeypatch, main_module, worker_queue
+    monkeypatch, main_module, worker_queue, generation
 ):
     queue, finished = worker_queue
     db = _DB(documents={17: ("seventeen.txt", _DOC_TEXT)})
@@ -691,21 +727,22 @@ def test_a_qualified_candidate_job_keeps_one_snapshot_and_its_expected_and_obser
     _install(monkeypatch, main_module, db, ollama)
     monkeypatch.setattr(main_module, "_MODEL_REGISTRY", _qualified_gemma_default())
     monkeypatch.setattr(main_module, "_installed_model_digest", lambda tag: "sha256:" + SYNTHETIC_DIGEST.upper())
+    _switch(generation, GEMMA_CANDIDATE, 3)
     resolved = []
-    real_resolve = main_module._resolve_helper_generation
+    real_resolve = main_module._helper_generation
 
-    def recording_resolve():
-        snapshot = real_resolve()
+    def recording_resolve(ticket):
+        snapshot = real_resolve(ticket)
         resolved.append(snapshot)
         return snapshot
 
-    monkeypatch.setattr(main_module, "_resolve_helper_generation", recording_resolve)
+    monkeypatch.setattr(main_module, "_helper_generation", recording_resolve)
 
     queue.enqueue(17)
 
     assert _next_finished(finished) == (17, _admission().CallState.OBSERVED_TERMINAL)
     [snapshot] = resolved
-    assert (snapshot.profile_id, snapshot.selection) == (GEMMA_CANDIDATE, "default")
+    assert (snapshot.profile_id, snapshot.selection, snapshot.selection_epoch) == (GEMMA_CANDIDATE, "shared_active", 3)
     assert (snapshot.expected_digest, snapshot.observed_digest) == (SYNTHETIC_DIGEST, SYNTHETIC_DIGEST)
     [post] = ollama.posts
     assert post["json"]["model"] == "gemma4:31b" and post["json"]["think"] is False

@@ -13,8 +13,9 @@ What these prove:
   known/unknown, normalized -- and nothing internal, without touching the
   database or Ollama;
 * a successful answer is saved with a server-generated trace id and
-  provenance in the same INSERT, describing the snapshotted profile (default
-  Llama with no observed digest; an authorized admin override with its
+  provenance (schema 3) in the same INSERT, describing the snapshotted
+  profile and the shared selection and epoch it was admitted under (the
+  Llama control with no observed digest; a qualified Gemma selection with its
   observed digest), the release, prompt versions, configured embedding
   profile, server timing, and the stream's own metrics;
 * configuration swapped mid-stream does not reach a running answer's record;
@@ -23,8 +24,12 @@ What these prove:
   answer row at all; verification still precedes persistence;
 * client-sent look-alike fields never reach the record;
 * owner history keeps its shape and owner scope; only the admin chat-history
-  route returns provenance, legacy rows read back as null, and no other code
-  path reads the column.
+  route returns provenance, legacy rows read back as null, stored version 1
+  and 2 records come back exactly as saved (and stay readable with their own
+  vocabulary), and no other code path reads the column.
+
+The generation ledger installed here is what the lifespan installs once this
+process owns generation, without a database session.
 
 REQUIRES THE SOCKETPAIR-AWARE SIBLING GUARD (see test_main_route_harness.py):
 entering a TestClient builds a real asyncio loop.
@@ -39,6 +44,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 import uuid
 
 import dotenv
@@ -47,7 +53,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from answer_provenance import AnswerProvenanceError
+from answer_provenance import AnswerProvenanceError, read_answer_provenance
+from generation_admission import DispatchIntents, GenerationLedger, SharedSelection
 from generation_profiles import (
     GEMMA_CANDIDATE,
     LLAMA_CONTROL,
@@ -312,6 +319,29 @@ def main_module(monkeypatch):
         yield module
 
 
+class _NoIntents(DispatchIntents):
+    def record_dispatch(self, intent):
+        pass
+
+    def record_outcome(self, intent, state):
+        pass
+
+
+def _ready_generation(monkeypatch, main_module, profile_id=LLAMA_CONTROL, epoch=1):
+    """Install a generation ledger this process owns, admitting under the
+    shared selection (profile_id, epoch)."""
+    ledger = GenerationLedger(main_module._ADMISSION_SETTINGS, clock=time.monotonic)
+    assert ledger.install_owner(intents=_NoIntents(), owner_seq=1, selection=SharedSelection(profile_id, epoch),
+                                paused_by=None, recovered={})
+    monkeypatch.setattr(main_module, "_GENERATION_LEDGER", ledger)
+    return ledger
+
+
+@pytest.fixture(autouse=True)
+def generation(monkeypatch, main_module):
+    return _ready_generation(monkeypatch, main_module)
+
+
 @pytest.fixture
 def db(log):
     return _FakeDB(log)
@@ -480,7 +510,7 @@ def test_version_is_public_and_exposes_nothing_internal(client, db, ollama, inve
 # --- provenance on a successful answer ----------------------------------------
 
 
-def test_a_default_llama_answer_is_saved_with_server_provenance(client, db, ollama):
+def test_a_shared_llama_answer_is_saved_with_server_provenance(client, db, ollama):
     response = _ask(client, "tok-alice", active_document_id=10)
 
     events = _events(response)
@@ -492,13 +522,14 @@ def test_a_default_llama_answer_is_saved_with_server_provenance(client, db, olla
     trace_id = row["trace_id"]
     assert str(uuid.UUID(trace_id)) == trace_id and uuid.UUID(trace_id).version == 4
     provenance = row["answer_provenance"]
-    assert provenance["schema_version"] == 2
+    assert provenance["schema_version"] == 3
     assert provenance["trace_id"] == trace_id, "the column and the record name the same attempt"
     assert provenance["release"] == {"app_version": "0.1.0", "build_sha": SYNTHETIC_SHA}
     assert provenance["generation"] == {
         "profile_id": "llama_control",
         "model_tag": "llama3.1:8b",
-        "selection": "default",
+        "selection": "shared_active",
+        "selection_epoch": 1,
         "expected_digest": LLAMA_CONTROL_DIGEST,
         "observed_digest": None,
         "requested_options": {"temperature": 0.2, "num_ctx": 8192, "num_predict": 1200},
@@ -557,22 +588,23 @@ def test_the_answer_stream_carries_no_provenance(client, db):
     )
 
 
-def test_an_authorized_admin_override_records_its_selection_and_observed_digest(
+def test_a_shared_gemma_selection_records_its_epoch_and_observed_digest(
     monkeypatch, main_module, client, db, ollama, inventory
 ):
     monkeypatch.setattr(main_module, "_MODEL_REGISTRY", _qualified_gemma_registry())
+    _ready_generation(monkeypatch, main_module, GEMMA_CANDIDATE, 3)
     # The inventory reports the digest in another spelling; the record keeps
     # the normalized observation, separately from the registry's pin.
     inventory["digest"] = "sha256:" + SYNTHETIC_DIGEST.upper()
 
-    response = _ask(client, "tok-admin", model_profile_id=GEMMA_CANDIDATE, active_document_id=40)
+    response = _ask(client, "tok-admin", active_document_id=40)
 
     assert _events(response)[-1] == {"type": "done", "ok": True}
     _, row = _only_saved(db)
     generation = row["answer_provenance"]["generation"]
     assert generation["profile_id"] == "gemma_candidate"
     assert generation["model_tag"] == "gemma4:31b"
-    assert generation["selection"] == "admin_override"
+    assert (generation["selection"], generation["selection_epoch"]) == ("shared_active", 3)
     assert generation["expected_digest"] == SYNTHETIC_DIGEST
     assert generation["observed_digest"] == SYNTHETIC_DIGEST
     assert generation["think"] is False
@@ -629,7 +661,9 @@ def test_the_record_describes_the_snapshot_even_if_configuration_changes_mid_str
     provenance = row["answer_provenance"]
     assert provenance["release"]["build_sha"] == SYNTHETIC_SHA
     assert provenance["generation"]["model_tag"] == "llama3.1:8b"
-    assert provenance["generation"]["selection"] == "default"
+    assert (provenance["generation"]["selection"], provenance["generation"]["selection_epoch"]) == (
+        "shared_active", 1,
+    )
     assert provenance["retrieval"]["configured_embedding_profile"]["model"] == "mxbai-embed-large:335m"
 
 
@@ -758,7 +792,7 @@ def test_client_look_alike_fields_never_reach_the_record(client, db):
     assert _comparable(spoofed_row["answer_provenance"]) == _comparable(clean_row["answer_provenance"])
     assert spoofed_row["trace_id"] != _SPOOFED_FIELDS["trace_id"]
     assert spoofed_row["answer_provenance"]["trace_id"] == spoofed_row["trace_id"]
-    assert spoofed_row["answer_provenance"]["generation"]["selection"] == "default"
+    assert spoofed_row["answer_provenance"]["generation"]["selection"] == "shared_active"
     # The random server trace id is removed first so it cannot match by chance.
     stored = spoofed_row["raw_provenance"].replace(spoofed_row["trace_id"], "")
     for value in ("spoofed", "9.9.9", "f" * 40, "11111111-1111-4111-8111-111111111111", "gemma4", "1.9", "32768"):
@@ -832,30 +866,65 @@ _V1_ROW = dict(
 )
 
 
-def test_admin_history_returns_a_stored_v1_record_exactly_as_saved(client, db):
+# A row saved by the schema-version-2 writer under the retired per-request
+# override (synthetic values).
+_V2_TRACE_ID = "9b2f5d1e-3c4a-4e8b-9f10-2a3b4c5d6e7f"
+_V2_ROW = dict(
+    user_id="admin-id", ts="2026-10-08T10:00:00", selected_text="", question="v2 admin question",
+    answer="v2 admin answer", rating=None, comment=None, trace_id=_V2_TRACE_ID,
+    answer_provenance={
+        "schema_version": 2,
+        "trace_id": _V2_TRACE_ID,
+        "release": {"app_version": "0.1.0", "build_sha": None},
+        "generation": {
+            "profile_id": "gemma_candidate", "model_tag": "gemma4:31b", "selection": "admin_override",
+            "expected_digest": SYNTHETIC_DIGEST, "observed_digest": SYNTHETIC_DIGEST,
+            "requested_options": {"temperature": 0.2, "num_ctx": 8192, "num_predict": 1200},
+            "think": False, "keep_alive": "5m", "answer_read_timeout_s": 150.0,
+        },
+        "verification": {
+            "profile_id": "gemma_candidate", "model_tag": "gemma4:31b", "expected_digest": SYNTHETIC_DIGEST,
+            "observed_digest": SYNTHETIC_DIGEST,
+            "requested_options": {"temperature": 0.0, "num_ctx": 8192, "num_predict": 16},
+            "think": False, "keep_alive": "5m", "read_timeout_s": 150.0, "calls_attempted": 2,
+        },
+    },
+)
+
+
+def test_admin_history_returns_stored_v1_and_v2_records_exactly_as_saved(client, db):
     db.rows[3] = copy.deepcopy(_V1_ROW)
+    db.rows[4] = copy.deepcopy(_V2_ROW)
     _ask(client, "tok-alice", active_document_id=10)
-    [new_id] = [row_id for row_id in _saved(db) if row_id != 3]
+    [new_id] = [row_id for row_id in _saved(db) if row_id not in (3, 4)]
 
     response = client.get("/admin/chat_history", params={"token": "tok-admin"})
 
     assert response.status_code == 200
     items = {item["id"]: item for item in response.json()["items"]}
     assert items[3]["answer_provenance"] == _V1_ROW["answer_provenance"], "returned exactly as stored"
-    assert items[3]["trace_id"] == _V1_TRACE_ID
+    assert items[4]["answer_provenance"] == _V2_ROW["answer_provenance"], "returned exactly as stored"
+    assert (items[3]["trace_id"], items[4]["trace_id"]) == (_V1_TRACE_ID, _V2_TRACE_ID)
     stored_v1 = items[3]["answer_provenance"]["verification"]
     for added in ("expected_digest", "observed_digest", "think", "read_timeout_s"):
         assert added not in stored_v1, f"{added} must not be synthesized for a version 1 row"
-    assert db.rows[3] == _V1_ROW, "the stored version 1 row is never rewritten"
+    for stored_id in (3, 4):
+        assert "selection_epoch" not in items[stored_id]["answer_provenance"]["generation"]
+    assert db.rows[3] == _V1_ROW and db.rows[4] == _V2_ROW, "stored version 1/2 rows are never rewritten"
+    # Each stored version stays readable with its own selection vocabulary.
+    assert read_answer_provenance(items[3]["answer_provenance"])["selection"] == "default"
+    assert read_answer_provenance(items[4]["answer_provenance"])["selection"] == "admin_override"
     current = items[new_id]["answer_provenance"]
-    assert current["schema_version"] == 2 and current["verification"]["read_timeout_s"] == 30.0
+    assert current["schema_version"] == 3 and current["verification"]["read_timeout_s"] == 30.0
+    assert read_answer_provenance(current)["selection_epoch"] == 1
 
 
 def test_the_new_verifier_internals_reach_neither_the_stream_nor_owner_history(
     monkeypatch, main_module, client, db, inventory
 ):
     monkeypatch.setattr(main_module, "_MODEL_REGISTRY", _qualified_gemma_registry())
-    response = _ask(client, "tok-admin", model_profile_id=GEMMA_CANDIDATE, active_document_id=40)
+    _ready_generation(monkeypatch, main_module, GEMMA_CANDIDATE, 3)
+    response = _ask(client, "tok-admin", active_document_id=40)
     assert _events(response)[-1] == {"type": "done", "ok": True}
     _, row = _only_saved(db)
     assert row["answer_provenance"]["verification"]["observed_digest"] == SYNTHETIC_DIGEST

@@ -21,10 +21,12 @@ What is REAL here:
 * ``dbSetup.init_db`` itself -- its DDL, schema validation, single commit, and
   its rollback/close error handling -- unmodified.
 * The current /ask route: ``ask_question`` and the definitions it calls in
-  main.py (model resolution, citation resolution, claim verifier) are compiled
-  from the current main.py source, the same AST approach as
-  tests/test_main_citation_wiring.py, and mounted on an isolated FastAPI app
-  with no lifespan, driven in-process by TestClient (no listener).
+  main.py (admission, the shared-selection snapshot, citation resolution, the
+  claim verifier and the owned answer job) are compiled from the current
+  main.py source, the same AST approach as tests/test_main_citation_wiring.py,
+  and mounted on an isolated FastAPI app with no lifespan, driven in-process
+  by TestClient (no listener). The answer job runs on its own thread and is
+  delivered through the real AdmittedAnswerResponse.
 * The completed-stream reader, answer provenance construction and JSON
   encoding, NDJSON events, the pinned default model registry, release
   metadata and the configured embedding profile (pure value objects built from
@@ -36,9 +38,12 @@ What is MOCKED, and therefore NOT qualified here:
   the case schema's search_path. This intentionally does not exercise the
   production connector's dotenv/DB_CONNECTION_STRING configuration.
 * Authentication (``_resolve_caller_id`` returns a seeded synthetic user),
-  evidence planning (a synthetic one-passage bundle), and the Ollama transport
-  (a synthetic completed stream and verifier reply). No model, embedder,
-  network service or application server is contacted.
+  evidence planning (a synthetic one-passage bundle), the Ollama transport
+  (a synthetic completed stream and verifier reply), and generation
+  ownership: an in-memory ledger owned by this process admits the answer
+  under the shared control selection (the durable selection tables and their
+  ownership are proven in tests/test_generation_selection_integration.py). No
+  model, embedder, network service or application server is contacted.
 
 So this is startup-DDL and persistence integration coverage on a fresh
 disposable target. It does not qualify application lifespan, production
@@ -53,6 +58,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 from typing import Optional
 import uuid
 
@@ -291,8 +297,13 @@ _ROUTE_DEFINITIONS = (
     "_CLAIM_VERIFIER_WORDS",
     "_claim_verifier_status",
     "_ollama_claim_verifier",
+    "_MODEL_OVERRIDE_RETIRED",
     "_MODEL_SELECTION_REFUSALS",
-    "_resolve_answer_generation",
+    "_ADMISSION_REFUSALS",
+    "_admit_answer",
+    "_answer_generation",
+    "_new_answer_job",
+    "_release_unstarted_answer",
     "_resolve_citations",
     "ask_question",
 )
@@ -366,11 +377,15 @@ def _load_ask_route(case, user_id):
     """The current ask_question and its main.py helpers, compiled from source
     into a namespace of real pure modules plus the stubs named in the module
     docstring, mounted on an isolated FastAPI app (no lifespan)."""
+    import asyncio
+    import time
+
     from fastapi import FastAPI, HTTPException
-    from fastapi.responses import StreamingResponse
     from fastapi.testclient import TestClient
 
+    import answer_jobs
     import answer_provenance
+    import generation_admission
     from answer_evidence import EvidenceBundle, EvidenceItem, EvidenceMode, EvidencePlanningResult
     from ask_stream import (
         STREAM_MEDIA_TYPE, delta_event, done_event, entry_id_event, error_event, evidence_event,
@@ -438,6 +453,19 @@ def _load_ask_route(case, user_id):
         case.log.append(("entry_id_event", entry_id, rows[0][0]))
         return entry_id_event(entry_id)
 
+    class _NoIntents(generation_admission.DispatchIntents):
+        def record_dispatch(self, intent):
+            pass
+
+        def record_outcome(self, intent, state):
+            pass
+
+    settings = generation_admission.AdmissionSettings()
+    ledger = generation_admission.GenerationLedger(settings, clock=time.monotonic)
+    assert ledger.install_owner(intents=_NoIntents(), owner_seq=1,
+                                selection=generation_admission.SharedSelection("llama_control", 1),
+                                paused_by=None, recovered={})
+
     app = FastAPI(title="isolated /ask integration route")
     namespace = {
         "app": app,
@@ -445,20 +473,34 @@ def _load_ask_route(case, user_id):
         "Optional": Optional,
         "re": re,
         "datetime": datetime,
+        "asyncio": asyncio,
         "HTTPException": HTTPException,
-        "StreamingResponse": StreamingResponse,
         "STREAM_MEDIA_TYPE": STREAM_MEDIA_TYPE,
         "EmbeddingProviderError": EmbeddingProviderError,
+        # Real admission, owned answer job and delivery.
+        "GenerationTicket": generation_admission.GenerationTicket,
+        "AdmissionRefusal": generation_admission.AdmissionRefusal,
+        "AdmissionRefused": generation_admission.AdmissionRefused,
+        "DispatchRefused": generation_admission.DispatchRefused,
+        "current_dispatch_permitted": generation_admission.current_dispatch_permitted,
+        "acquire_answer": answer_jobs.acquire_answer,
+        "AnswerJob": answer_jobs.AnswerJob,
+        "AdmittedAnswerResponse": answer_jobs.AdmittedAnswerResponse,
+        "ANSWER_TIMEOUT_ERROR": answer_jobs.ANSWER_TIMEOUT_ERROR,
+        "NOT_DISPATCHED_ERROR": answer_jobs.NOT_DISPATCHED_ERROR,
+        "_GENERATION_LEDGER": ledger,
+        "_ADMISSION_SETTINGS": settings,
+        "_DELIVERY_SETTINGS": answer_jobs.DeliverySettings(),
         # Real pure modules.
         "AnswerGenerationSnapshot": generation_profiles.AnswerGenerationSnapshot,
         "ModelSelectionError": generation_profiles.ModelSelectionError,
-        "OverrideNotPermittedError": generation_profiles.OverrideNotPermittedError,
         "UnknownModelProfileError": generation_profiles.UnknownModelProfileError,
         "ProfileNotQualifiedError": generation_profiles.ProfileNotQualifiedError,
         "ModelIdentityMismatchError": generation_profiles.ModelIdentityMismatchError,
-        "SelectionAuthorityUnavailableError": generation_profiles.SelectionAuthorityUnavailableError,
         "ModelIdentityUnavailableError": generation_profiles.ModelIdentityUnavailableError,
-        "resolve_answer_generation": generation_profiles.resolve_answer_generation,
+        "select_shared_profile": generation_profiles.select_shared_profile,
+        "check_installed_identity": generation_profiles.check_installed_identity,
+        "shared_generation_snapshot": generation_profiles.shared_generation_snapshot,
         "_MODEL_REGISTRY": generation_profiles.default_model_registry(),
         "_RELEASE": release_metadata_from_env({}),
         "_EMBEDDING_PROFILE": resolve_embedding_profile({}),
@@ -488,7 +530,6 @@ def _load_ask_route(case, user_id):
         "connect_to_postgres": case.connect_to_postgres,
         # Mocked boundaries.
         "_resolve_caller_id": resolve_caller_id,
-        "_caller_is_admin": forbidden("_caller_is_admin"),
         "_installed_model_digest": forbidden("_installed_model_digest"),
         "_resolve_authorized_scope": lambda auth_token: "synthetic-authorized-scope",
         "_build_answer_evidence_planner": lambda scope: type(
@@ -498,7 +539,9 @@ def _load_ask_route(case, user_id):
         "post_ollama": post_ollama,
     }
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(_MAIN_PATH), "exec"), namespace)
-    return _Route(TestClient(app), calls, provenance)
+    route = _Route(TestClient(app), calls, provenance)
+    route.ledger = ledger
+    return route
 
 
 def _route_connection_indexes(case, before):
@@ -650,8 +693,9 @@ def test_real_ask_persists_real_provenance_with_answer_and_entry_id(monkeypatch,
     assert stored == json.loads(json.dumps(built)), "JSONB holds exactly the constructed record"
     generation = stored["generation"]
     assert (generation["profile_id"], generation["model_tag"], generation["selection"]) == (
-        "llama_control", "llama3.1:8b", "default",
+        "llama_control", "llama3.1:8b", "shared_active",
     )
+    assert generation["selection_epoch"] == 1, "the shared selection's epoch the answer was admitted under"
     assert generation["expected_digest"] == LLAMA_CONTROL_DIGEST
     assert generation["observed_digest"] is None, "no inventory lookup is made for the pinned control"
     assert generation["requested_options"] == {"temperature": 0.2, "num_ctx": 8192, "num_predict": 1200}
@@ -668,10 +712,10 @@ def test_real_ask_persists_real_provenance_with_answer_and_entry_id(monkeypatch,
     }
     assert stored["verification"]["calls_attempted"] == len(route.calls["verify"]) == 1
     assert stored["verification"]["model_tag"] == "llama3.1:8b"
-    # Schema version 2: the verifier settings that actually ran, as stored in
+    # Schema version 3: the verifier settings that actually ran, as stored in
     # real JSONB and read back -- the control's pin, no observation, no think
     # field, and the 30 s verifier read timeout that reached the transport.
-    assert stored["schema_version"] == 2
+    assert stored["schema_version"] == 3
     added = ("expected_digest", "observed_digest", "think", "read_timeout_s")
     assert {key: stored["verification"][key] for key in added} == {
         "expected_digest": LLAMA_CONTROL_DIGEST, "observed_digest": None, "think": None, "read_timeout_s": 30.0,
@@ -697,6 +741,10 @@ def test_real_ask_persists_real_provenance_with_answer_and_entry_id(monkeypatch,
     assert route.calls["auth"] == [_SYNTHETIC_TOKEN] and route.calls["forbidden"] == []
     assert len(route.calls["generate"]) == 1
     assert route.calls["generate"][0]["payload"]["model"] == "llama3.1:8b"
+    deadline = time.monotonic() + 5
+    while route.ledger.snapshot().answers_running and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert route.ledger.snapshot().answers_running == 0, "the answer job released its one ticket"
 
 
 # --- D. a real INSERT failure saves nothing and announces nothing -----------------

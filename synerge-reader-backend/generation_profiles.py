@@ -3,9 +3,9 @@
 This module is a pure configuration/value-object layer, like
 ``rag_model_profiles.py``: no network, filesystem, database, or environment
 access happens at import time or in any function here. The application's
-composition boundary (``main.py``) supplies the two runtime facts a selection
-may need -- whether the caller is a trusted administrator, and which digest an
-installed model tag currently has -- as callables.
+composition boundary (``main.py``) supplies the one runtime fact a snapshot
+may need -- which digest an installed model tag currently has -- as a
+callable.
 
 What the registry decides, and what a client can never override:
 
@@ -19,8 +19,15 @@ What the registry decides, and what a client can never override:
   separate verifier or helper model: each role call is derived from one
   resolved profile -- its exact tag, context window, ``keep_alive`` and think
   policy -- with the role's own temperature, output limit and read timeout.
-  An answer's verifier comes from that answer's snapshot; a helper job uses
-  the registry default, resolved once when the job starts.
+
+Which registered profile is in use is NOT decided here or by any request: it
+is the one shared active selection an administrator changes through the
+switch coordinator (``generation_selection.py`` / ``generation_coordinator.py``).
+Every answer, its verifier calls and every helper job capture that selection
+-- profile id and epoch -- once, when admission grants them, and build their
+snapshot from it with ``shared_generation_snapshot``. There is no per-request
+override and no fallback: a selection naming an unknown, unqualified or
+mismatched profile refuses instead of using another model.
 
 The option values are the settings this backend REQUESTS. Ollama may still
 apply its own limits (for example a server-wide ``OLLAMA_NUM_PARALLEL`` or a
@@ -34,14 +41,15 @@ Two separate kinds of reviewed data live on a profile:
   an ``observed_digest`` only when the installed identity was actually read
   for that answer.
 * ``qualification`` -- which release gates have evidence. A profile with
-  ``requires_qualification`` is selectable (explicitly, or as the default)
-  only when its combined-capacity and quality evidence are both recorded, and
-  every answer it produces is preceded by an installed-digest check.
+  ``requires_qualification`` is selectable (as the shared selection, or as the
+  registry default that first seeds it) only when its combined-capacity and
+  quality evidence are both recorded, and every answer or helper job it
+  produces is preceded by an installed-digest check.
 
 The unqualified control (``llama_control``) is the existing production model:
-it is explicitly marked as not requiring qualification, so ordinary answers
-cost no admin lookup and no per-request inventory call. Whether a profile needs
-qualification never depends on which profile happens to be the default.
+it is explicitly marked as not requiring qualification, so its answers cost no
+per-job inventory call. Whether a profile needs qualification never depends on
+which profile happens to be selected.
 """
 
 from __future__ import annotations
@@ -132,15 +140,11 @@ class GenerationProfileError(ValueError):
 
 
 class ModelSelectionError(Exception):
-    """An answer-model selection was refused. Messages are fixed and safe."""
-
-
-class OverrideNotPermittedError(ModelSelectionError):
-    """An explicit profile was requested by a caller without admin authority."""
+    """A model selection or snapshot was refused. Messages are fixed and safe."""
 
 
 class UnknownModelProfileError(ModelSelectionError):
-    """The requested profile id is not in the registry."""
+    """The selected profile id is not in the registry."""
 
 
 class ProfileNotQualifiedError(ModelSelectionError):
@@ -149,10 +153,6 @@ class ProfileNotQualifiedError(ModelSelectionError):
 
 class ModelIdentityMismatchError(ModelSelectionError):
     """The expected tag is absent, or installed with a different digest."""
-
-
-class SelectionAuthorityUnavailableError(ModelSelectionError):
-    """Admin authority could not be established (the lookup failed)."""
 
 
 class ModelIdentityUnavailableError(ModelSelectionError):
@@ -467,22 +467,44 @@ def _role_call(
     )
 
 
-Selection = Literal["default", "admin_override"]
+# "shared_active": the one shared selection an administrator switches, captured
+# with its epoch at admission. That is the only selection the application
+# makes. "default" and "admin_override" are the historical values of answers
+# saved before the shared selection existed (provenance schema 1 and 2); they
+# remain valid snapshot values only so that historical records and the
+# operator diagnostic, which builds its own fixed snapshots, keep their meaning.
+SHARED_SELECTION = "shared_active"
+Selection = Literal["default", "admin_override", "shared_active"]
+_SELECTIONS = ("default", "admin_override", SHARED_SELECTION)
+MAX_SELECTION_EPOCH = 2**62
+
+
+def require_selection_epoch(value: object) -> int:
+    """A shared-selection epoch: a real int in [1, 2**62]; never a bool."""
+    if type(value) is not int or not 1 <= value <= MAX_SELECTION_EPOCH:
+        raise GenerationProfileError("a selection epoch must be an integer of at least 1")
+    return value
 
 
 @dataclass(frozen=True)
 class AnswerGenerationSnapshot:
-    """Everything one answer is generated and verified with, fixed up front.
+    """Everything one answer or helper job is generated and verified with,
+    fixed up front.
 
-    Built once per /ask request, before anything streams, and once at the
-    start of each background helper job. It holds values, not a reference to
-    the registry, so a later selection or registry change cannot alter an
-    answer or job already in progress.
+    Built once per admitted /ask answer, before anything streams, and once per
+    admitted helper job, from the shared selection captured at admission. It
+    holds values, not a reference to the registry or the selection, so a later
+    switch or registry change cannot alter an answer or job already in
+    progress.
 
     ``expected_digest`` is the registry's pin for this profile.
     ``observed_digest`` is what the installed-model lookup reported while
-    resolving THIS answer or job, and is None whenever no lookup was made (the
+    building THIS snapshot, and is None whenever no lookup was made (the
     unqualified control). The two are never interchangeable.
+
+    ``selection_epoch`` is the shared selection's epoch the job was admitted
+    under (``selection`` "shared_active"); it is None only for the historical
+    selection values, which carry no shared epoch.
 
     ``verifier`` is derived from this same profile and identity when the
     snapshot is built; ``helper_call`` derives a helper call from the values
@@ -501,6 +523,15 @@ class AnswerGenerationSnapshot:
     expected_digest: Optional[str]
     observed_digest: Optional[str]
     verifier: FixedModelCall
+    selection_epoch: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.selection not in _SELECTIONS:
+            raise GenerationProfileError("unknown model selection")
+        if self.selection == SHARED_SELECTION:
+            require_selection_epoch(self.selection_epoch)
+        elif self.selection_epoch is not None:
+            raise GenerationProfileError("only a shared selection carries an epoch")
 
     def ollama_payload(self, prompt: str, *, stream: bool = True) -> dict:
         return build_generate_payload(
@@ -602,7 +633,11 @@ GEMMA_CANDIDATE_EVIDENCE = Qualification(
 
 
 def default_model_registry() -> ModelRegistry:
-    """The production registry: Llama answers by default; Gemma unqualified."""
+    """The production registry: Llama is the default; Gemma unqualified.
+
+    The default only seeds the shared selection the first time ownership
+    creates it; after that the persisted selection decides which profile
+    answers, and changing it is an administrator's coordinated switch."""
     return ModelRegistry(
         profiles=(
             ModelProfile(
@@ -645,6 +680,7 @@ def _snapshot(
     profile: ModelProfile,
     selection: Selection,
     observed_digest: Optional[str],
+    selection_epoch: Optional[int] = None,
 ) -> AnswerGenerationSnapshot:
     # The verifier is this exact profile and identity with the bounded
     # verifier options, fixed here with the answer: verification never
@@ -674,49 +710,33 @@ def _snapshot(
         expected_digest=profile.expected_digest,
         observed_digest=observed_digest,
         verifier=verifier,
+        selection_epoch=selection_epoch,
     )
 
 
-def resolve_answer_generation(
-    registry: ModelRegistry,
-    *,
-    requested_profile_id: Optional[str],
-    caller_is_admin: Callable[[], bool],
-    installed_digest: Callable[[str], Optional[str]],
-) -> AnswerGenerationSnapshot:
-    """The one answer model a request may use, or a ModelSelectionError.
-
-    * No requested profile: the registry default, with no admin lookup. A
-      legacy client model string is not an input here at all -- it can never
-      pick a model.
-    * A requested profile: admin authority is established first, so a
-      non-admin learns nothing about the registry; then the id must exist.
-    * Either way the profile must be selectable, and a profile that requires
-      qualification answers only after its installed digest equals its
-      expected digest. The unqualified control makes no inventory call.
-
-    The snapshot's verifier is derived from the same profile and identity, so
-    an answer is verified by the model that wrote it.
-    """
-    if requested_profile_id is None:
-        profile, selection = registry.default, "default"
-    else:
-        try:
-            is_admin = caller_is_admin()
-        except Exception:
-            raise SelectionAuthorityUnavailableError("admin authority could not be established") from None
-        if is_admin is not True:
-            raise OverrideNotPermittedError("model selection requires an administrator")
-        profile = registry.get(requested_profile_id)
-        if profile is None:
-            raise UnknownModelProfileError("unknown model profile")
-        selection = "admin_override"
-
+def select_shared_profile(registry: ModelRegistry, profile_id: object) -> ModelProfile:
+    """The registered, selectable profile a shared selection names, or a
+    ModelSelectionError. Pure: no lookup, no fallback to any other profile --
+    an unknown or unqualified selection refuses."""
+    profile = registry.get(profile_id) if isinstance(profile_id, str) else None
+    if profile is None:
+        raise UnknownModelProfileError("unknown model profile")
     if not profile.selectable:
         raise ProfileNotQualifiedError("model profile is not qualified for selection")
-    if not profile.requires_qualification:
-        return _snapshot(profile, selection, None)
+    return profile
 
+
+def check_installed_identity(
+    profile: ModelProfile, installed_digest: Callable[[str], Optional[str]]
+) -> str:
+    """Read the installed digest of the profile's exact tag and require it to
+    equal the profile's pinned digest; return what was observed.
+
+    Read-only: ``installed_digest`` is an inventory lookup. An absent tag or a
+    different digest is a mismatch; a failed or malformed lookup is
+    unavailable. A profile without a pin cannot be verified."""
+    if profile.expected_digest is None:
+        raise ModelIdentityUnavailableError("model profile has no pinned identity")
     try:
         observed = installed_digest(profile.model_tag)
     except Exception:
@@ -728,32 +748,31 @@ def resolve_answer_generation(
         raise ModelIdentityUnavailableError("installed model identity is unreadable")
     if observed != profile.expected_digest:
         raise ModelIdentityMismatchError("installed model digest differs from the expected digest")
-    return _snapshot(profile, selection, observed)
+    return observed
 
 
-def _no_admin_lookup_for_a_default() -> bool:
-    raise RuntimeError("a default resolution never consults admin authority")
-
-
-def resolve_default_generation(
-    registry: ModelRegistry,
+def shared_generation_snapshot(
+    profile: ModelProfile,
     *,
-    installed_digest: Callable[[str], Optional[str]],
+    epoch: int,
+    observed_digest: Optional[str],
 ) -> AnswerGenerationSnapshot:
-    """The trusted registry default for one background helper job, or a
-    ModelSelectionError.
+    """The snapshot for one job admitted under the shared selection
+    ``(profile, epoch)``.
 
-    There is no requested profile and no caller here, so nothing a request
-    carries -- including an admin's per-request answer override -- can reach
-    a helper. The default goes through the same policy as an answer's
-    default: no admin lookup, the unqualified control makes no inventory call
-    (``observed_digest`` None), and a profile that requires qualification is
-    used only once its installed digest equals its expected digest. Resolve it
-    once when the job starts and use the snapshot for every call of that job.
-    """
-    return resolve_answer_generation(
-        registry,
-        requested_profile_id=None,
-        caller_is_admin=_no_admin_lookup_for_a_default,
-        installed_digest=installed_digest,
-    )
+    ``observed_digest`` must be what ``check_installed_identity`` returned for
+    THIS job when the profile requires qualification, and None otherwise: the
+    unqualified control makes no per-job inventory call, and its pinned digest
+    is never copied into the observed one. The verifier and every helper call
+    are derived from this same snapshot."""
+    if not isinstance(profile, ModelProfile):
+        raise GenerationProfileError("expected a registered ModelProfile")
+    require_selection_epoch(epoch)
+    if not profile.selectable:
+        raise ProfileNotQualifiedError("model profile is not qualified for selection")
+    if profile.requires_qualification:
+        if observed_digest is None or observed_digest != profile.expected_digest:
+            raise ModelIdentityUnavailableError("a qualified profile needs its observed identity")
+    elif observed_digest is not None:
+        raise GenerationProfileError("the unqualified control records no observed identity")
+    return _snapshot(profile, SHARED_SELECTION, observed_digest, epoch)

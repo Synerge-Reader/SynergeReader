@@ -43,7 +43,9 @@ real asyncio event loop, whose Windows self-pipe uses ``socket.socketpair()``.
 ``main._initialize_application`` is replaced before any client is built, and
 ``main.connect_to_postgres``, ``main._EMBEDDING_PROVIDER`` and (for /ask)
 ``main.post_ollama`` are replaced with in-memory doubles, so there is no
-database, Ollama, network, or subprocess.
+database, Ollama, network, or subprocess. A generation ledger owned by this
+process (what the lifespan installs once ownership is held) admits /ask under
+the shared control selection, without any database session.
 """
 
 import ast
@@ -54,6 +56,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 import bcrypt
 import dotenv
@@ -62,6 +65,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from generation_admission import DispatchIntents, GenerationLedger, SharedSelection
 from helper_jobs import EnqueueOutcome
 
 
@@ -381,6 +385,25 @@ def main_module(monkeypatch):
 @pytest.fixture
 def db():
     return _FakeDB()
+
+
+class _NoIntents(DispatchIntents):
+    def record_dispatch(self, intent):
+        pass
+
+    def record_outcome(self, intent, state):
+        pass
+
+
+@pytest.fixture(autouse=True)
+def generation(monkeypatch, main_module):
+    """A generation ledger this process owns, admitting under the shared
+    control selection."""
+    ledger = GenerationLedger(main_module._ADMISSION_SETTINGS, clock=time.monotonic)
+    assert ledger.install_owner(intents=_NoIntents(), owner_seq=1, selection=SharedSelection("llama_control", 1),
+                                paused_by=None, recovered={})
+    monkeypatch.setattr(main_module, "_GENERATION_LEDGER", ledger)
+    return ledger
 
 
 @pytest.fixture

@@ -1,9 +1,16 @@
 """Bounded, ID-only queue for background document insights (B2a-1).
 
 One process-local queue holds at most ``max_queued`` waiting document ids and
-runs them on a fixed set of ``workers`` threads that share
-``generation_admission.HelperCapacity(workers)``. It replaces starting one
+runs them on a fixed set of ``workers`` threads. It replaces starting one
 daemon thread per uploaded or pending document.
+
+Capacity: by default the workers share a private
+``generation_admission.HelperCapacity(workers)``. The application injects the
+shared ledger's helper sublimit instead (``generation_admission.HelperPool``):
+then a worker takes a job only when the ledger grants a helper ticket, which
+captures the shared model selection at that moment -- never when the id was
+queued -- and the ledger's answer priority, switch pauses and unresolved work
+all apply. The injected capacity's change notifications wake idle workers.
 
 What an item is: a positive ``int`` document id -- nothing else. No document
 text, filename, token, reply or closure over them is ever stored; the job
@@ -13,9 +20,11 @@ Concurrency rules:
 
 * ``enqueue``/``enqueue_batch`` never block on work: one short critical section
   over in-memory state, safe to call from the event loop.
-* A worker takes the next id only when a capacity slot is free, then runs the
-  injected ``run_job(document_id, call)`` OUTSIDE every lock. No lock is held
-  across SQL, HTTP, model resolution, a response close, a join or a log line.
+* A worker takes the next id only when the capacity grants it a call record,
+  then runs the injected ``run_job(document_id, call)`` OUTSIDE every lock. No
+  lock is held across SQL, HTTP, model resolution, a response close, a join or
+  a log line. The only lock nesting is queue lock -> capacity lock, inside the
+  grant; capacity notifications are delivered outside the capacity's lock.
 * Dedupe covers queued, running and unresolved ids, so retained state is
   bounded by ``max_queued + workers``. Order among admitted ids is FIFO.
 * An ``UNKNOWN`` call (see generation_admission) keeps its capacity slot and its
@@ -111,17 +120,22 @@ class HelperJobQueue:
         thread_factory: Callable[..., object] = threading.Thread,
         on_finished: Optional[Callable[[int, CallState], None]] = None,
         log: Callable[[str], None] = print,
+        capacity: Optional[object] = None,
     ) -> None:
         if not isinstance(settings, HelperQueueSettings):
             raise TypeError("settings must be HelperQueueSettings")
         if not callable(run_job):
             raise TypeError("run_job must be callable")
+        if capacity is not None and not all(
+            callable(getattr(capacity, name, None)) for name in ("try_acquire", "finish", "snapshot")
+        ):
+            raise TypeError("capacity needs try_acquire, finish and snapshot")
         self._settings = settings
         self._run_job = run_job
         self._thread_factory = thread_factory
         self._on_finished = on_finished
         self._log = log
-        self._capacity = HelperCapacity(settings.workers)
+        self._capacity = capacity if capacity is not None else HelperCapacity(settings.workers)
         self._lock = threading.Lock()
         self._wake = threading.Condition(self._lock)
         self._queued = collections.deque()
@@ -134,6 +148,15 @@ class HelperJobQueue:
         self._lifecycle = object()
         # True while one start() is between reserving tokens and publishing.
         self._starting = False
+        add_listener = getattr(self._capacity, "add_listener", None)
+        if callable(add_listener):
+            add_listener(self._capacity_changed)
+
+    def _capacity_changed(self) -> None:
+        """A shared capacity may have freed a slot or changed its selection:
+        idle workers re-check. Called outside the capacity's own lock."""
+        with self._lock:
+            self._wake.notify_all()
 
     # --- lifecycle ---------------------------------------------------------------
 
@@ -262,11 +285,14 @@ class HelperJobQueue:
                 if self._stopping:
                     self._workers.discard(token)
                     return None
-                if self._queued and self._capacity.free > 0:
+                if self._queued:
+                    # None when no slot is free (or a shared ledger is paused,
+                    # unowned or serving a waiting answer first): wait.
                     call = self._capacity.try_acquire()
-                    doc = self._queued.popleft()
-                    self._keys[doc] = _RUNNING
-                    return doc, call
+                    if call is not None:
+                        doc = self._queued.popleft()
+                        self._keys[doc] = _RUNNING
+                        return doc, call
                 self._wake.wait()
 
     def _worker_loop(self, token) -> None:

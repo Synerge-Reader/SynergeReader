@@ -8,9 +8,11 @@ Three kinds of test live here, and none imports the application:
 * Route-composition tests parse ``main.py`` with the stdlib ``ast`` module.
 * Route-execution tests compile only ``ask_question`` and the claim verifier
   out of that same parse tree into an isolated namespace in which every
-  collaborator -- Ollama, the database, evidence planning, the knowledge base
-  -- is an in-memory stub, then drive the real stream generator and decode
-  what it emits.
+  collaborator -- Ollama, the database, evidence planning, the knowledge base,
+  admission and the answer job -- is an in-memory stub, then drive the real
+  stream generator (the job body ``stream_generate``) with an in-memory job
+  and decode what it emits. Admission's own waits, the job thread and the
+  bounded delivery are proven in tests/test_answer_jobs.py.
 
 main.py is never imported, so none of its module-level setup runs, and no
 database, Ollama, network, subprocess, or filesystem write occurs.
@@ -82,7 +84,9 @@ from citation_generation import (
     generate_citations,
     safe_error,
 )
-from generation_profiles import default_model_registry, resolve_answer_generation
+from answer_jobs import ANSWER_TIMEOUT_ERROR, NOT_DISPATCHED_ERROR
+from generation_admission import DispatchRefused
+from generation_profiles import LLAMA_CONTROL, default_model_registry, shared_generation_snapshot
 from ollama_generation import (
     FAILURE_OUTPUT_LIMIT,
     OllamaGenerateStream,
@@ -287,11 +291,34 @@ class _FakeVerifierResponse:
         return {"response": self._reply, "done": True, "done_reason": "stop"}
 
 
-class _CapturedStreamingResponse:
-    def __init__(self, content, media_type=None, headers=None):
-        self.content = content
+class _CapturedAnswerResponse:
+    """Stands in for answer_jobs.AdmittedAnswerResponse: keeps the job (here,
+    the job body itself, see ``_new_answer_job`` in the harness)."""
+
+    def __init__(self, job, media_type=None, headers=None):
+        self.content = job
         self.media_type = media_type
         self.headers = headers
+
+
+class _HarnessJob:
+    """The answer job as the body sees it: delivery never abandoned, budget
+    never spent, and the commit point always reached."""
+
+    abandoned = False
+    expired = False
+
+    def observed_stream(self, stream):
+        return True
+
+    def begin_persistence(self):
+        return True
+
+
+def _shared_llama():
+    """The snapshot an answer admitted under the shared control selection
+    carries. No inventory lookup is made for the control."""
+    return shared_generation_snapshot(default_model_registry().get(LLAMA_CONTROL), epoch=1, observed_digest=None)
 
 
 def _evidence_bundle():
@@ -316,7 +343,7 @@ _CALLER_ID = "caller-7"
 def _route_harness(main_tree, connection, verifier_reply="supported", kb_entries=()):
     """The route's real code, with every collaborator an in-memory stub."""
     calls = SimpleNamespace(
-        ollama=[], callers=[], scopes=[], kb_queries=[], kb_used=[],
+        ollama=[], callers=[], scopes=[], kb_queries=[], kb_used=[], admitted=[], released=[],
         auto_saved=threading.Event(),
     )
     planning = EvidencePlanningResult(bundle=_evidence_bundle())
@@ -345,23 +372,34 @@ def _route_harness(main_tree, connection, verifier_reply="supported", kb_entries
             return _FakeGenerationStream(_ANSWER_TOKENS)
         return _FakeVerifierResponse(verifier_reply)
 
-    # The real default resolution (no explicit profile). Admin authority and
-    # installed-model lookups are never consulted on this path; route-level
-    # selection is proven in tests/test_answer_model_selection.py.
-    def resolve_answer_generation_default(request):
-        return resolve_answer_generation(
-            default_model_registry(),
-            requested_profile_id=None,
-            caller_is_admin=lambda: pytest.fail("no admin lookup for a default answer"),
-            installed_digest=lambda tag: pytest.fail("no inventory lookup for a default answer"),
-        )
+    # Admission and the shared selection, as non-suspending coroutines so the
+    # route still runs to its return with one send(). Route-level admission
+    # and selection are proven in tests/test_answer_model_selection.py and
+    # tests/test_generation_switch_routes.py.
+    async def admit_answer():
+        calls.admitted.append(1)
+        return "admitted-ticket"
+
+    async def answer_generation(ticket):
+        assert ticket == "admitted-ticket"
+        return _shared_llama()
 
     namespace = {
         "app": SimpleNamespace(post=lambda path: (lambda function: function)),
         "AskRequest": object,
         "Optional": Optional,
         "re": re,
-        "StreamingResponse": _CapturedStreamingResponse,
+        "HTTPException": type("HTTPException", (Exception,), {}),
+        "_MODEL_OVERRIDE_RETIRED": "retired",
+        "AdmittedAnswerResponse": _CapturedAnswerResponse,
+        "_new_answer_job": lambda ticket, body: body,
+        "_admit_answer": admit_answer,
+        "_answer_generation": answer_generation,
+        "_release_unstarted_answer": lambda ticket: calls.released.append(ticket),
+        "current_dispatch_permitted": lambda: True,
+        "DispatchRefused": DispatchRefused,
+        "ANSWER_TIMEOUT_ERROR": ANSWER_TIMEOUT_ERROR,
+        "NOT_DISPATCHED_ERROR": NOT_DISPATCHED_ERROR,
         "STREAM_MEDIA_TYPE": STREAM_MEDIA_TYPE,
         "EmbeddingProviderError": type("EmbeddingProviderError", (Exception,), {}),
         "OLLAMA_KEEP_ALIVE": "30m",
@@ -373,7 +411,6 @@ def _route_harness(main_tree, connection, verifier_reply="supported", kb_entries
         # The real pure validator _ollama_claim_verifier now delegates to;
         # its rules are proven in tests/test_ollama_generation.py.
         "completed_generate_response": completed_generate_response,
-        "_resolve_answer_generation": resolve_answer_generation_default,
         # Answer provenance is built from the real pure modules; its contents
         # are proven in tests/test_answer_provenance_routes.py.
         "AnswerTimer": AnswerTimer,
@@ -413,7 +450,8 @@ def _route_harness(main_tree, connection, verifier_reply="supported", kb_entries
 
 
 def _call_without_event_loop(coroutine):
-    """ask_question awaits nothing, so one send() runs it to its return."""
+    """ask_question's awaits (admission, the model snapshot) are stubbed as
+    coroutines that never suspend, so one send() runs it to its return."""
     try:
         coroutine.send(None)
     except StopIteration as finished:
@@ -437,12 +475,14 @@ def _stream_ask(
         selected_text="",
         auth_token=auth_token,
         model="local-test-model",
+        model_profile_id=None,
         mode=mode,
     )
     response = _call_without_event_loop(namespace["ask_question"](request))
     assert response.media_type == STREAM_MEDIA_TYPE
+    assert calls.admitted == [1] and calls.released == [], "one admission; the response owns the ticket"
 
-    payload = "".join(response.content)
+    payload = "".join(response.content(_HarnessJob()))
     decoder = EventStreamDecoder()
     events = decoder.feed(payload) + decoder.close()
     assert decoder.malformed_lines == 0, "every emitted line must parse as an event"
@@ -906,13 +946,8 @@ def test_the_runtime_claim_verifier_is_local_only(main_tree):
 
 
 def _default_verifier():
-    """The verifier call a default answer's snapshot carries."""
-    return resolve_answer_generation(
-        default_model_registry(),
-        requested_profile_id=None,
-        caller_is_admin=lambda: pytest.fail("no admin lookup for a default answer"),
-        installed_digest=lambda tag: pytest.fail("no inventory lookup for a default answer"),
-    ).verifier
+    """The verifier call a shared-control answer's snapshot carries."""
+    return _shared_llama().verifier
 
 
 def test_the_claim_verifier_sends_bounded_native_options(main_tree):
@@ -1523,3 +1558,74 @@ def test_public_citation_payloads_never_label_a_chunk():
     assert citation["locator"]["label"] == "Relevant passage"
     assert "chunk 4" not in json.dumps(citation)
     assert "chunk" not in citation["display_label"].lower()
+
+
+# --- the owned answer job: abandonment, budget and refused dispatch ------------------
+
+
+class _AbandonAfterGeneration(_HarnessJob):
+    """Delivery is abandoned once the model's stream was fully read."""
+
+    def __init__(self):
+        self.observed = []
+
+    @property
+    def abandoned(self):
+        return bool(self.observed)
+
+    def observed_stream(self, stream):
+        self.observed.append(stream.done_reason)
+        return True
+
+    def begin_persistence(self):
+        raise AssertionError("no INSERT is begun after known abandonment")
+
+
+def _drive(main_tree, connection, job, *, post_ollama=None):
+    namespace, calls = _route_harness(main_tree, connection)
+    if post_ollama is not None:
+        namespace["post_ollama"] = post_ollama
+    request = SimpleNamespace(question="How long is the agreement term?", selected_text="", auth_token=None,
+                              model=None, model_profile_id=None, mode="document_qa")
+    response = _call_without_event_loop(namespace["ask_question"](request))
+    payload = "".join(response.content(job))
+    decoder = EventStreamDecoder()
+    return decoder.feed(payload) + decoder.close(), calls
+
+
+def test_an_abandoned_answer_drains_its_stream_then_verifies_and_saves_nothing(main_tree):
+    connection = _FakeConnection()
+    job = _AbandonAfterGeneration()
+    events, calls = _drive(main_tree, connection, job)
+    assert job.observed == ["stop"], "the stream was read to its terminal record"
+    assert [call.stream for call in calls.ollama] == [True], "no verifier call after abandonment"
+    assert connection.steps == [], "no INSERT was begun"
+    assert not [e for e in events if e["type"] in ("verification", "entry_id", "done")]
+
+
+def test_a_spent_budget_before_dispatch_sends_nothing_and_ends_not_ok(main_tree):
+    job = _HarnessJob()
+    job.expired = True
+    connection = _FakeConnection()
+    events, calls = _drive(main_tree, connection, job)
+    assert calls.ollama == [] and connection.steps == []
+    assert events[-2:] == [{"type": "error", **ANSWER_TIMEOUT_ERROR}, {"type": "done", "ok": False}]
+
+
+def test_a_refused_dispatch_is_reported_as_not_sent_and_ends_not_ok(main_tree):
+    def refuse(endpoint, payload, *, stream=False, timeout=60):
+        raise DispatchRefused("no admitted job may dispatch")
+
+    connection = _FakeConnection()
+    events, _ = _drive(main_tree, connection, _HarnessJob(), post_ollama=refuse)
+    assert events[-2:] == [{"type": "error", **NOT_DISPATCHED_ERROR}, {"type": "done", "ok": False}]
+    assert connection.steps == []
+
+
+def test_a_per_request_model_override_is_refused_before_identity_or_admission(main_tree):
+    namespace, calls = _route_harness(main_tree, _FakeConnection())
+    request = SimpleNamespace(question="q", selected_text="", auth_token="tok", model=None,
+                              model_profile_id="llama_control", mode="document_qa")
+    with pytest.raises(namespace["HTTPException"]):
+        _call_without_event_loop(namespace["ask_question"](request))
+    assert calls.callers == [] and calls.admitted == [] and calls.ollama == []

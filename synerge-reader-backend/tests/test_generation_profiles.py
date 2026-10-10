@@ -1,13 +1,17 @@
-"""Registry, option validation and selection for answer-generation profiles.
+"""Registry, option validation and shared-selection snapshots for
+answer-generation profiles.
 
-Pure: generation_profiles.py does no I/O, and every runtime fact a selection
-needs (admin authority, installed digest) is injected here as a callable.
-Gate behaviour is exercised with synthetic digests on constructed profiles;
-only the production-constant tests compare against the operator-supplied pins.
+Pure: generation_profiles.py does no I/O, and the one runtime fact a snapshot
+needs (the installed digest) is injected here as a callable. Gate behaviour is
+exercised with synthetic digests on constructed profiles; only the
+production-constant tests compare against the operator-supplied pins.
+
+Which profile answers is the shared selection an administrator switches (see
+generation_coordinator.py); the per-request override and its admin-authority
+resolution are retired, and these tests prove they no longer exist.
 """
 
 import dataclasses
-import inspect
 import math
 import os
 import sys
@@ -16,9 +20,11 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import generation_profiles
 from generation_profiles import (
     GEMMA_CANDIDATE,
     LLAMA_CONTROL,
+    SHARED_SELECTION,
     SMOKE_OPTIONS,
     FixedModelCall,
     GenerationOptions,
@@ -27,14 +33,14 @@ from generation_profiles import (
     ModelIdentityUnavailableError,
     ModelProfile,
     ModelRegistry,
-    OverrideNotPermittedError,
     ProfileNotQualifiedError,
     Qualification,
-    SelectionAuthorityUnavailableError,
     UnknownModelProfileError,
+    _snapshot,
+    check_installed_identity,
     default_model_registry,
-    resolve_answer_generation,
-    resolve_default_generation,
+    select_shared_profile,
+    shared_generation_snapshot,
 )
 
 # Operator-supplied pins, asserted only against the production constants.
@@ -79,13 +85,12 @@ def _qualified_registry(default=LLAMA_CONTROL):
     return _registry(_gemma(qualification=_evidence()), default=default)
 
 
-def _resolve(registry, profile_id, *, admin=True, digest=None):
-    return resolve_answer_generation(
-        registry,
-        requested_profile_id=profile_id,
-        caller_is_admin=lambda: admin,
-        installed_digest=lambda tag: digest,
-    )
+def _shared(registry, profile_id, *, epoch=1, lookup=_never):
+    """A snapshot the way main builds one for an admitted job: the selected
+    profile, its identity read only if it requires qualification."""
+    profile = select_shared_profile(registry, profile_id)
+    observed = check_installed_identity(profile, lookup) if profile.requires_qualification else None
+    return shared_generation_snapshot(profile, epoch=epoch, observed_digest=observed)
 
 
 # --- the production registry --------------------------------------------------
@@ -140,20 +145,16 @@ def test_answer_profiles_request_the_reviewed_settings_and_timeouts():
     assert (gemma.verifier_read_timeout_s, gemma.helper_read_timeout_s) == (150.0, 150.0)
 
 
-def test_production_gemma_stays_disabled_for_an_admin_too():
+def test_production_gemma_cannot_be_the_shared_selection():
     registry = default_model_registry()
     with pytest.raises(ProfileNotQualifiedError):
-        resolve_answer_generation(
-            registry, requested_profile_id=GEMMA_CANDIDATE,
-            caller_is_admin=lambda: True, installed_digest=_never,
-        )
+        select_shared_profile(registry, GEMMA_CANDIDATE)
+    with pytest.raises(ProfileNotQualifiedError):
+        shared_generation_snapshot(registry.get(GEMMA_CANDIDATE), epoch=1, observed_digest=OPERATOR_GEMMA_DIGEST)
 
 
 def test_verifier_and_helpers_are_bounded_llama_calls_without_think():
-    snapshot = resolve_answer_generation(
-        default_model_registry(), requested_profile_id=None,
-        caller_is_admin=_never, installed_digest=_never,
-    )
+    snapshot = _shared(default_model_registry(), LLAMA_CONTROL)
     verifier = snapshot.verifier.ollama_payload("p")
     assert verifier == {
         "model": "llama3.1:8b", "prompt": "p", "stream": False,
@@ -331,28 +332,34 @@ def test_the_production_gemma_cannot_be_made_default():
         )
 
 
-def test_an_incomplete_default_is_refused_at_resolution_even_if_construction_was_bypassed():
+def test_an_unqualified_selection_is_refused_with_no_fallback():
     registry = _registry(_gemma())
-    # Simulate a registry whose invariant was broken after construction.
-    object.__setattr__(registry, "default_profile_id", GEMMA_CANDIDATE)
     with pytest.raises(ProfileNotQualifiedError):
-        resolve_answer_generation(
-            registry, requested_profile_id=None,
-            caller_is_admin=_never, installed_digest=_never,
-        )
+        select_shared_profile(registry, GEMMA_CANDIDATE)
+    # Even handed the profile directly, an unqualified one yields no snapshot.
+    with pytest.raises(ProfileNotQualifiedError):
+        shared_generation_snapshot(registry.get(GEMMA_CANDIDATE), epoch=1, observed_digest=SYNTHETIC_DIGEST)
 
 
-# --- selection: the omitted-profile default -----------------------------------
+@pytest.mark.parametrize("profile_id", ["qwen3_latest", "Llama Control", None, 7])
+def test_an_unknown_selection_is_refused_with_no_fallback(profile_id):
+    with pytest.raises(UnknownModelProfileError):
+        select_shared_profile(_qualified_registry(), profile_id)
 
 
-def test_the_llama_default_needs_no_admin_and_no_inventory_lookup():
-    snapshot = resolve_answer_generation(
-        default_model_registry(),
-        requested_profile_id=None,
-        caller_is_admin=_never,
-        installed_digest=_never,
-    )
-    assert snapshot.profile_id == LLAMA_CONTROL and snapshot.selection == "default"
+def test_the_per_request_override_resolution_no_longer_exists():
+    for retired in ("resolve_answer_generation", "resolve_default_generation", "OverrideNotPermittedError",
+                    "SelectionAuthorityUnavailableError"):
+        assert not hasattr(generation_profiles, retired), retired
+
+
+# --- snapshots from the shared selection ---------------------------------------
+
+
+def test_the_llama_control_needs_no_inventory_lookup():
+    snapshot = _shared(default_model_registry(), LLAMA_CONTROL, epoch=4)
+    assert snapshot.profile_id == LLAMA_CONTROL
+    assert (snapshot.selection, snapshot.selection_epoch) == (SHARED_SELECTION, 4)
     assert snapshot.answer_read_timeout_s == 60.0
     assert snapshot.ollama_payload("p") == {
         "model": "llama3.1:8b", "prompt": "p", "stream": True,
@@ -363,35 +370,32 @@ def test_the_llama_default_needs_no_admin_and_no_inventory_lookup():
 
 
 def test_expected_and_observed_digests_are_never_conflated():
-    llama = resolve_answer_generation(
-        default_model_registry(), requested_profile_id=None,
-        caller_is_admin=_never, installed_digest=_never,
-    )
+    llama = _shared(default_model_registry(), LLAMA_CONTROL)
     assert llama.expected_digest == OPERATOR_LLAMA_DIGEST
     assert llama.observed_digest is None, "a pin is not an observation for this answer"
     assert "digest" not in str(llama.public_metadata())
+    with pytest.raises(GenerationProfileError):
+        shared_generation_snapshot(default_model_registry().get(LLAMA_CONTROL), epoch=1,
+                                   observed_digest=OPERATOR_LLAMA_DIGEST)
 
-    gemma = resolve_answer_generation(
-        _qualified_registry(default=GEMMA_CANDIDATE), requested_profile_id=None,
-        caller_is_admin=_never, installed_digest=lambda tag: "sha256:" + SYNTHETIC_DIGEST.upper(),
-    )
+    gemma = _shared(_qualified_registry(), GEMMA_CANDIDATE, lookup=lambda tag: "sha256:" + SYNTHETIC_DIGEST.upper())
     assert gemma.expected_digest == SYNTHETIC_DIGEST
     assert gemma.observed_digest == SYNTHETIC_DIGEST, "the normalized value the lookup reported"
+    for observed in (None, OTHER_DIGEST):
+        with pytest.raises(ModelIdentityUnavailableError):
+            shared_generation_snapshot(_qualified_registry().get(GEMMA_CANDIDATE), epoch=1, observed_digest=observed)
 
 
-def test_a_qualified_candidate_default_needs_no_admin_but_its_exact_digest():
+def test_a_qualified_candidate_needs_its_exact_digest_read_once():
     lookups = []
 
     def installed(tag):
         lookups.append(tag)
         return SYNTHETIC_DIGEST
 
-    snapshot = resolve_answer_generation(
-        _qualified_registry(default=GEMMA_CANDIDATE), requested_profile_id=None,
-        caller_is_admin=_never, installed_digest=installed,
-    )
+    snapshot = _shared(_qualified_registry(), GEMMA_CANDIDATE, epoch=3, lookup=installed)
     assert lookups == ["gemma4:31b"]
-    assert snapshot.profile_id == GEMMA_CANDIDATE and snapshot.selection == "default"
+    assert (snapshot.profile_id, snapshot.selection_epoch) == (GEMMA_CANDIDATE, 3)
     assert snapshot.answer_read_timeout_s == 150.0
     assert snapshot.ollama_payload("p")["think"] is False
     # The answer is verified by the model that wrote it, with no second lookup.
@@ -409,96 +413,60 @@ def test_a_qualified_candidate_default_needs_no_admin_but_its_exact_digest():
     ],
     ids=["absent", "changed", "malformed", "unreadable"],
 )
-def test_a_qualified_default_with_the_wrong_identity_fails_closed(lookup, error):
+def test_a_qualified_selection_with_the_wrong_identity_fails_closed(lookup, error):
     with pytest.raises(error) as excinfo:
-        resolve_answer_generation(
-            _qualified_registry(default=GEMMA_CANDIDATE), requested_profile_id=None,
-            caller_is_admin=_never, installed_digest=lookup,
-        )
+        _shared(_qualified_registry(), GEMMA_CANDIDATE, lookup=lookup)
     assert "ollama down" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
 
 
-# --- selection: explicit profiles ------------------------------------------------
+def test_an_identity_check_needs_a_pin_and_reads_only_the_exact_tag():
+    unpinned = ModelProfile(**{**_VALID_PROFILE, "expected_digest": None})
+    with pytest.raises(ModelIdentityUnavailableError):
+        check_installed_identity(unpinned, _never)
+    lookups = []
+    assert check_installed_identity(
+        default_model_registry().get(LLAMA_CONTROL), lambda tag: lookups.append(tag) or OPERATOR_LLAMA_DIGEST
+    ) == OPERATOR_LLAMA_DIGEST
+    assert lookups == ["llama3.1:8b"]
 
 
-@pytest.mark.parametrize("profile_id", [LLAMA_CONTROL, GEMMA_CANDIDATE, "qwen_anything", "x"])
-def test_a_non_admin_explicit_profile_is_refused_before_the_registry_is_consulted(profile_id):
-    with pytest.raises(OverrideNotPermittedError):
-        resolve_answer_generation(
-            _qualified_registry(), requested_profile_id=profile_id,
-            caller_is_admin=lambda: False, installed_digest=_never,
-        )
+@pytest.mark.parametrize("epoch", [0, -1, True, 1.0, "1", None, 2**62 + 1])
+def test_a_shared_snapshot_carries_a_valid_epoch(epoch):
+    with pytest.raises(GenerationProfileError):
+        shared_generation_snapshot(default_model_registry().get(LLAMA_CONTROL), epoch=epoch, observed_digest=None)
 
 
-@pytest.mark.parametrize("admin_value", [1, "true", None])
-def test_only_a_real_true_admin_flag_counts(admin_value):
-    with pytest.raises(OverrideNotPermittedError):
-        _resolve(default_model_registry(), LLAMA_CONTROL, admin=admin_value)
+def test_historical_selections_carry_no_epoch_and_stay_constructible():
+    llama = default_model_registry().get(LLAMA_CONTROL)
+    for selection in ("default", "admin_override"):
+        assert _snapshot(llama, selection, None).selection_epoch is None, "provenance v1/v2 and the diagnostic"
+        with pytest.raises(GenerationProfileError):
+            _snapshot(llama, selection, None, 3)
+    with pytest.raises(GenerationProfileError):
+        _snapshot(llama, SHARED_SELECTION, None)
+    with pytest.raises(GenerationProfileError):
+        _snapshot(llama, "per_request", None)
 
 
-def test_a_failed_admin_lookup_fails_closed():
-    def broken():
-        raise RuntimeError("db down")
-
-    with pytest.raises(SelectionAuthorityUnavailableError) as excinfo:
-        resolve_answer_generation(
-            default_model_registry(), requested_profile_id=LLAMA_CONTROL,
-            caller_is_admin=broken, installed_digest=_never,
-        )
-    assert "db down" not in str(excinfo.value)
-    assert excinfo.value.__cause__ is None and excinfo.value.__suppress_context__
-
-
-def test_admin_unknown_profile_is_refused():
-    with pytest.raises(UnknownModelProfileError):
-        _resolve(default_model_registry(), "qwen3_latest")
-
-
-def test_admin_may_explicitly_choose_the_control_without_an_inventory_lookup():
-    snapshot = resolve_answer_generation(
-        default_model_registry(), requested_profile_id=LLAMA_CONTROL,
-        caller_is_admin=lambda: True, installed_digest=_never,
-    )
-    assert snapshot.profile_id == LLAMA_CONTROL and snapshot.selection == "admin_override"
-    assert snapshot.observed_digest is None
-
-
-def test_an_explicit_qualified_candidate_needs_its_exact_installed_digest():
-    registry = _qualified_registry()
-
-    snapshot = _resolve(registry, GEMMA_CANDIDATE, digest=SYNTHETIC_DIGEST)
-    assert snapshot.model_tag == "gemma4:31b" and snapshot.selection == "admin_override"
-    assert snapshot.observed_digest == SYNTHETIC_DIGEST
-    payload = snapshot.ollama_payload("p")
-    assert payload["think"] is False
-    assert payload["options"] == {"temperature": 0.2, "num_ctx": 8192, "num_predict": 1200}
-    verifier = snapshot.verifier.ollama_payload("p")
-    assert verifier["model"] == "gemma4:31b" and verifier["think"] is False
-
-    with pytest.raises(ModelIdentityMismatchError):
-        _resolve(registry, GEMMA_CANDIDATE, digest=None)
-    with pytest.raises(ModelIdentityMismatchError):
-        _resolve(registry, GEMMA_CANDIDATE, digest=OTHER_DIGEST)
-
-
-def test_a_snapshot_is_immutable_and_independent_of_later_registry_changes():
-    snapshot = _resolve(_qualified_registry(), None)
-    gemma_default = _qualified_registry(default=GEMMA_CANDIDATE)
-    assert _resolve(gemma_default, None, digest=SYNTHETIC_DIGEST).model_tag == "gemma4:31b"
-    assert snapshot.model_tag == "llama3.1:8b"
+def test_a_snapshot_is_immutable_and_independent_of_a_later_switch():
+    snapshot = _shared(_qualified_registry(), LLAMA_CONTROL, epoch=1)
+    assert _shared(_qualified_registry(), GEMMA_CANDIDATE, epoch=3,
+                   lookup=lambda tag: SYNTHETIC_DIGEST).model_tag == "gemma4:31b"
+    assert snapshot.model_tag == "llama3.1:8b" and snapshot.selection_epoch == 1
     assert snapshot.ollama_payload("p")["model"] == "llama3.1:8b"
     assert snapshot.answer_read_timeout_s == 60.0
     with pytest.raises(dataclasses.FrozenInstanceError):
         snapshot.model_tag = "gemma4:31b"
     with pytest.raises(dataclasses.FrozenInstanceError):
-        snapshot.answer_read_timeout_s = 600.0
+        snapshot.selection_epoch = 3
 
 
-# --- role calls: the verifier and helpers follow the resolved profile ---------
+# --- role calls: the verifier and helpers follow the snapshot's profile --------
 
 
 def test_a_qualified_candidate_verifier_has_the_answers_identity_and_bounded_settings():
-    snapshot = _resolve(_qualified_registry(), GEMMA_CANDIDATE, digest="sha256:" + SYNTHETIC_DIGEST.upper())
+    snapshot = _shared(_qualified_registry(), GEMMA_CANDIDATE, lookup=lambda tag: "sha256:" + SYNTHETIC_DIGEST.upper())
 
     verifier = snapshot.verifier
     assert (verifier.profile_id, verifier.model_tag) == (GEMMA_CANDIDATE, "gemma4:31b")
@@ -522,10 +490,7 @@ def test_a_qualified_candidate_verifier_has_the_answers_identity_and_bounded_set
 
 
 def test_the_control_role_calls_carry_its_pin_and_no_observation():
-    snapshot = resolve_answer_generation(
-        default_model_registry(), requested_profile_id=None,
-        caller_is_admin=_never, installed_digest=_never,
-    )
+    snapshot = _shared(default_model_registry(), LLAMA_CONTROL)
     for call in (snapshot.verifier, snapshot.helper_call(0.2)):
         assert call.profile_id == LLAMA_CONTROL and call.model_tag == "llama3.1:8b"
         assert call.expected_digest == OPERATOR_LLAMA_DIGEST
@@ -533,22 +498,20 @@ def test_the_control_role_calls_carry_its_pin_and_no_observation():
         assert call.think is None
 
 
-def test_an_admin_override_routes_only_that_answers_verifier():
+def test_each_snapshot_routes_only_its_own_verifier_and_helpers():
     registry = _qualified_registry()
-    override = _resolve(registry, GEMMA_CANDIDATE, digest=SYNTHETIC_DIGEST)
-    default = _resolve(registry, None)
-    assert override.verifier.model_tag == "gemma4:31b"
-    assert default.verifier.model_tag == "llama3.1:8b", "another answer keeps the default's verifier"
-    helper_default = resolve_default_generation(registry, installed_digest=_never)
-    assert helper_default.profile_id == LLAMA_CONTROL and helper_default.selection == "default"
+    gemma = _shared(registry, GEMMA_CANDIDATE, epoch=3, lookup=lambda tag: SYNTHETIC_DIGEST)
+    llama = _shared(registry, LLAMA_CONTROL, epoch=1)
+    assert gemma.verifier.model_tag == "gemma4:31b" and gemma.helper_call(0.2).model_tag == "gemma4:31b"
+    assert llama.verifier.model_tag == "llama3.1:8b", "a job admitted under another epoch keeps its own model"
 
 
 def test_role_calls_are_frozen_with_their_snapshot():
-    snapshot = _resolve(_qualified_registry(), None)
+    snapshot = _shared(_qualified_registry(), LLAMA_CONTROL)
     verifier, helper = snapshot.verifier, snapshot.helper_call(0.2)
-    # A later registry with a different default changes nothing already resolved.
-    replaced = _qualified_registry(default=GEMMA_CANDIDATE)
-    assert _resolve(replaced, None, digest=SYNTHETIC_DIGEST).verifier.model_tag == "gemma4:31b"
+    # A later switch changes nothing already built.
+    assert _shared(_qualified_registry(), GEMMA_CANDIDATE, epoch=3,
+                   lookup=lambda tag: SYNTHETIC_DIGEST).verifier.model_tag == "gemma4:31b"
     assert snapshot.verifier is verifier and verifier.model_tag == "llama3.1:8b"
     assert snapshot.helper_call(0.2) == helper and helper.model_tag == "llama3.1:8b"
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -598,55 +561,3 @@ def test_an_invalid_role_call_is_rejected(fields):
     base.update(fields)
     with pytest.raises(GenerationProfileError):
         FixedModelCall(**base)
-
-
-# --- helper jobs: the trusted default, resolved once at job start ------------
-
-
-def test_helper_resolution_takes_no_requested_profile_or_caller():
-    assert list(inspect.signature(resolve_default_generation).parameters) == ["registry", "installed_digest"]
-
-
-def test_the_control_default_for_helpers_needs_no_admin_and_no_inventory():
-    snapshot = resolve_default_generation(default_model_registry(), installed_digest=_never)
-    assert snapshot.profile_id == LLAMA_CONTROL and snapshot.selection == "default"
-    assert snapshot.observed_digest is None
-    assert snapshot.helper_call(0.1).read_timeout_s == 120.0
-
-
-def test_a_qualified_candidate_default_for_helpers_needs_its_exact_digest():
-    lookups = []
-
-    def installed(tag):
-        lookups.append(tag)
-        return "sha256:" + SYNTHETIC_DIGEST.upper()
-
-    snapshot = resolve_default_generation(_qualified_registry(default=GEMMA_CANDIDATE), installed_digest=installed)
-    assert lookups == ["gemma4:31b"], "one inventory read, at job start"
-    assert snapshot.observed_digest == SYNTHETIC_DIGEST
-    helper = snapshot.helper_call(0.2).ollama_payload("p")
-    assert helper["model"] == "gemma4:31b" and helper["think"] is False
-
-
-@pytest.mark.parametrize(
-    "lookup, error",
-    [
-        (lambda tag: None, ModelIdentityMismatchError),
-        (lambda tag: OTHER_DIGEST, ModelIdentityMismatchError),
-        (lambda tag: "not-a-digest", ModelIdentityUnavailableError),
-        (lambda tag: (_ for _ in ()).throw(ConnectionError("ollama down")), ModelIdentityUnavailableError),
-    ],
-    ids=["absent", "changed", "malformed", "unreadable"],
-)
-def test_a_qualified_helper_default_with_the_wrong_identity_fails_closed(lookup, error):
-    with pytest.raises(error) as excinfo:
-        resolve_default_generation(_qualified_registry(default=GEMMA_CANDIDATE), installed_digest=lookup)
-    assert "ollama down" not in str(excinfo.value)
-
-
-def test_an_ineligible_helper_default_is_refused_before_any_lookup():
-    registry = _registry(_gemma())
-    # Simulate a registry whose invariant was broken after construction.
-    object.__setattr__(registry, "default_profile_id", GEMMA_CANDIDATE)
-    with pytest.raises(ProfileNotQualifiedError):
-        resolve_default_generation(registry, installed_digest=_never)

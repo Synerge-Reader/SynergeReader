@@ -22,6 +22,11 @@ reserved tokens as ready, and a failure of the pending start never leaves an
 accepting, workerless queue; a later explicit ``start`` reopens the same queue
 with running and UNKNOWN accounting intact and never more than ``workers``
 live threads.
+
+Shared helper pool: with main's injected generation_admission.HelperPool, a
+worker waits while answers hold the shared slots or a switch pauses admission,
+is woken when that changes, and its job captures the shared selection when it
+starts -- not when its id was queued.
 """
 
 import os
@@ -632,3 +637,76 @@ def test_a_later_start_after_an_interrupted_one_keeps_running_and_unknown_work(c
     snapshot = queue.snapshot()
     assert (snapshot.unresolved, snapshot.free_capacity, snapshot.queued, snapshot.running) == (1, 1, 0, 0)
     assert logs == ["[Insights] Background model call unresolved; capacity held: 1"]
+
+
+# --- the shared ledger's helper pool (injected capacity) ----------------------------------
+#
+# With main's injected generation_admission.HelperPool, a worker takes a job only
+# when the shared ledger grants a helper ticket: it waits -- on its condition, never
+# spinning -- while answers hold the slots or a switch pauses admission, is woken by
+# the ledger when that changes, and each job captures the shared selection when it
+# actually starts, not when its id was queued.
+
+from generation_admission import (  # noqa: E402
+    AdmissionSettings,
+    DispatchIntents,
+    GenerationLedger,
+    HelperPool,
+    SharedSelection,
+)
+
+
+class _NoIntents(DispatchIntents):
+    def record_dispatch(self, intent):
+        pass
+
+    def record_outcome(self, intent, state):
+        pass
+
+
+def _shared_queue(jobs):
+    ledger = GenerationLedger(AdmissionSettings(total_slots=2, answer_slots=2, helper_slots=1), clock=time.monotonic)
+    assert ledger.install_owner(intents=_NoIntents(), owner_seq=1, selection=SharedSelection("llama_control", 1),
+                                paused_by=None, recovered={})
+    finished = stdlib_queue.Queue()
+    seen = []
+
+    def run_job(document_id, ticket):
+        seen.append((document_id, ticket.selection))
+
+    queue = HelperJobQueue(
+        settings=HelperQueueSettings(workers=1, max_queued=4),
+        run_job=run_job if jobs is None else jobs,
+        on_finished=lambda document_id, state: finished.put((document_id, state)),
+        log=lambda line: None,
+        capacity=HelperPool(ledger),
+    )
+    return ledger, queue, finished, seen
+
+
+def test_a_shared_pool_worker_waits_for_answers_and_wakes_when_a_slot_frees(cleanup):
+    ledger, queue, finished, seen = _shared_queue(None)
+    cleanup(queue)
+    answers = [ledger.enqueue_answer(lambda: None), ledger.enqueue_answer(lambda: None)]
+    assert queue.start() is True
+    assert queue.enqueue(70) is EnqueueOutcome.ACCEPTED
+    with pytest.raises(stdlib_queue.Empty):
+        finished.get(timeout=0.3)
+    assert seen == [] and queue.snapshot().queued == 1, "two answers fill T: the helper waits"
+    assert ledger.release_unstarted(answers[0])
+    assert finished.get(timeout=_WAIT) == (70, CallState.NEVER_DISPATCHED)
+    assert seen == [(70, SharedSelection("llama_control", 1))]
+    ledger.release_unstarted(answers[1])
+
+
+def test_a_shared_pool_job_captures_the_selection_when_it_starts_not_when_queued(cleanup):
+    ledger, queue, finished, seen = _shared_queue(None)
+    cleanup(queue)
+    assert ledger.pause("switch-1") is not None
+    assert queue.start() is True
+    assert queue.enqueue(71) is EnqueueOutcome.ACCEPTED, "intake stays open; the job waits"
+    with pytest.raises(stdlib_queue.Empty):
+        finished.get(timeout=0.3)
+    assert ledger.resume("switch-1", SharedSelection("gemma_candidate", 3))
+    assert finished.get(timeout=_WAIT) == (71, CallState.NEVER_DISPATCHED)
+    assert seen == [(71, SharedSelection("gemma_candidate", 3))]

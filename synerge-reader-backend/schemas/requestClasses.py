@@ -22,9 +22,10 @@ class AskRequest(BaseModel):
     # backend never forwards it and never lets it choose a model -- every
     # answer uses the backend-resolved profile.
     model: Optional[str] = None
-    # An explicit backend model profile id (e.g. "llama_control"). Honoured
-    # only for a caller the backend itself identifies as an active admin;
-    # anyone else sending it is refused before any evidence or model is used.
+    # RETIRED per-request model override. Every answer uses the one shared
+    # selection an administrator switches; the backend refuses ANY non-null
+    # value (an administrator's too) with 400, before any lookup. The field is
+    # kept only so such a request is refused explicitly rather than ignored.
     model_profile_id: Optional[str] = Field(default=None, min_length=1, max_length=64)
     auth_token: Optional[str] = None
     active_document_name: Optional[str] = None
@@ -41,6 +42,14 @@ class AskRequest(BaseModel):
     # output; model_reasoning is open-ended AI analysis shown with an
     # "AI analysis only" notice. The values match citation_generation.AnswerMode.
     mode: Literal["document_qa", "structured_json", "model_reasoning"] = "document_qa"
+
+
+class GenerationSelectRequest(BaseModel):
+    """An administrator's request to switch the shared answer model. The id
+    must name a registered, qualified backend profile; nothing else about the
+    model can be chosen."""
+
+    profile_id: str = Field(min_length=1, max_length=64)
 
 
 class AskResponse(BaseModel):

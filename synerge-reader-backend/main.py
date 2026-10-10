@@ -46,9 +46,14 @@ from ask_stream import (
     verification_event,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from schemas import AskRequest, AskResponse, CorrectionRequest, RatingRequest,GoogleLoginRequest,LoginRequest,RegisterRequest,ResetPasswordRequest,ResendVerificationRequest
 from schemas import HistoryItem,HistoryRequest, KnowledgeItem,KnowledgeInsertRequest,ForgotPasswordRequest,KnowledgeUrlImportRequest
+from schemas import GenerationSelectRequest
+import asyncio
+import concurrent.futures
+import threading
+import uuid
 import os
 import string
 import datetime
@@ -62,13 +67,12 @@ from generation_profiles import (
     ModelIdentityMismatchError,
     ModelIdentityUnavailableError,
     ModelSelectionError,
-    OverrideNotPermittedError,
     ProfileNotQualifiedError,
-    SelectionAuthorityUnavailableError,
     UnknownModelProfileError,
+    check_installed_identity,
     default_model_registry,
-    resolve_answer_generation,
-    resolve_default_generation,
+    select_shared_profile,
+    shared_generation_snapshot,
 )
 from ollama_generation import (
     FAILURE_OUTPUT_LIMIT,
@@ -82,8 +86,28 @@ from answer_provenance import (
     new_trace_id,
 )
 from release_metadata import API_CONTRACT_VERSION, release_metadata_from_env
-from generation_admission import HelperCall
+from generation_admission import (
+    AdmissionRefusal,
+    AdmissionRefused,
+    AdmissionSettings,
+    DispatchRefused,
+    GenerationLedger,
+    GenerationTicket,
+    HelperPool,
+    current_dispatch_permitted,
+    current_generation_ticket,
+)
 from helper_jobs import EnqueueOutcome, HelperJobQueue, HelperQueueSettings
+from answer_jobs import (
+    ANSWER_TIMEOUT_ERROR,
+    NOT_DISPATCHED_ERROR,
+    AdmittedAnswerResponse,
+    AnswerJob,
+    DeliverySettings,
+    acquire_answer,
+)
+from generation_selection import GenerationOwner, OwnerSettings, PostgresGenerationStore
+from generation_coordinator import CoordinatorSettings, GenerationRuntime, SwitchCoordinator, loaded_model_entries
 import requests
 import json
 import time
@@ -108,12 +132,16 @@ load_dotenv()
 async def lifespan(_app: FastAPI):
     """Initialize required database state before accepting requests.
 
-    The background-insights workers start only after initialization has
-    succeeded. A failed worker start leaves that queue unavailable while the
-    application still serves. Shutdown closes the same queue's intake and
-    signals its workers without waiting for them; it proves nothing about
-    model work already submitted, and its in-memory accounting is kept for a
-    later lifespan in the same process.
+    Initialization ends by starting generation ownership (see
+    _initialize_application): until this process holds it, every generation
+    request is refused. The background-insights workers start only after
+    initialization has succeeded. A failed worker start leaves that queue
+    unavailable while the application still serves. Shutdown closes the
+    queue's intake and signals its workers, then fences generation and lets
+    ownership go, without waiting for either; it proves nothing about model
+    work already submitted -- unobserved calls stay durably unresolved for the
+    next owner -- and the queue's in-memory accounting is kept for a later
+    lifespan in the same process.
     """
     try:
         _initialize_application()
@@ -131,6 +159,7 @@ async def lifespan(_app: FastAPI):
         yield
     finally:
         _close_insights_queue(insights_queue)
+        _stop_generation_runtime(_GENERATION_RUNTIME)
 
 
 app = FastAPI(title="SynergeReader API", version=API_CONTRACT_VERSION, lifespan=lifespan)
@@ -229,15 +258,60 @@ def post_ollama(endpoint: str, payload: dict, *, stream: bool = False, timeout: 
     ``timeout`` is the Requests READ timeout: the longest wait for any one
     read, including the first response byte (which covers a cold model load).
     The connect timeout stays the short OLLAMA_CONNECT_TIMEOUT. It bounds each
-    wait, not the whole streamed answer, whose length num_predict bounds.
+    wait, not a whole job.
+
+    A native generation call (``/api/generate``) is sent only for the admitted
+    job of the calling thread (an /ask answer job; see answer_jobs.py), and
+    only while that job may dispatch: its read timeout is clamped to the job's
+    remaining wall-clock budget, and a durable dispatch intent is recorded
+    immediately before the POST -- after the endpoint was resolved, so an
+    unreachable server never counts as a dispatch. Otherwise nothing is sent
+    (DispatchRefused). A non-streamed reply shows its decoded body to the job;
+    a streamed reply is observed by the job once it has been read.
     """
+    if endpoint != "/api/generate":
+        base_url = get_active_ollama_base_url()
+        return requests.post(
+            f"{base_url}{endpoint}",
+            json=payload,
+            stream=stream,
+            timeout=(OLLAMA_CONNECT_TIMEOUT, timeout or OLLAMA_READ_TIMEOUT),
+        )
+    ticket = current_generation_ticket()
+    if ticket is None or not current_dispatch_permitted():
+        raise DispatchRefused("no admitted job may dispatch this generation call")
     base_url = get_active_ollama_base_url()
-    return requests.post(
+    read_timeout = ticket.read_timeout(timeout or OLLAMA_READ_TIMEOUT)
+    ticket.dispatching("answer" if stream else "verifier")
+    response = requests.post(
         f"{base_url}{endpoint}",
         json=payload,
         stream=stream,
-        timeout=(OLLAMA_CONNECT_TIMEOUT, timeout or OLLAMA_READ_TIMEOUT),
+        timeout=(OLLAMA_CONNECT_TIMEOUT, read_timeout),
     )
+    return response if stream else _ObservedReply(response, ticket)
+
+
+class _ObservedReply:
+    """A non-streamed generation reply whose decoded body is shown to the job
+    that dispatched it, so a terminal reply returns the job's capacity and
+    anything else (an error status, an undecodable or unfinished body) leaves
+    the call unresolved."""
+
+    def __init__(self, response, ticket: GenerationTicket) -> None:
+        self._response = response
+        self._ticket = ticket
+
+    def raise_for_status(self):
+        return self._response.raise_for_status()
+
+    def json(self):
+        body = self._response.json()
+        self._ticket.observed(body)
+        return body
+
+    def __getattr__(self, name):
+        return getattr(self._response, name)
 
 
 # ------------------- Embedding composition boundary -------------------
@@ -253,8 +327,12 @@ _EMBEDDING_PROFILE = resolve_embedding_profile(os.environ)
 
 
 def _initialize_application() -> None:
-    """Initialize database state using the resolved embedding dimension."""
+    """Initialize database state using the resolved embedding dimension, then
+    start generation ownership. Ownership is acquired on its own thread (see
+    generation_selection.GenerationOwner): this never waits for it, and no
+    generation is admitted until it is held."""
     init_db(expected_dimension=_EMBEDDING_PROFILE.dimension)
+    _start_generation_runtime(_GENERATION_RUNTIME)
 
 
 def _post_embedding_request(endpoint: str, payload: dict):
@@ -504,29 +582,47 @@ def auto_save_to_kb(question: str, answer: str, source: str = "auto"):
         print(f"[KB] Auto-save failed (non-critical): {e}")
 
 
-# Background helper calls are bounded calls derived from the trusted registry
-# default, resolved once per job. They used to probe a list of tags (several
-# of them never approved) with a bare "Say OK" generation each -- every probe
-# could load a model at its default, unbounded context -- and then send their
-# temperature at the top level, where Ollama ignores it.
+# Background helper calls are bounded calls derived from the shared selection
+# their job captured when it was admitted. They used to probe a list of tags
+# (several of them never approved) with a bare "Say OK" generation each --
+# every probe could load a model at its default, unbounded context -- and then
+# send their temperature at the top level, where Ollama ignores it.
 _KB_HELPER_TEMPERATURE = 0.2
 _INSIGHTS_HELPER_TEMPERATURE = 0.1
 
 
-def _resolve_helper_generation() -> AnswerGenerationSnapshot:
-    """The trusted registry default for one background helper job.
+def _helper_generation(ticket: GenerationTicket) -> AnswerGenerationSnapshot:
+    """The snapshot for one admitted helper job, built once from the shared
+    selection its ticket captured at admission -- never from a request, never
+    re-resolved per excerpt, and never a fallback model.
 
-    Called once when a job starts, before any generation, and never from a
-    request: there is no admin lookup, and an admin's per-request answer
-    override cannot reach a helper. The unqualified control makes no
-    inventory call. A default that requires qualification has its installed
-    identity read first, and an ineligible, missing, unreadable or mismatched
-    identity raises, so the job generates nothing.
+    The unqualified control makes no inventory call. A profile that requires
+    qualification has its installed identity read first, and an unknown,
+    ineligible, missing, unreadable or mismatched one raises, so the job
+    generates nothing.
     """
-    return resolve_default_generation(_MODEL_REGISTRY, installed_digest=_installed_model_digest)
+    if ticket.snapshot is not None:
+        return ticket.snapshot
+    profile = select_shared_profile(_MODEL_REGISTRY, ticket.selection.profile_id)
+    observed = (
+        check_installed_identity(profile, _installed_model_digest) if profile.requires_qualification else None
+    )
+    snapshot = shared_generation_snapshot(profile, epoch=ticket.selection.epoch, observed_digest=observed)
+    ticket.bind_snapshot(snapshot)
+    return snapshot
 
 
-def _generate_qa_pairs_from_text(text: str, label: str) -> List[dict]:
+def _admitted_helper_ticket(recorder):
+    """(ticket, owned): the caller's admitted helper ticket, or one admitted
+    here without waiting -- owned, so the caller releases it. (None, False)
+    when no helper slot is free or generation is not owned here."""
+    if recorder is not None:
+        return (recorder, False) if isinstance(recorder, GenerationTicket) else (None, False)
+    ticket = _GENERATION_LEDGER.try_acquire_helper()
+    return (ticket, True) if ticket is not None else (None, False)
+
+
+def _generate_qa_pairs_from_text(text: str, label: str, *, recorder: Optional[GenerationTicket] = None) -> List[dict]:
     """Ask the LLM to write Q:/A: pairs from arbitrary text (a document excerpt
     or scraped external page). Shared by document-upload seeding and the
     external URL importer — the only difference between those two source
@@ -538,13 +634,27 @@ def _generate_qa_pairs_from_text(text: str, label: str) -> List[dict]:
     excerpt are kept. Log lines carry fixed categories and counts only --
     never ``label``, the text, the model output, or exception text.
 
-    The model is resolved once for the whole job (see
-    _resolve_helper_generation), so every excerpt uses the same snapshot; if
-    it cannot be resolved, nothing is generated and no pairs are returned."""
+    The job runs under one admitted helper ticket (``recorder``, or one taken
+    here without waiting): its model is built once from the shared selection
+    captured at admission (see _helper_generation), so every excerpt uses the
+    same snapshot. Each call records a durable intent first; once a call's end
+    was not observed, no further excerpt is sent in that slot."""
     if len(text.strip()) < 200:
         return []
+    ticket, owned = _admitted_helper_ticket(recorder)
+    if ticket is None:
+        print("[KB] Helper model capacity unavailable; Q&A generation skipped")
+        return []
     try:
-        generation = _resolve_helper_generation()
+        return _qa_pairs_for_ticket(text, ticket)
+    finally:
+        if owned:
+            _GENERATION_LEDGER.release(ticket)
+
+
+def _qa_pairs_for_ticket(text: str, ticket: GenerationTicket) -> List[dict]:
+    try:
+        generation = _helper_generation(ticket)
     except Exception as exc:
         print(f"[KB] Helper model unavailable ({type(exc).__name__}); Q&A generation skipped")
         return []
@@ -583,14 +693,22 @@ Document (part {i+1}):
 
 Start with Q:"""
 
+        if not ticket.may_dispatch:
+            print(f"[KB] Excerpt {i+1}: no further model call permitted for this job; no pairs taken")
+            continue
+
         try:
+            payload = helper.ollama_payload(prompt, stream=False)
+            ticket.dispatching("helper")
             resp = requests.post(
                 f"{base_url}/api/generate",
-                json=helper.ollama_payload(prompt, stream=False),
-                timeout=(5, helper.read_timeout_s),
+                json=payload,
+                timeout=(5, ticket.read_timeout(helper.read_timeout_s)),
             )
             resp.raise_for_status()
-            reply = completed_generate_response(resp.json())
+            body = resp.json()
+            ticket.observed(body)
+            reply = completed_generate_response(body)
             if reply is None:
                 print(f"[KB] Excerpt {i+1}: reply was not a completed response; no pairs taken")
                 continue
@@ -703,7 +821,7 @@ def _extract_json_block(raw: str) -> Optional[dict]:
         return None
 
 
-def _extract_document_insights(doc_id: int, filename: str, text: str, *, recorder: Optional[HelperCall] = None):
+def _extract_document_insights(doc_id: int, filename: str, text: str, *, recorder: Optional[GenerationTicket] = None):
     """Ask the LLM to read a document and pull out a type classification, key
     facts, keywords, and named entities/parties — then store one row per
     document for the admin dashboard's Insights tab. Runs on a background
@@ -719,19 +837,30 @@ def _extract_document_insights(doc_id: int, filename: str, text: str, *, recorde
     exception text. The insights connection and cursor are closed on every
     path, and an uncommitted write is rolled back.
 
-    The model is resolved once when the job starts (see
-    _resolve_helper_generation); if it cannot be resolved, nothing is
-    generated or stored.
-
-    ``recorder`` (optional, keyword-only) is the queue's record of this job's
-    model call: it is told immediately before the POST is invoked, and is
-    shown the decoded reply body, so a call whose termination was never
-    observed stays accounted for even though this function swallows its own
-    errors. Direct calls without it behave exactly as before."""
+    The job runs under one admitted helper ticket: ``recorder`` (the queue
+    worker's, keyword-only), or one taken here without waiting and released
+    here. Its model is built once from the shared selection the ticket
+    captured at admission (see _helper_generation); if it cannot be built,
+    nothing is generated or stored. The ticket records a durable intent
+    immediately before the POST and is shown the decoded reply body, so a call
+    whose termination was never observed stays accounted for -- across a
+    restart too -- even though this function swallows its own errors."""
     if len(text.strip()) < 200:
         return
+    ticket, owned = _admitted_helper_ticket(recorder)
+    if ticket is None:
+        print("[Insights] Helper model capacity unavailable; insight extraction skipped")
+        return
     try:
-        generation = _resolve_helper_generation()
+        _extract_insights_for_ticket(doc_id, filename, text, ticket)
+    finally:
+        if owned:
+            _GENERATION_LEDGER.release(ticket)
+
+
+def _extract_insights_for_ticket(doc_id: int, filename: str, text: str, recorder: GenerationTicket) -> None:
+    try:
+        generation = _helper_generation(recorder)
     except Exception as exc:
         print(f"[Insights] Helper model unavailable ({type(exc).__name__}); insight extraction skipped")
         return
@@ -760,17 +889,15 @@ JSON:"""
 
     try:
         payload = helper.ollama_payload(prompt, stream=False)
-        if recorder is not None:
-            recorder.dispatching()
+        recorder.dispatching("helper")
         resp = requests.post(
             f"{base_url}/api/generate",
             json=payload,
-            timeout=(5, helper.read_timeout_s),
+            timeout=(5, recorder.read_timeout(helper.read_timeout_s)),
         )
         resp.raise_for_status()
         body = resp.json()
-        if recorder is not None:
-            recorder.observed(body)
+        recorder.observed(body)
         reply = completed_generate_response(body)
         if reply is None:
             print("[Insights] Reply was not a completed response; nothing stored")
@@ -880,12 +1007,13 @@ def _load_pending_insight_source(document_id: int):
     return row
 
 
-def _run_insight_job(document_id: int, call: HelperCall) -> None:
+def _run_insight_job(document_id: int, call: GenerationTicket) -> None:
     """One queued insights job, run by an insights-queue worker that already
-    holds background model capacity. Reloads the current row by its exact id
+    holds an admitted helper ticket. Reloads the current row by its exact id
     when the job actually starts -- nothing private ever waited in the queue --
-    and skips a document that was deleted or analysed meanwhile. ``call``
-    records whether the model was invoked and whether its termination was
+    and skips a document that was deleted or analysed meanwhile. ``call`` is
+    the ticket: it captured the shared selection when the worker took the job,
+    and records whether the model was invoked and whether its termination was
     observed."""
     try:
         row = _load_pending_insight_source(document_id)
@@ -987,16 +1115,93 @@ class _PostCommitDispatchError(RuntimeError):
     """
 
 
+# ------------------- Shared generation: admission, ownership, switching -------------------
+#
+# ONE ledger admits every generation job in this process: /ask answers (with
+# their verifier calls), background insights and URL-import Q&A. Only the
+# process holding generation ownership (a PostgreSQL session advisory lock,
+# see generation_selection.py) installs its durable dispatch-intent store into
+# it; until then, and after ownership is lost or the application shuts down,
+# nothing is admitted or dispatched. Every value below is PROVISIONAL -- chosen
+# for a single-host first release and not measured on the production host.
+# Constructing any of this starts no thread and does no I/O.
+_ADMISSION_SETTINGS = AdmissionSettings()
+_DELIVERY_SETTINGS = DeliverySettings()
+_GENERATION_LEDGER = GenerationLedger(_ADMISSION_SETTINGS, clock=time.monotonic)
+# A fresh id per process start: the owner row and every dispatch intent record
+# which boot wrote them.
+_BOOT_ID = str(uuid.uuid4())
+
+
+def _new_generation_store() -> PostgresGenerationStore:
+    """One owner-session store; its connection opens only when it tries to
+    acquire ownership."""
+    return PostgresGenerationStore(lambda: connect_to_postgres(), boot_id=_BOOT_ID)
+
+
+def _resident_models() -> list:
+    """Read-only: the models Ollama currently reports as loaded (/api/ps).
+    Used only as the switch coordinator's residency barrier; it is a
+    point-in-time view and never proves exclusive GPU use. A successful
+    response alone is not a readable inventory: a reply without an explicit
+    models list, or with an entry that names no model, raises."""
+    base_url = get_active_ollama_base_url()
+    response = requests.get(f"{base_url}/api/ps", timeout=(OLLAMA_CONNECT_TIMEOUT, 5))
+    response.raise_for_status()
+    return loaded_model_entries(response.json())
+
+
+_GENERATION_OWNER = GenerationOwner(
+    store_factory=lambda: _new_generation_store(),
+    ledger=_GENERATION_LEDGER,
+    # Seeds the persisted selection only when it does not exist yet.
+    default_profile_id=lambda: _MODEL_REGISTRY.default_profile_id,
+    settings=OwnerSettings(),
+)
+_GENERATION_RUNTIME = GenerationRuntime(
+    ledger=_GENERATION_LEDGER,
+    owner=_GENERATION_OWNER,
+    coordinator=SwitchCoordinator(
+        ledger=_GENERATION_LEDGER,
+        owner=_GENERATION_OWNER,
+        registry_provider=lambda: _MODEL_REGISTRY,
+        installed_digest=lambda tag: _installed_model_digest(tag),
+        resident_models=lambda: _resident_models(),
+        settings=CoordinatorSettings(),
+    ),
+)
+
+
+def _start_generation_runtime(runtime) -> None:
+    """Start ownership acquisition and the switch coordinator; never waits,
+    never raises. Generation stays unavailable until ownership is held."""
+    try:
+        runtime.start()
+    except Exception:
+        print("[Generation] runtime could not start; generation unavailable")
+
+
+def _stop_generation_runtime(runtime) -> None:
+    """Fence generation and let ownership go; never waits, never raises."""
+    try:
+        runtime.stop()
+    except Exception:
+        print("[Generation] runtime could not be stopped cleanly")
+
+
 # Background insights run through ONE bounded, id-only queue per process:
-# ``workers`` threads sharing as many background model slots, and at most
-# ``max_queued`` waiting document ids (see helper_jobs.py). These are
-# provisional local values, not measured production capacity. Constructing the
-# queue starts no thread and does no I/O; the lifespan starts its workers.
+# ``workers`` threads and at most ``max_queued`` waiting document ids (see
+# helper_jobs.py). A worker takes a job only when the shared ledger grants it a
+# helper ticket, which captures the shared model selection at that moment.
+# These are provisional local values, not measured production capacity.
+# Constructing the queue starts no thread and does no I/O; the lifespan starts
+# its workers.
 _INSIGHTS_QUEUE_SETTINGS = HelperQueueSettings(workers=1, max_queued=100)
 _INSIGHTS_QUEUE = HelperJobQueue(
     settings=_INSIGHTS_QUEUE_SETTINGS,
     # Looked up when each job runs, never captured per item.
     run_job=lambda document_id, call: _run_insight_job(document_id, call),
+    capacity=HelperPool(_GENERATION_LEDGER),
 )
 
 _ENQUEUE_FAILURE_LABELS = {
@@ -1496,43 +1701,13 @@ def _ollama_claim_verifier(claim: str, records, verifier) -> Optional[str]:
     return _claim_verifier_status(completed_generate_response(response.json()))
 
 
-def _caller_is_admin(auth_token: Optional[str]) -> bool:
-    """Trusted admin authority for an explicit model override.
-
-    The caller's own token is looked up against the active-account is_admin
-    flag -- the same lookup every admin route uses. Nothing the client sends
-    about its role is read. A lookup that cannot complete raises, and the
-    selection then fails closed with a 503 instead of guessing.
-    """
-    if not auth_token:
-        return False
-    connection = connect_to_postgres()
-    if connection is None:
-        raise RuntimeError("admin lookup unavailable")
-    cursor = None
-    try:
-        cursor = connection.cursor()
-        cursor.execute(_ACTIVE_ADMIN_FLAG_BY_TOKEN, (auth_token,))
-        row = cursor.fetchone()
-        return bool(row and row[0])
-    finally:
-        if cursor is not None:
-            try:
-                cursor.close()
-            except Exception:
-                pass
-        try:
-            connection.close()
-        except Exception:
-            pass
-
-
 def _installed_model_digest(model_tag: str) -> Optional[str]:
     """The manifest digest Ollama lists for exactly this tag, or None.
 
-    Read-only (``/api/tags``) and only consulted for a profile that requires
-    qualification -- per answer, or once when a background helper job starts
-    -- so ordinary answers make no extra request.
+    Read-only (``/api/tags``). Consulted per answer and once per helper job
+    only for a profile that requires qualification -- so ordinary control
+    answers make no extra request -- and by the switch coordinator for a
+    switch's target.
     """
     base_url = get_active_ollama_base_url()
     response = requests.get(f"{base_url}/api/tags", timeout=(OLLAMA_CONNECT_TIMEOUT, 5))
@@ -1543,39 +1718,92 @@ def _installed_model_digest(model_tag: str) -> Optional[str]:
     return None
 
 
-# Fixed refusals for an explicit model selection. Only the class of the
-# selection error is used; no exception text reaches the response.
+# Per-request model selection is retired: every answer uses the one shared
+# selection an administrator switches (/admin/generation). Any non-null
+# model_profile_id is refused for every caller -- an administrator too --
+# before any lookup; the legacy ``model`` string is never read at all.
+_MODEL_OVERRIDE_RETIRED = (
+    "Per-request model selection is not supported. An administrator selects the shared answer model."
+)
+
+# Fixed refusals when the shared selection cannot produce this answer's
+# snapshot. The client chose nothing, so each is a server-side 503, and no
+# other model is ever used instead. Only the class of the error is used.
 _MODEL_SELECTION_REFUSALS = {
-    OverrideNotPermittedError: (403, "Model selection requires an administrator account."),
-    UnknownModelProfileError: (400, "Unknown model profile."),
-    ProfileNotQualifiedError: (409, "That model profile is not qualified for selection."),
-    ModelIdentityMismatchError: (409, "That model is not installed with its qualified identity."),
-    SelectionAuthorityUnavailableError: (503, "Could not verify your session. Please try again shortly."),
+    UnknownModelProfileError: (503, "The selected answer model is not available on this server."),
+    ProfileNotQualifiedError: (503, "The selected answer model is not qualified for use."),
+    ModelIdentityMismatchError: (503, "The selected answer model is not installed with its qualified identity."),
     ModelIdentityUnavailableError: (503, "Could not verify the model. Please try again shortly."),
 }
 
+# Fixed admission refusals: busy before any evidence, model or database work.
+_ADMISSION_REFUSALS = {
+    AdmissionRefusal.BUSY: "The answer service is busy. Please retry in a moment.",
+    AdmissionRefusal.UNRESOLVED: (
+        "The answer service is holding capacity for model work whose outcome is unknown. Please retry later."
+    ),
+    AdmissionRefusal.SWITCHING: "The answer model is being switched. Please retry shortly.",
+    AdmissionRefusal.UNAVAILABLE: "Answer generation is not available on this server right now.",
+}
 
-def _resolve_answer_generation(request: AskRequest) -> AnswerGenerationSnapshot:
-    """The model, options and verifier for one answer, fixed before it starts.
+# Read-only identity lookups for qualified profiles run here: one dedicated
+# thread, never the shared request pool, and never while a slot is waited for.
+_IDENTITY_LOOKUPS = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-identity")
 
-    An omitted ``model_profile_id`` resolves the backend default. The legacy
-    ``request.model`` string is deliberately not read: it never selects or
-    reaches a model. An explicit profile is honoured only for a trusted admin,
-    and every refusal is an HTTP error raised before any evidence is read or
-    any model is called.
-    """
+
+async def _admit_answer() -> GenerationTicket:
+    """An admitted answer ticket, or a fixed 503 with ``Retry-After``.
+
+    Waits on the event loop for at most the agreed two seconds, holding no
+    thread. A refusal happens before scope SQL, planning, embedding, the
+    health probe or any model call."""
     refusal = None
     try:
-        return resolve_answer_generation(
-            _MODEL_REGISTRY,
-            requested_profile_id=request.model_profile_id,
-            caller_is_admin=lambda: _caller_is_admin(request.auth_token),
-            installed_digest=_installed_model_digest,
-        )
-    except ModelSelectionError as exc:
-        refusal = _MODEL_SELECTION_REFUSALS.get(type(exc), (503, "Model selection is unavailable."))
+        return await acquire_answer(_GENERATION_LEDGER)
+    except AdmissionRefused as exc:
+        refusal = exc.reason
+    print(f"[Ask] admission refused: {refusal.value}")
     # Raised outside the except block so nothing chains onto the HTTP error.
+    raise HTTPException(503, _ADMISSION_REFUSALS[refusal], headers={"Retry-After": "2"})
+
+
+async def _answer_generation(ticket: GenerationTicket) -> AnswerGenerationSnapshot:
+    """The model, options and verifier for one admitted answer, fixed before
+    it starts, from the shared selection its ticket captured.
+
+    The unqualified control needs no lookup (observed digest None). A
+    profile that requires qualification has its installed identity read for
+    THIS answer on the dedicated identity thread. Every refusal is a fixed
+    HTTP error raised before any evidence is read or any model is called;
+    the caller returns the ticket's slot."""
+    refusal = category = None
+    try:
+        profile = select_shared_profile(_MODEL_REGISTRY, ticket.selection.profile_id)
+        observed = None
+        if profile.requires_qualification:
+            observed = await asyncio.wrap_future(
+                _IDENTITY_LOOKUPS.submit(check_installed_identity, profile, _installed_model_digest)
+            )
+        snapshot = shared_generation_snapshot(profile, epoch=ticket.selection.epoch, observed_digest=observed)
+        ticket.bind_snapshot(snapshot)
+        return snapshot
+    except ModelSelectionError as exc:
+        category = type(exc).__name__
+        refusal = _MODEL_SELECTION_REFUSALS.get(type(exc), (503, "Model selection is unavailable."))
+    print(f"[Ask] shared model unavailable for this answer ({category})")
     raise HTTPException(*refusal)
+
+
+def _new_answer_job(ticket: GenerationTicket, body) -> AnswerJob:
+    """The answer's owned job, with its start lease armed on this loop."""
+    job = AnswerJob(ledger=_GENERATION_LEDGER, ticket=ticket, body=body, settings=_DELIVERY_SETTINGS)
+    job.arm_start_lease(asyncio.get_running_loop(), _ADMISSION_SETTINGS.unstarted_lease_s)
+    return job
+
+
+def _release_unstarted_answer(ticket: GenerationTicket) -> None:
+    """Return an admitted answer's slot when no response will start it."""
+    _GENERATION_LEDGER.release_unstarted(ticket)
 
 
 def _resolve_citations(
@@ -1610,16 +1838,29 @@ async def ask_question(request: AskRequest):
     # Decides the prompt rules and whether claims are graded; evidence
     # planning and authorization below are the same in every mode.
     answer_mode = AnswerMode(request.mode)
+    # Retired: no request chooses a model, an administrator's included.
+    if request.model_profile_id is not None:
+        raise HTTPException(400, _MODEL_OVERRIDE_RETIRED)
     # Identified before anything streams: a missing or unknown token is a 401
     # and a failed lookup a 503, so an unidentified request reads no evidence,
     # calls no model, and writes no history row. The answer's history row
     # belongs to exactly this caller.
     caller_id = _resolve_caller_id(request.auth_token)
-    # The answer model, its native options and the verifier are resolved once,
-    # here, before anything streams: an explicit profile from a non-admin is
-    # refused before any evidence is read or any model is called, and nothing
-    # that happens later can change what this answer is generated with.
-    generation = _resolve_answer_generation(request)
+    # Admission: one ticket from the shared ledger, waited for on the event
+    # loop (no thread held) for at most two seconds, else a fixed 503. The
+    # ticket captured the shared selection -- profile and epoch -- when it
+    # was granted, and from here on this answer owns it: its generation,
+    # every verifier call and its persistence all run under it.
+    ticket = await _admit_answer()
+    # The answer model, its native options and the verifier are fixed once,
+    # here, from the captured selection, before anything streams: nothing that
+    # happens later -- a switch, a registry change -- can change what this
+    # answer is generated or verified with. A refusal returns the slot.
+    try:
+        generation = await _answer_generation(ticket)
+    except BaseException:
+        _release_unstarted_answer(ticket)
+        raise
     # Fixed with the model snapshot, for the same reason: the provenance of
     # this answer describes the release and embedding configuration it started
     # under. The trace id is generated here, server-side, for this attempt; it
@@ -1631,6 +1872,11 @@ async def ask_question(request: AskRequest):
 
     def verify_claim(claim, records):
         nonlocal verifier_calls
+        # After known abandonment, past the job's budget, or once an earlier
+        # call of this answer was never observed to finish, no verifier call
+        # is dispatched: the claim stays unverified.
+        if not current_dispatch_permitted():
+            raise DispatchRefused("no further model call is permitted for this answer")
         verifier_calls += 1
         return _ollama_claim_verifier(claim, records, generation.verifier)
 
@@ -1642,9 +1888,16 @@ async def ask_question(request: AskRequest):
         registry = CitationRegistry.from_bundle(planning.bundle, _CITATION_LIMITS)
         return planning, registry
 
-    def stream_generate():
+    def stream_generate(job):
+        # Runs on this answer's own job thread (answer_jobs.AnswerJob), never
+        # on the event loop or the shared request pool. ``job`` reports known
+        # delivery abandonment and the whole-job budget.
         nonlocal answer_parts, entry_id
         yield '{"type": "delta", "text": ""}\n'
+        if job.abandoned:
+            # Delivery ended before any evidence was read: nothing is planned,
+            # generated or saved, and the slot returns as never dispatched.
+            return
 
         stream_error = None
         try:
@@ -1680,6 +1933,14 @@ async def ask_question(request: AskRequest):
             yield '{"type": "done", "ok": false}\n'
             return
 
+        if job.abandoned:
+            # Abandoned before dispatch: no model call is sent.
+            return
+        if job.expired:
+            yield error_event(**ANSWER_TIMEOUT_ERROR)
+            yield done_event(ok=False)
+            return
+
         # Only "response" text becomes the answer; thinking, error lines and
         # the final metrics record are handled by the reader (see
         # ollama_generation.py), which also survives split lines and split
@@ -1688,7 +1949,8 @@ async def ask_question(request: AskRequest):
         try:
             timer.mark("generation_request_sent")
             # Per-profile, finite read timeout from the snapshot: a cold Gemma
-            # load alone exceeded the 60 s Llama keeps.
+            # load alone exceeded the 60 s Llama keeps. post_ollama clamps it to
+            # the job's remaining budget and records the dispatch intent first.
             with post_ollama(
                 "/api/generate", payload, stream=True, timeout=generation.answer_read_timeout_s
             ) as r:
@@ -1698,11 +1960,24 @@ async def ask_question(request: AskRequest):
                         timer.mark("first_answer_token")
                         answer_parts.append(token)
                         yield delta_event(token)
-                for token in generated.close():
-                    timer.mark("first_answer_token")
-                    answer_parts.append(token)
-                    yield delta_event(token)
+                    # A client that went away does not stop this read: the
+                    # stream is drained to its terminal record so the call can
+                    # be observed as finished. Only the job's budget stops it,
+                    # and then the call's end is unobserved (its slot is held).
+                    if job.expired:
+                        break
+                else:
+                    for token in generated.close():
+                        timer.mark("first_answer_token")
+                        answer_parts.append(token)
+                        yield delta_event(token)
+                    job.observed_stream(generated)
             timer.mark("generation_complete")
+        except DispatchRefused:
+            # Nothing was sent: no admitted job may dispatch, or the durable
+            # dispatch intent could not be recorded first.
+            stream_error = True
+            yield error_event(**NOT_DISPATCHED_ERROR)
         except Exception as e:
             stream_error = True
             response = getattr(e, "response", None)
@@ -1720,6 +1995,11 @@ async def ask_question(request: AskRequest):
             f"eval_count={generated.metrics.get('eval_count')} "
             f"thinking_chars={generated.thinking_chars}"
         )
+
+        if job.expired and not stream_error:
+            # The whole-job budget ran out while the answer streamed.
+            stream_error = True
+            yield error_event(**ANSWER_TIMEOUT_ERROR)
 
         if not stream_error and generated.failure is not None:
             # The server reported an error, a line was corrupt, the final
@@ -1743,6 +2023,12 @@ async def ask_question(request: AskRequest):
             yield done_event(ok=False)
             return
 
+        if job.abandoned:
+            # Delivery was abandoned (the client disconnected or stalled, or
+            # the delivery bound overflowed) after a complete generation: no
+            # verifier call is dispatched and no answer row is begun.
+            return
+
         full_answer = "".join(answer_parts)
 
         citation_result = _resolve_citations(
@@ -1754,6 +2040,16 @@ async def ask_question(request: AskRequest):
             invalid_citation_ids=citation_result.invalid_citation_ids,
             used_citation_ids=citation_result.used_citation_ids,
         )
+
+        # The commit point: decided once. After known abandonment or past the
+        # budget, no INSERT is begun; an INSERT begun here is completed and
+        # kept even if the client goes away meanwhile.
+        if not job.begin_persistence():
+            if job.abandoned:
+                return
+            yield error_event(**ANSWER_TIMEOUT_ERROR)
+            yield done_event(ok=False)
+            return
 
         conn = None
         committed = False
@@ -1832,14 +2128,21 @@ async def ask_question(request: AskRequest):
 
         yield done_event(ok=True)
 
-    return StreamingResponse(
-        stream_generate(),
-        media_type=STREAM_MEDIA_TYPE,
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no"
-        }
-    )
+    # The response owns the ticket from here: its ASGI call starts the job
+    # thread (a start lease reclaims an answer whose response never starts),
+    # and each NDJSON line it sends is bounded in bytes and in send time.
+    try:
+        return AdmittedAnswerResponse(
+            _new_answer_job(ticket, stream_generate),
+            media_type=STREAM_MEDIA_TYPE,
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no"
+            }
+        )
+    except BaseException:
+        _release_unstarted_answer(ticket)
+        raise
 
 
 
@@ -2616,6 +2919,43 @@ def _extract_readable_text(html: str) -> str:
     return re.sub(r"[ \t]+", " ", re.sub(r"\n\s*\n+", "\n\n", text)).strip()
 
 
+_HELPER_BUSY = "Model capacity is busy or unavailable. Please retry shortly."
+
+
+async def _run_interactive_helper(ticket: GenerationTicket, work):
+    """Run ``work`` on a dedicated thread that owns ``ticket`` and releases it
+    exactly once, by what its model calls showed; await the result without
+    holding a request-pool thread. If the caller stops waiting, the job still
+    finishes and releases its own ticket."""
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    def settle(value) -> None:
+        if not future.done():
+            future.set_result(value)
+
+    def run() -> None:
+        result = []
+        try:
+            result = work()
+        except Exception:
+            print("[KB] Interactive helper job failed")
+        finally:
+            _GENERATION_LEDGER.release(ticket)
+            try:
+                loop.call_soon_threadsafe(settle, result)
+            except RuntimeError:
+                pass
+
+    try:
+        threading.Thread(target=run, name="kb-import-helper", daemon=True).start()
+    except Exception:
+        # The thread never ran, so nothing was dispatched.
+        _GENERATION_LEDGER.release(ticket)
+        raise HTTPException(503, _HELPER_BUSY, headers={"Retry-After": "2"}) from None
+    return await future
+
+
 @app.post("/knowledge_base/import_url")
 async def import_knowledge_from_url(request: KnowledgeUrlImportRequest):
     """Pull an external web page into the Knowledge Base: fetch it, extract
@@ -2652,7 +2992,15 @@ async def import_knowledge_from_url(request: KnowledgeUrlImportRequest):
     domain = urlparse(request.url).hostname or request.url
     label = f"Imported from {domain}" + (f" by {author}" if author else "")
 
-    pairs = _generate_qa_pairs_from_text(text, domain)
+    # The Q&A model calls are an interactive helper job: admitted at once or
+    # refused at once (never an open-ended wait), then run on a dedicated
+    # thread that owns the ticket -- never on the event loop.
+    ticket = _GENERATION_LEDGER.try_acquire_helper()
+    if ticket is None:
+        raise HTTPException(503, _HELPER_BUSY, headers={"Retry-After": "2"})
+    pairs = await _run_interactive_helper(
+        ticket, lambda: _generate_qa_pairs_from_text(text, domain, recorder=ticket)
+    )
     if not pairs:
         raise HTTPException(422, "Could not generate any question-answer pairs from that page's content")
 
@@ -3860,6 +4208,92 @@ async def admin_system_status(token: Optional[str] = None):
         "database": {"ok": db_ok},
         "llm_backend": {"ok": ollama_ok, "url": ollama_url, "models": models},
     }
+
+
+def _verify_generation_admin(authorization: Optional[str]) -> None:
+    """Admin authorization for the shared-model routes, before any inventory,
+    coordinator or other privileged work.
+
+    The token comes from ``Authorization: Bearer`` (never a query string,
+    which would reach browser history and access logs) and is checked with
+    the same active-account admin lookup every admin route uses; nothing the
+    browser says about its role is read. A missing token is 401, a non-admin
+    403, and a lookup that cannot complete -- including a failed close -- a
+    fixed 503."""
+    token = _bearer_token(authorization)
+    if not token:
+        raise HTTPException(401, "Unauthorized")
+    conn = None
+    denied = None
+    verified = False
+    try:
+        conn = connect_to_postgres()
+        if conn is not None:
+            _require_admin(conn.cursor(), token)
+            verified = True
+    except HTTPException as exc:
+        denied = exc
+    except Exception:
+        verified = False
+    closed = True
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            closed = False
+    if denied is not None:
+        raise denied
+    if not (verified and closed):
+        print("[Admin] Generation authorization could not be verified")
+        raise HTTPException(503, "Could not verify your session. Please try again shortly.")
+
+
+@app.get("/admin/generation")
+async def admin_generation_status(authorization: Optional[str] = Header(None)):
+    """The shared answer model as this process knows it: ownership, the
+    committed active profile and epoch, any switch in progress or the last
+    outcome, the registered choices with their eligibility, and admission
+    counts. In-memory only -- no database read, inventory or model call -- so
+    it stays responsive while generation is busy."""
+    _verify_generation_admin(authorization)
+    return JSONResponse(_GENERATION_RUNTIME.status(), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/admin/generation/select")
+async def admin_generation_select(request: GenerationSelectRequest, authorization: Optional[str] = Header(None)):
+    """Ask the coordinator to switch the shared answer model to ``profile_id``.
+    202 when queued (the switch then runs on the coordinator's own thread;
+    poll /admin/generation for its outcome); 400 unknown profile; 409 not
+    qualified, already active, a switch already pending, or unresolved model
+    work; 503 when this process does not own generation. Never falls back to
+    another model."""
+    _verify_generation_admin(authorization)
+    outcome = _GENERATION_RUNTIME.request_switch(request.profile_id)
+    if not outcome.accepted:
+        raise HTTPException(outcome.status_code, outcome.detail)
+    return JSONResponse(
+        status_code=202,
+        content={"switch_id": outcome.switch_id, "status": _GENERATION_RUNTIME.status()},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/admin/generation/abort")
+async def admin_generation_abort(authorization: Optional[str] = Header(None)):
+    """Abort the switch in progress (or one a previous process left
+    interrupted). 202 when the abort is requested; the coordinator then moves
+    the persisted selection back to the unchanged active profile with a new
+    epoch, which fences any late commit. 409 when there is nothing to abort,
+    the switch already committed, or it is committing right now."""
+    _verify_generation_admin(authorization)
+    outcome = _GENERATION_RUNTIME.abort_switch()
+    if not outcome.accepted:
+        raise HTTPException(outcome.status_code, outcome.detail)
+    return JSONResponse(
+        status_code=202,
+        content={"switch_id": outcome.switch_id, "status": _GENERATION_RUNTIME.status()},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/test")

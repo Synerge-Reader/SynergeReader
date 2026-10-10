@@ -106,6 +106,10 @@ _MAIN_ROUTES_AT_FC64A5A = frozenset(
 _ROUTES_ADDED_SINCE_FC64A5A = frozenset(
     {
         ("GET", "/version"),  # CP2A: public, read-only release identity
+        # Shared model switcher: admin-only status, select and abort (Bearer token).
+        ("GET", "/admin/generation"),
+        ("POST", "/admin/generation/select"),
+        ("POST", "/admin/generation/abort"),
     }
 )
 

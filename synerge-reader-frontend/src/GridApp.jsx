@@ -5,6 +5,7 @@ import { renderAsync } from "docx-preview";
 import UserAuth from "./components/UserAuth/UserAuth";
 import { ClaimSupportSummary } from "./components/ClaimSupportSummary";
 import VersionBadge from "./components/VersionBadge";
+import AdminGenerationPanel from "./components/AdminGenerationPanel";
 
 GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.js",
@@ -5817,6 +5818,9 @@ export default function GridApp() {
                           ) : <div style={{ fontSize: "11.5px", color: "#94a3b8" }}>Checking…</div>}
                         </ChartCard>
                       </div>
+
+                      {/* the shared answer model (admin-only; the backend authorizes every call) */}
+                      <AdminGenerationPanel backendUrl={BACKEND} authToken={authToken} />
 
                       {/* breakdowns — by task mode, by user */}
                       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>

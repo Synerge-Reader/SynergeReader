@@ -1,10 +1,14 @@
 """Unit contracts for answer_provenance.py.
 
 Pure: no ``main`` import, no database, no Ollama, no network or subprocess.
-Snapshots come from the real registry resolver with synthetic digests; model
-streams are fed to the real reader as NDJSON text.
+Snapshots come from the real shared-selection functions with synthetic
+digests; model streams are fed to the real reader as NDJSON text.
 
-What these prove: a record has exactly the versioned schema; every value is
+What these prove: a new record has exactly the version 3 schema and records
+the shared selection and its epoch -- and nothing else may be written as a new
+record; stored version 1 and 2 records stay readable with their own
+vocabulary and are never modified, while mixed or unknown vocabularies are
+refused; every value is
 copied from its own trusted server source (expected and observed digests
 never stand in for each other); graded and ungraded modes are told apart;
 Ollama metrics keep nanoseconds separate from server milliseconds and are
@@ -27,12 +31,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from answer_evidence import EvidenceMode
 from answer_provenance import (
     PROVENANCE_SCHEMA_VERSION,
+    SELECTIONS_BY_SCHEMA_VERSION,
     TIMING_MARKS,
     AnswerProvenanceError,
     AnswerTimer,
     answer_provenance_json,
     build_answer_provenance,
     new_trace_id,
+    read_answer_provenance,
 )
 from citation_generation import AnswerMode
 from generation_profiles import (
@@ -41,8 +47,10 @@ from generation_profiles import (
     LLAMA_CONTROL_DIGEST,
     ModelRegistry,
     Qualification,
+    _snapshot,
+    check_installed_identity,
     default_model_registry,
-    resolve_answer_generation,
+    shared_generation_snapshot,
 )
 from ollama_generation import OllamaGenerateStream
 from rag_model_profiles import default_embedding_profile
@@ -76,16 +84,12 @@ _DONE = {
 }
 
 
-def _llama_default():
-    return resolve_answer_generation(
-        default_model_registry(),
-        requested_profile_id=None,
-        caller_is_admin=lambda: pytest.fail("no admin lookup for the default"),
-        installed_digest=lambda tag: pytest.fail("no inventory lookup for the unqualified control"),
-    )
+def _llama_default(epoch=1):
+    """The control as the shared selection at ``epoch``: no inventory lookup."""
+    return shared_generation_snapshot(default_model_registry().get(LLAMA_CONTROL), epoch=epoch, observed_digest=None)
 
 
-def _qualified_gemma_override(observed=SYNTHETIC_DIGEST):
+def _qualified_gemma_shared(observed=SYNTHETIC_DIGEST, epoch=3):
     base = default_model_registry()
     gemma = dataclasses.replace(
         base.get(GEMMA_CANDIDATE),
@@ -99,11 +103,9 @@ def _qualified_gemma_override(observed=SYNTHETIC_DIGEST):
         profiles=(base.get(LLAMA_CONTROL), gemma),
         default_profile_id=LLAMA_CONTROL,
     )
-    return resolve_answer_generation(
-        registry,
-        requested_profile_id=GEMMA_CANDIDATE,
-        caller_is_admin=lambda: True,
-        installed_digest=lambda tag: observed,
+    profile = registry.get(GEMMA_CANDIDATE)
+    return shared_generation_snapshot(
+        profile, epoch=epoch, observed_digest=check_installed_identity(profile, lambda tag: observed),
     )
 
 
@@ -134,18 +136,19 @@ def _build(**overrides):
 # --- the schema ---------------------------------------------------------------
 
 
-def test_a_default_llama_record_has_exactly_the_versioned_schema():
+def test_a_shared_llama_record_has_exactly_the_versioned_schema():
     embedding = default_embedding_profile()
     record = _build()
 
     assert record == {
-        "schema_version": 2,
+        "schema_version": 3,
         "trace_id": TRACE_ID,
         "release": {"app_version": "0.1.0", "build_sha": SYNTHETIC_SHA},
         "generation": {
             "profile_id": "llama_control",
             "model_tag": "llama3.1:8b",
-            "selection": "default",
+            "selection": "shared_active",
+            "selection_epoch": 1,
             "expected_digest": LLAMA_CONTROL_DIGEST,
             "observed_digest": None,
             "requested_options": {"temperature": 0.2, "num_ctx": 8192, "num_predict": 1200},
@@ -195,7 +198,7 @@ def test_a_default_llama_record_has_exactly_the_versioned_schema():
             "total_duration_ns": 4_000_000_000,
         },
     }
-    assert PROVENANCE_SCHEMA_VERSION == 2
+    assert PROVENANCE_SCHEMA_VERSION == 3
 
 
 def test_an_unknown_build_is_recorded_as_null_not_guessed():
@@ -206,7 +209,7 @@ def test_an_unknown_build_is_recorded_as_null_not_guessed():
 # --- generation identity ------------------------------------------------------
 
 
-def test_the_default_llama_path_has_no_observed_digest():
+def test_the_shared_llama_path_has_no_observed_digest():
     record = _build()
     assert record["generation"]["expected_digest"] == LLAMA_CONTROL_DIGEST
     assert record["generation"]["observed_digest"] is None, (
@@ -214,13 +217,13 @@ def test_the_default_llama_path_has_no_observed_digest():
     )
 
 
-def test_an_admin_override_records_its_selection_and_the_observed_digest():
-    record = _build(generation=_qualified_gemma_override(observed="SHA256:" + SYNTHETIC_DIGEST.upper()))
+def test_a_shared_gemma_selection_records_its_epoch_and_the_observed_digest():
+    record = _build(generation=_qualified_gemma_shared(observed="SHA256:" + SYNTHETIC_DIGEST.upper()))
 
     generation = record["generation"]
     assert generation["profile_id"] == "gemma_candidate"
     assert generation["model_tag"] == "gemma4:31b"
-    assert generation["selection"] == "admin_override"
+    assert (generation["selection"], generation["selection_epoch"]) == ("shared_active", 3)
     assert generation["expected_digest"] == SYNTHETIC_DIGEST
     assert generation["observed_digest"] == SYNTHETIC_DIGEST, "the lookup's value, normalized"
     assert generation["think"] is False, "think: false was sent"
@@ -281,7 +284,7 @@ def test_verification_is_copied_only_from_the_captured_verifier_call():
 
 def test_the_verifier_think_policy_is_recorded_as_sent():
     assert _build()["verification"]["think"] is None, "None: no think field was sent"
-    assert _build(generation=_qualified_gemma_override())["verification"]["think"] is False
+    assert _build(generation=_qualified_gemma_shared())["verification"]["think"] is False
 
 
 def test_a_stand_in_verifier_is_refused():
@@ -290,11 +293,12 @@ def test_a_stand_in_verifier_is_refused():
         _build(generation=snapshot)
 
 
-def test_the_v2_verification_fields_survive_json_storage():
-    record = _build(generation=_qualified_gemma_override())
+def test_the_verification_and_selection_fields_survive_json_storage():
+    record = _build(generation=_qualified_gemma_shared())
     text = answer_provenance_json(record)
     stored = json.loads(text)
-    assert stored["schema_version"] == 2
+    assert stored["schema_version"] == 3
+    assert (stored["generation"]["selection"], stored["generation"]["selection_epoch"]) == ("shared_active", 3)
     assert stored["verification"] == record["verification"]
     assert stored["verification"]["think"] is False, "false is stored, not dropped"
     assert stored["verification"]["read_timeout_s"] == 150.0
@@ -479,9 +483,9 @@ def test_thinking_text_never_reaches_the_record():
     assert "SECRET-THOUGHT" not in text and "thinking" not in text
 
 
-# A version 1 dict is not what this writer produces: stored v1 rows are
+# A version 1 or 2 dict is not what this writer produces: stored rows are
 # returned as they are and never re-serialized (see the admin-history tests).
-@pytest.mark.parametrize("value", [{"schema_version": 1}, [], "text", None])
+@pytest.mark.parametrize("value", [{"schema_version": 1}, {"schema_version": 2}, [], "text", None])
 def test_only_a_provenance_record_is_serialized(value):
     with pytest.raises(AnswerProvenanceError):
         answer_provenance_json(value)
@@ -492,3 +496,95 @@ def test_non_finite_numbers_are_refused_rather_than_stored():
     record["timing"]["first_answer_token_ms"] = float("nan")
     with pytest.raises(ValueError):
         answer_provenance_json(record)
+
+
+# --- a new record describes only the shared selection -----------------------------
+
+
+@pytest.mark.parametrize("selection", ["default", "admin_override"])
+def test_a_historical_selection_is_never_written_as_a_new_record(selection):
+    historical = _snapshot(default_model_registry().get(LLAMA_CONTROL), selection, None)
+    with pytest.raises(AnswerProvenanceError):
+        _build(generation=historical)
+
+
+# --- reading stored records with their own vocabulary -------------------------------
+
+
+def _stored_v1():
+    return {
+        "schema_version": 1, "trace_id": TRACE_ID,
+        "generation": {"profile_id": "llama_control", "model_tag": "llama3.1:8b", "selection": "default",
+                       "expected_digest": LLAMA_CONTROL_DIGEST, "observed_digest": None},
+        "verification": {"profile_id": "llama_control", "model_tag": "llama3.1:8b", "calls_attempted": 1},
+    }
+
+
+def _stored_v2():
+    record = _stored_v1()
+    record["schema_version"] = 2
+    record["generation"].update(selection="admin_override", profile_id="gemma_candidate", model_tag="gemma4:31b",
+                                expected_digest=SYNTHETIC_DIGEST, observed_digest=SYNTHETIC_DIGEST)
+    return record
+
+
+def test_the_reader_vocabulary_is_explicit_per_schema_version():
+    assert SELECTIONS_BY_SCHEMA_VERSION == {
+        1: ("default", "admin_override"), 2: ("default", "admin_override"), 3: ("shared_active",),
+    }
+
+
+def test_stored_v1_and_v2_records_read_with_their_own_vocabulary_and_stay_unchanged():
+    for stored, expected in (
+        (_stored_v1(), {"schema_version": 1, "selection": "default", "selection_epoch": None,
+                        "profile_id": "llama_control", "model_tag": "llama3.1:8b",
+                        "expected_digest": LLAMA_CONTROL_DIGEST, "observed_digest": None}),
+        (_stored_v2(), {"schema_version": 2, "selection": "admin_override", "selection_epoch": None,
+                        "profile_id": "gemma_candidate", "model_tag": "gemma4:31b",
+                        "expected_digest": SYNTHETIC_DIGEST, "observed_digest": SYNTHETIC_DIGEST}),
+    ):
+        before = json.dumps(stored, sort_keys=True)
+        assert read_answer_provenance(stored) == expected
+        assert json.dumps(stored, sort_keys=True) == before, "reading never rewrites or fills in a record"
+
+
+def test_a_v3_record_reads_back_its_shared_selection_and_epoch():
+    stored = json.loads(answer_provenance_json(_build(generation=_qualified_gemma_shared(epoch=5))))
+    view = read_answer_provenance(stored)
+    assert (view["schema_version"], view["selection"], view["selection_epoch"]) == (3, "shared_active", 5)
+    assert (view["expected_digest"], view["observed_digest"]) == (SYNTHETIC_DIGEST, SYNTHETIC_DIGEST)
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["v1-with-shared", "v2-with-epoch", "v3-with-default", "v3-without-epoch", "v3-bool-epoch", "v4", "v0",
+     "string-version", "no-generation", "bad-digest"],
+)
+def test_a_mixed_or_unknown_vocabulary_is_refused_not_guessed(change):
+    if change.startswith("v3"):
+        stored = json.loads(answer_provenance_json(_build()))
+    else:
+        stored = _stored_v2() if change == "v2-with-epoch" else _stored_v1()
+    generation = stored["generation"]
+    if change == "v1-with-shared":
+        generation["selection"] = "shared_active"
+    elif change == "v2-with-epoch":
+        generation["selection_epoch"] = 2
+    elif change == "v3-with-default":
+        generation["selection"] = "default"
+    elif change == "v3-without-epoch":
+        del generation["selection_epoch"]
+    elif change == "v3-bool-epoch":
+        generation["selection_epoch"] = True
+    elif change == "v4":
+        stored["schema_version"] = 4
+    elif change == "v0":
+        stored["schema_version"] = 0
+    elif change == "string-version":
+        stored["schema_version"] = "1"
+    elif change == "no-generation":
+        del stored["generation"]
+    else:
+        generation["expected_digest"] = "SHA256:" + "AA" * 32
+    with pytest.raises(AnswerProvenanceError):
+        read_answer_provenance(stored)

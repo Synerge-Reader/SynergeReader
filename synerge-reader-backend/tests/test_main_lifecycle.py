@@ -211,6 +211,23 @@ def test_vector_schema_error_is_visible_and_blocks_startup(
     )
 
 
+class _RecordingGeneration:
+    """Stands in for main._GENERATION_RUNTIME: records start/stop, starts no
+    thread and opens no database session."""
+
+    def __init__(self, events, start_error=None):
+        self._events = events
+        self._start_error = start_error
+
+    def start(self):
+        self._events.append("generation.start")
+        if self._start_error is not None:
+            raise self._start_error
+
+    def stop(self):
+        self._events.append("generation.stop")
+
+
 def test_initialize_application_uses_resolved_embedding_dimension(
     monkeypatch,
     main_module,
@@ -221,6 +238,9 @@ def test_initialize_application_uses_resolved_embedding_dimension(
         calls.append((args, kwargs))
 
     monkeypatch.setattr(main_module, "init_db", record_init_db)
+    # Initialization ends by starting generation ownership; the recorder keeps
+    # this test from starting a real ownership thread.
+    monkeypatch.setattr(main_module, "_GENERATION_RUNTIME", _RecordingGeneration([]))
 
     main_module._initialize_application()
 
@@ -235,6 +255,62 @@ def test_initialize_application_uses_resolved_embedding_dimension(
         "init_db must receive exactly the dimension resolved by the embedding "
         "profile, so the schema check can never fall back to a hardcoded value"
     )
+
+
+# --- generation ownership's lifecycle ---------------------------------------------------
+
+
+def test_generation_starts_only_after_the_database_and_stops_after_the_queue(monkeypatch, main_module):
+    events = []
+    monkeypatch.setattr(main_module, "init_db", lambda **kwargs: events.append("init_db"))
+    monkeypatch.setattr(main_module, "_GENERATION_RUNTIME", _RecordingGeneration(events))
+    monkeypatch.setattr(main_module, "_INSIGHTS_QUEUE", _RecordingInsightsQueue(events))
+    context = main_module.app.router.lifespan_context(main_module.app)
+
+    _drive_without_event_loop(context.__aenter__())
+    assert events == ["init_db", "generation.start", "queue.start"], (
+        "ownership is sought only after the schema initialized, and never waited for"
+    )
+    _drive_without_event_loop(context.__aexit__(None, None, None))
+    assert events[-2:] == ["queue.close", "generation.stop"], "shutdown fences generation and lets ownership go"
+
+
+def test_a_failed_initialization_never_seeks_generation_ownership(monkeypatch, main_module):
+    events = []
+    monkeypatch.setattr(main_module, "_GENERATION_RUNTIME", _RecordingGeneration(events))
+
+    def fail_init_db(*args, **kwargs):
+        raise VectorSchemaError("document_chunks has an incompatible vector dimension")
+
+    monkeypatch.setattr(main_module, "init_db", fail_init_db)
+    with pytest.raises(VectorSchemaError):
+        _drive_without_event_loop(main_module.app.router.lifespan_context(main_module.app).__aenter__())
+    assert events == []
+
+
+def test_a_generation_start_failure_never_stops_startup_or_leaks_detail(monkeypatch, main_module, capsys):
+    events = []
+    monkeypatch.setattr(main_module, "init_db", lambda **kwargs: None)
+    monkeypatch.setattr(main_module, "_GENERATION_RUNTIME",
+                        _RecordingGeneration(events, start_error=RuntimeError("SECRET-DETAIL")))
+    monkeypatch.setattr(main_module, "_INSIGHTS_QUEUE", _RecordingInsightsQueue(events))
+    context = main_module.app.router.lifespan_context(main_module.app)
+    capsys.readouterr()
+
+    _drive_without_event_loop(context.__aenter__())
+    _drive_without_event_loop(context.__aexit__(None, None, None))
+    assert events == ["generation.start", "queue.start", "queue.close", "generation.stop"]
+    assert "SECRET-DETAIL" not in "".join(capsys.readouterr())
+
+
+def test_importing_main_starts_no_generation_thread_and_opens_no_session(neutral_main_environment, monkeypatch):
+    opened = []
+    monkeypatch.setattr(dbSetup, "connect_to_postgres", lambda: opened.append(1))
+    before = {thread.name for thread in threading.enumerate()}
+    module = _load_isolated_module(_MAIN_PATH, "main")
+    after = {thread.name for thread in threading.enumerate()}
+    assert opened == [] and not {"generation-owner", "generation-coordinator"} & (after - before)
+    assert module._GENERATION_LEDGER.snapshot().admission == "unavailable", "no ownership, no admission"
 
 
 # --- the background-insights queue's lifecycle (B2a-1) -----------------------------
