@@ -101,6 +101,18 @@ _MAIN_ROUTES_AT_FC64A5A = frozenset(
     }
 )
 
+# Routes deliberately added since main@fc64a5a, pinned just as exactly, so the
+# historical set above stays a faithful record of what main served.
+_ROUTES_ADDED_SINCE_FC64A5A = frozenset(
+    {
+        ("GET", "/version"),  # CP2A: public, read-only release identity
+        # Shared model switcher: admin-only status, select and abort (Bearer token).
+        ("GET", "/admin/generation"),
+        ("POST", "/admin/generation/select"),
+        ("POST", "/admin/generation/abort"),
+    }
+)
+
 _DOCUMENT_HISTORY_ROUTES = (
     ("DELETE", "/me/documents/{document_id}"),
     ("GET", "/documents/{document_id}/content"),
@@ -196,8 +208,10 @@ class _FakeConnection:
 
 def test_the_merged_app_serves_exactly_mains_route_set(main_module):
     served = _api_routes(main_module.app)
-    assert served - _MAIN_ROUTES_AT_FC64A5A == set(), "a route main does not serve came back"
+    expected = _MAIN_ROUTES_AT_FC64A5A | _ROUTES_ADDED_SINCE_FC64A5A
+    assert served - expected == set(), "a route main does not serve came back"
     assert _MAIN_ROUTES_AT_FC64A5A - served == set(), "a route main serves was lost"
+    assert _ROUTES_ADDED_SINCE_FC64A5A - served == set(), "a deliberately added route was lost"
 
 
 def test_the_unauthenticated_filename_delete_stays_gone(main_module):

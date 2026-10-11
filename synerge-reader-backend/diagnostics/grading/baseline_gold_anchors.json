@@ -1,0 +1,60 @@
+{
+  "anchors_revision": 1,
+  "purpose": "Heuristic aid for the operator's manual grading of the manual-evidence fixtures C01, C02, C03 and C06. Never sent to a model: the harnesses read this file only after generation (--grade, or after the last network call of a qualification batch). Each fact was checked against the public paper page named below; the same facts also appear in the evidence each fixture supplies, which is expected.",
+  "fixtures": {
+    "C01": {
+      "required_facts": [
+        "Expected: with Step-Back Prompting, PaLM-2L improves by 7% on MMLU Physics and by 11% on MMLU Chemistry.",
+        "Expected: with Step-Back Prompting, PaLM-2L improves by 27% on TimeQA and by 7% on MuSiQue."
+      ],
+      "expected_citation_pages": [1],
+      "expected_citation_ids": ["C1"],
+      "anchor_groups": [
+        {"fact": "MMLU Physics 7%", "any": ["physics[^.\\n]{0,80}?\\b7\\s?%", "\\b7\\s?%[^.\\n]{0,80}?physics"]},
+        {"fact": "MMLU Chemistry 11%", "any": ["chemistry[^.\\n]{0,80}?\\b11\\s?%", "\\b11\\s?%[^.\\n]{0,80}?chemistry"]},
+        {"fact": "TimeQA 27%", "any": ["timeqa[^.\\n]{0,80}?\\b27\\s?%", "\\b27\\s?%[^.\\n]{0,80}?timeqa"]},
+        {"fact": "MuSiQue 7%", "any": ["musique[^.\\n]{0,80}?\\b7\\s?%", "\\b7\\s?%[^.\\n]{0,80}?musique"]}
+      ]
+    },
+    "C02": {
+      "required_facts": [
+        "Expected: the big Transformer reaches a BLEU score of 28.4 on WMT 2014 English-to-German.",
+        "Expected: its training took 3.5 days."
+      ],
+      "supplementary_facts": [
+        "Training used 8 P100 GPUs; the paper states this with the duration, but the question asks only how long training took."
+      ],
+      "expected_citation_pages": [8],
+      "expected_citation_ids": ["C1"],
+      "anchor_groups": [
+        {"fact": "28.4 BLEU", "any": ["\\b28\\.4\\b"]},
+        {"fact": "3.5 days of training", "any": ["\\b3\\.5\\s*days\\b", "three and a half days"]}
+      ]
+    },
+    "C03": {
+      "required_facts": [
+        "Expected: stage one, Abstraction, prompts the model to ask a generic step-back question about a higher-level concept or principle and retrieves relevant facts about it.",
+        "Expected: stage two, Reasoning, grounded on those high-level facts, reasons about the solution to the original question (abstraction-grounded reasoning)."
+      ],
+      "expected_citation_pages": [3],
+      "expected_citation_ids": ["C1"],
+      "anchor_groups": [
+        {"fact": "abstraction stage", "all": ["abstraction", "(higher|high)[- ]level|principle|concept"]},
+        {"fact": "reasoning stage grounded on the abstraction", "all": ["reason", "original question|grounded"]}
+      ]
+    },
+    "C06": {
+      "required_facts": [
+        "Expected: IRCoT interleaves chain-of-thought generation and retrieval steps, each guiding the other (C1, IRCoT page 4).",
+        "Expected: Step-Back Prompting first abstracts to a higher-level concept or principle and retrieves facts about it, then reasons about the original question grounded on those facts (C2, Step-Back page 3).",
+        "Expected: each method is attributed to its own source."
+      ],
+      "expected_citation_pages": [4, 3],
+      "expected_citation_ids": ["C1", "C2"],
+      "anchor_groups": [
+        {"fact": "IRCoT interleaves retrieval with chain-of-thought reasoning", "all": ["ircot", "interleav|alternat", "retriev"]},
+        {"fact": "Step-Back abstracts first, then reasons from the abstraction", "all": ["step-?\\s?back", "abstract", "reason"]}
+      ]
+    }
+  }
+}

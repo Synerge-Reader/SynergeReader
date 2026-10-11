@@ -43,7 +43,9 @@ real asyncio event loop, whose Windows self-pipe uses ``socket.socketpair()``.
 ``main._initialize_application`` is replaced before any client is built, and
 ``main.connect_to_postgres``, ``main._EMBEDDING_PROVIDER`` and (for /ask)
 ``main.post_ollama`` are replaced with in-memory doubles, so there is no
-database, Ollama, network, or subprocess.
+database, Ollama, network, or subprocess. A generation ledger owned by this
+process (what the lifespan installs once ownership is held) admits /ask under
+the shared control selection, without any database session.
 """
 
 import ast
@@ -54,6 +56,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 import bcrypt
 import dotenv
@@ -61,6 +64,9 @@ from fastapi.testclient import TestClient
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from generation_admission import DispatchIntents, GenerationLedger, SharedSelection
+from helper_jobs import EnqueueOutcome
 
 
 _MAIN_PY_PATH = Path(__file__).resolve().parents[1] / "main.py"
@@ -132,8 +138,8 @@ _SCOPE_OWNED = (
 )
 _LOAD_OWNED = "SELECT content FROM documents WHERE id = %s AND user_id = %s"
 _INSERT_HISTORY = (
-    "INSERT INTO chat_history (ts, selected_text, question, answer, user_id) "
-    "VALUES (%s, %s, %s, %s, %s) RETURNING id"
+    "INSERT INTO chat_history (ts, selected_text, question, answer, user_id, trace_id, answer_provenance) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id"
 )
 _LIST_HISTORY = (
     "SELECT id, ts, selected_text, question, answer FROM chat_history "
@@ -381,6 +387,25 @@ def db():
     return _FakeDB()
 
 
+class _NoIntents(DispatchIntents):
+    def record_dispatch(self, intent):
+        pass
+
+    def record_outcome(self, intent, state):
+        pass
+
+
+@pytest.fixture(autouse=True)
+def generation(monkeypatch, main_module):
+    """A generation ledger this process owns, admitting under the shared
+    control selection."""
+    ledger = GenerationLedger(main_module._ADMISSION_SETTINGS, clock=time.monotonic)
+    assert ledger.install_owner(intents=_NoIntents(), owner_seq=1, selection=SharedSelection("llama_control", 1),
+                                paused_by=None, recovered={})
+    monkeypatch.setattr(main_module, "_GENERATION_LEDGER", ledger)
+    return ledger
+
+
 @pytest.fixture
 def embedding_calls(monkeypatch, main_module):
     """Any embedding means a knowledge-base write was being prepared."""
@@ -619,10 +644,12 @@ _ANSWER_TOKENS = ("The term ", "is stated in ", "the document [C1].")
 
 
 class _FakeGeneration:
-    """A streamed /api/generate response: NDJSON lines cut into small chunks."""
+    """A streamed /api/generate response: NDJSON lines cut into small chunks,
+    ending with Ollama's final ``done`` record as the real server sends it."""
 
     def __init__(self, tokens):
         self._payload = "".join(json.dumps({"response": token}) + "\n" for token in tokens)
+        self._payload += json.dumps({"response": "", "done": True, "done_reason": "stop"}) + "\n"
 
     def __enter__(self):
         return self
@@ -643,7 +670,7 @@ class _FakeVerifierReply:
         pass
 
     def json(self):
-        return {"response": "supported"}
+        return {"response": "supported", "done": True, "done_reason": "stop"}
 
 
 @pytest.fixture
@@ -917,11 +944,23 @@ def test_deleting_a_user_requires_an_admin(client, db, params, status):
 
 @pytest.fixture
 def followups(monkeypatch, main_module):
-    started = []
-    monkeypatch.setattr(
-        main_module, "_start_background_task", lambda target, args: started.append(target)
-    )
-    return started
+    """Document ids admitted to the bounded insights queue -- the only
+    post-commit follow-up. Nothing runs: no worker, model or extra query."""
+    admitted = []
+
+    class _RecordingInsightsQueue:
+        def start(self):
+            return True
+
+        def close(self):
+            pass
+
+        def enqueue(self, document_id):
+            admitted.append(document_id)
+            return EnqueueOutcome.ACCEPTED
+
+    monkeypatch.setattr(main_module, "_INSIGHTS_QUEUE", _RecordingInsightsQueue())
+    return admitted
 
 
 @pytest.fixture
@@ -954,7 +993,7 @@ def test_an_active_user_uploads_asks_with_citations_and_sees_history(
         "the uploaded document belongs to the uploader"
     )
     assert document_id in db.chunks
-    assert followups == [main_module._extract_document_insights]
+    assert followups == [document_id], "only the committed id is queued, for insights"
 
     ask = client.post(
         "/ask",

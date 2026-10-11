@@ -1,0 +1,10 @@
+{
+  "fixture_id": "C03",
+  "fixture_revision": 1,
+  "question": "What are the two stages of Step-Back Prompting, and what does each stage do?",
+  "task_prefix": "none (Research & Q&A mode)",
+  "evidence_supply": "manual_evidence",
+  "prompt_evidence_mode": "hybrid_retrieval",
+  "evidence_file": "stepback_c03_evidence.json",
+  "evidence_text_sha256": "0be557ab22ada5b610402f8259bf80c5dcf08e8effcb45894b34c5274f849766"
+}

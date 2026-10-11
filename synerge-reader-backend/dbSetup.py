@@ -150,6 +150,23 @@ def ensure_document_chunks_locator_columns(cursor) -> None:
         )
 
 
+def ensure_chat_history_provenance_columns(cursor) -> None:
+    """Add nullable answer-provenance columns without rewriting any row.
+
+    Both columns are nullable with no default, so PostgreSQL adds them as a
+    catalog change: no table rewrite, no backfill. A NULL on an existing row
+    means "not recorded" -- it says nothing about which model, release, or
+    prompt produced that answer, and must never be read as the current one.
+    """
+    for col, definition in [
+        ("trace_id", "UUID"),
+        ("answer_provenance", "JSONB"),
+    ]:
+        cursor.execute(
+            f"ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS {col} {definition}"
+        )
+
+
 def connect_to_postgres():
     load_dotenv()
     connection = None
@@ -286,9 +303,12 @@ def init_db(
             answer TEXT NOT NULL,
             rating INTEGER,
             comment TEXT,
+            trace_id UUID,
+            answer_provenance JSONB,
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
         """)
+        ensure_chat_history_provenance_columns(cursor)
 
         cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS knowledge_base (

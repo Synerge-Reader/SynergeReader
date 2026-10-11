@@ -49,6 +49,10 @@ services:
       - EMBEDDING_QUERY_PREFIX
       - EMBEDDING_DOCUMENT_PREFIX
       - EMBEDDING_PROFILE_UNVERIFIED_ACK
+      # Full 40-character SHA of the reviewed release commit, supplied by the
+      # deployment workflow or operator. Bare on purpose: when it is not
+      # supplied it stays absent and /api/version reports "build unknown".
+      - SYNERGE_BUILD_SHA
     depends_on:
       synergereader-db:
         condition: service_healthy

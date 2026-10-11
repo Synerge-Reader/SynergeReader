@@ -1,0 +1,10 @@
+{
+  "evidence_id": "stepback-c03-page3-v1",
+  "filename": "Step back.pdf",
+  "page_start": 3,
+  "page_end": 3,
+  "source_kind": "normalized_excerpt",
+  "provenance_note": "Manual evidence prepared 10 October 2026 by Claude Code from the public paper arXiv:2310.06117v2, PDF file 'Step back.pdf' (sha256 5133e42bd76de3b31be5fd21a3d36ebb45bfdf58db00047839175829f214eb72), physical page 3 (printed page 3). Text extracted with pypdfium2; its character sequence matched pdfplumber's independent extraction once whitespace was set aside, and the rendered page was checked visually. Pending operator review. Newly prepared manual evidence; it is not the evidence retrieved by any historical website attempt.",
+  "excerpt_scope_note": "From Section 2 on physical page 3: the sentence introducing the two steps and both step bullets, verbatim including the source's wording 'consists two simple steps'. A normalized relevant excerpt, not a byte-exact whole-page extraction. Normalization: whitespace only. Line breaks inside a paragraph or bullet became single spaces; a line break after a line-final hyphen was removed and the hyphen kept (no word was de-hyphenated or repaired); breaks between bullets are kept as newlines. pypdfium2 reports a line-final hyphen glyph as U+FFFE; the character written is the '-' that the PDF content stream holds (as pdfplumber reports it). Small-caps headings appear as the upper-case letters of the text layer. No other change.",
+  "text": "In short, STEP-BACK PROMPTING consists two simple steps:\n• Abstraction: Instead of addressing the question directly, we first prompt the LLM to ask a generic step-back question about a higher-level concept or principle, and retrieve relevant facts about the high-level concept or principle. The step-back question is unique for each task in order to retrieve the most relevant facts.\n• Reasoning: Grounded on the facts regarding the high-level concept or principle, the LLM can reason about the solution to the original question. We term this as Abstraction-grounded Reasoning."
+}

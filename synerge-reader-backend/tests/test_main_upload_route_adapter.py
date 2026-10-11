@@ -57,6 +57,7 @@ from document_ingestion import (
     ResultStatus,
     UploadDocument,
 )
+from helper_jobs import EnqueueOutcome
 from original_file_fixtures import make_docx, make_pdf
 
 
@@ -495,14 +496,33 @@ def test_uploader_lookup_always_closes_its_cursor_and_connection(
     ), "the lookup cursor must always be closed"
 
 
+class _RecordingInsightsQueue:
+    """Stands in for main._INSIGHTS_QUEUE: records the admitted document ids
+    and runs nothing. The only post-commit follow-up is queued insights."""
+
+    def __init__(self, outcome=EnqueueOutcome.ACCEPTED, error=None):
+        self.enqueued = []
+        self._outcome = outcome
+        self._error = error
+
+    def start(self):
+        return True
+
+    def close(self):
+        pass
+
+    def enqueue(self, document_id):
+        self.enqueued.append(document_id)
+        if self._error is not None:
+            raise self._error
+        return self._outcome
+
+
 def _record_followup_starts(monkeypatch, main_module):
-    started = []
-    monkeypatch.setattr(
-        main_module,
-        "_start_background_task",
-        lambda target, args: started.append(target),
-    )
-    return started
+    """The document ids admitted to the insights queue."""
+    queue = _RecordingInsightsQueue()
+    monkeypatch.setattr(main_module, "_INSIGHTS_QUEUE", queue)
+    return queue.enqueued
 
 
 def test_unknown_token_is_refused_with_401_before_ingestion(
@@ -929,12 +949,10 @@ def test_complete_batch_envelope_is_returned_without_raw_exception_detail(
 
 
 def test_dispatcher_starts_only_the_insights_followup(monkeypatch, main_module):
-    started = []
-    monkeypatch.setattr(
-        main_module,
-        "_start_background_task",
-        lambda target, args: started.append((target, args)),
-    )
+    # B2a-1: the follow-up is queued, not started on a thread of its own, and
+    # only the committed id travels -- the worker reloads the current row.
+    queue = _RecordingInsightsQueue()
+    monkeypatch.setattr(main_module, "_INSIGHTS_QUEUE", queue)
 
     committed = CommittedDocument(
         document_id=77,
@@ -945,18 +963,22 @@ def test_dispatcher_starts_only_the_insights_followup(monkeypatch, main_module):
     )
     main_module._dispatch_upload_followups(committed)
 
-    assert [target for target, _ in started] == [
-        main_module._extract_document_insights,
-    ], (
-        "PR #54 containment: only document insights may follow a commit; "
-        "generate_kb_from_document writes the uploaded text's Q&A into the "
-        "shared knowledge base and must not be dispatched"
+    assert queue.enqueued == [77], (
+        "PR #54 containment: only document insights may follow a commit, and "
+        "the insights queue is the only follow-up; generate_kb_from_document "
+        "writes the uploaded text's Q&A into the shared knowledge base and must "
+        "not be dispatched"
     )
-    for _, args in started:
-        assert args == (77, "sanitized_name.pdf", "server-extracted text"), (
-            "the follow-up must receive the committed document id, the "
-            "service-sanitized filename, and the server-extracted text"
-        )
+    assert all(type(item) is int for item in queue.enqueued), (
+        "only the committed document id is queued -- never the filename or the "
+        "server-extracted text"
+    )
+
+    queue.enqueued.clear()
+    duplicate = _RecordingInsightsQueue(outcome=EnqueueOutcome.DUPLICATE)
+    monkeypatch.setattr(main_module, "_INSIGHTS_QUEUE", duplicate)
+    main_module._dispatch_upload_followups(committed)
+    assert duplicate.enqueued == [77], "an id already queued, running or unresolved is a no-op"
 
 
 class _RecordingWriteCursor:
@@ -1009,15 +1031,11 @@ def test_an_indexed_upload_adds_nothing_to_the_knowledge_base(
     monkeypatch, main_module, upload_client
 ):
     """End to end through the REAL DocumentIngestionService and the real
-    post-commit dispatcher: the document commits and is indexed, document
-    insights are started, and no knowledge-base follow-up or statement occurs.
-    Only the embedding provider and the connection are in-memory doubles."""
-    started = []
-    monkeypatch.setattr(
-        main_module,
-        "_start_background_task",
-        lambda target, args: started.append(target),
-    )
+    post-commit dispatcher: the document commits and is indexed, its id is
+    queued for document insights, and no knowledge-base follow-up or statement
+    occurs. Only the embedding provider, the connection and the insights queue
+    are in-memory doubles."""
+    started = _record_followup_starts(monkeypatch, main_module)
     connection = _RecordingWriteConnection()
     monkeypatch.setattr(main_module, "connect_to_postgres", lambda: connection)
     monkeypatch.setattr(
@@ -1036,46 +1054,31 @@ def test_an_indexed_upload_adds_nothing_to_the_knowledge_base(
     assert result["status"] == "indexed" and result["document_id"] == 501
     assert connection.committed and connection.closed
     assert any(sql.startswith("INSERT INTO documents") for sql in connection.statements)
-    assert started == [main_module._extract_document_insights], (
-        "a committed upload must start document insights only"
+    assert started == [501], (
+        "a committed upload must queue document insights only, by its id"
     )
+    assert result["warnings"] == []
     assert not [sql for sql in connection.statements if "knowledge_base" in sql]
 
 
 def test_a_failed_follow_up_start_surfaces_as_one_generic_error(
     monkeypatch, main_module, capsys
 ):
-    """A follow-up that never started must be visible to the service.
+    """A follow-up that was not admitted must be visible to the service.
 
-    _start_background_task must let a Thread construction/start failure
-    propagate, and the dispatcher must attempt every follow-up before raising
-    one generic error carrying none of the underlying detail. The service then
-    converts that error into its fixed post-commit warning while keeping the
-    result indexed -- proven separately by
+    B2a-1: the follow-up is now admission to the bounded insights queue rather
+    than a thread start. A full queue, an unavailable queue, or an admission
+    call that raises must each surface as one generic error carrying none of
+    the underlying detail. The service then converts that error into its fixed
+    post-commit warning while keeping the result indexed -- proven separately by
     test_dispatch_failure_warns_but_does_not_falsify_committed_state in
     tests/test_document_ingestion.py, which this test does not duplicate.
 
-    Only a failed START is detectable here. A failure inside an already-running
-    follow-up thread happens after this function has returned and cannot be
-    observed synchronously by anything in this path.
+    Only a failed ADMISSION is detectable here. What happens to an admitted
+    job later runs on a queue worker and cannot be observed synchronously by
+    anything in this path.
     """
     seeded_private_detail = "token=hunter2 /var/secret/doc.pdf"
-    attempts = []
-
-    class _UnstartableThread:
-        def __init__(self, target=None, args=(), daemon=None):
-            attempts.append((target, args))
-            raise RuntimeError(f"cannot start thread: {seeded_private_detail}")
-
-    monkeypatch.setattr("threading.Thread", _UnstartableThread)
-    capsys.readouterr()
-
-    # 1: the start failure propagates out of _start_background_task itself.
-    with pytest.raises(RuntimeError):
-        main_module._start_background_task(lambda: None, ())
-    assert len(attempts) == 1
-    attempts.clear()
-
     committed = CommittedDocument(
         document_id=77,
         filename="sanitized_name.pdf",
@@ -1083,25 +1086,30 @@ def test_a_failed_follow_up_start_surfaces_as_one_generic_error(
         content_sha256="ab" * 32,
         embedding_profile_id="profile-1",
     )
+    failures = {
+        "full": _RecordingInsightsQueue(outcome=EnqueueOutcome.FULL),
+        "unavailable": _RecordingInsightsQueue(outcome=EnqueueOutcome.UNAVAILABLE),
+        "raises": _RecordingInsightsQueue(
+            error=RuntimeError(f"cannot admit: {seeded_private_detail}")
+        ),
+    }
+    for name, queue in failures.items():
+        monkeypatch.setattr(main_module, "_INSIGHTS_QUEUE", queue)
+        capsys.readouterr()
 
-    # 2/3: the follow-up is attempted, and the raise comes only afterwards.
-    with pytest.raises(main_module._PostCommitDispatchError) as excinfo:
-        main_module._dispatch_upload_followups(committed)
+        with pytest.raises(main_module._PostCommitDispatchError) as excinfo:
+            main_module._dispatch_upload_followups(committed)
 
-    assert [target for target, _ in attempts] == [
-        main_module._extract_document_insights,
-    ], "the insights follow-up must be attempted with its committed arguments"
-    for _, args in attempts:
-        assert args == (77, "sanitized_name.pdf", "server-extracted text")
-
-    # 4: none of the seeded private detail escapes, by message or by chaining.
-    assert seeded_private_detail not in str(excinfo.value)
-    assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None, (
-        "the generic dispatch error must not carry the original exception"
-    )
-    captured = capsys.readouterr()
-    assert seeded_private_detail not in captured.out
-    assert seeded_private_detail not in captured.err
+        assert queue.enqueued == [77], f"{name}: the insights admission was attempted with the id only"
+        # None of the seeded private detail escapes, by message or by chaining.
+        assert seeded_private_detail not in str(excinfo.value)
+        assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None, (
+            f"{name}: the generic dispatch error must not carry the original exception"
+        )
+        captured = capsys.readouterr()
+        assert seeded_private_detail not in captured.out
+        assert seeded_private_detail not in captured.err
+        assert "sanitized_name" not in captured.out and "server-extracted" not in captured.out
 
 
 def test_route_never_calls_the_followups_directly(main_tree):
@@ -1124,18 +1132,16 @@ def test_route_never_calls_the_followups_directly(main_tree):
     assert "generate_kb_from_document" not in referenced, (
         "PR #54 containment: knowledge-base generation must not be dispatched"
     )
-    assert "_extract_document_insights" in referenced
+    # B2a-1: insights are admitted to the bounded queue; the dispatcher no
+    # longer runs or threads the insights helper itself.
+    assert "_INSIGHTS_QUEUE" in referenced
+    assert not referenced & {"_extract_document_insights", "Thread", "threading"}
 
 
 def test_no_followup_is_started_when_the_service_reports_a_failure(
     monkeypatch, main_module, upload_client
 ):
-    started = []
-    monkeypatch.setattr(
-        main_module,
-        "_start_background_task",
-        lambda target, args: started.append(target),
-    )
+    started = _record_followup_starts(monkeypatch, main_module)
     _install_service_double(monkeypatch, main_module, lambda uploads: _mixed_batch(503))
 
     response = upload_client.post(

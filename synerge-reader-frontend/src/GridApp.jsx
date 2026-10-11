@@ -3,6 +3,9 @@ import * as pdfjsLib from "pdfjs-dist/build/pdf";
 import { GlobalWorkerOptions } from "pdfjs-dist/build/pdf";
 import { renderAsync } from "docx-preview";
 import UserAuth from "./components/UserAuth/UserAuth";
+import { ClaimSupportSummary } from "./components/ClaimSupportSummary";
+import VersionBadge from "./components/VersionBadge";
+import AdminGenerationPanel from "./components/AdminGenerationPanel";
 
 GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.js",
@@ -34,8 +37,13 @@ const TASK_MODES = [
 // so a model change is one edit in TASK_MODES.
 const EXPLAIN_MODEL = (TASK_MODES.find(t => t.id === "summarize") || {}).model || "llama3.1:8b";
 
+// Display names for the model tags the backend reports. The tag shown on an
+// answer always comes from the backend's stream (evidence.generation), never
+// from TASK_MODES: the backend decides which model answers, and the model
+// strings above are only legacy request fields it does not honour.
 const MODEL_LABEL = {
   "llama3.1:8b":  "Llama 3.1 8B",
+  "gemma4:31b":   "Gemma 4 31B",
   "qwen3:latest": "Qwen3",
 };
 
@@ -445,116 +453,6 @@ function AnswerText({ text, citations, pending, onOpen, linkCitations = true }) 
   }
   if (last < body.length) nodes.push(body.slice(last));
   return <>{nodes}</>;
-}
-
-// What happened to one claim, in the reader's language. The backend's reason
-// is what separates "we checked and it is not supported" from "we never got to
-// check it" — collapsing those into one "not verified" count is what made the
-// old pills unreadable.
-const CLAIM_STATE_LABEL = {
-  supported:           { label: "Supported",                        color: "#15803d", background: "#dcfce7", border: "#86efac" },
-  partially_supported: { label: "Partly supported",                 color: "#b45309", background: "#fef3c7", border: "#fcd34d" },
-  no_citation:         { label: "Not supported by a cited document", color: "#b91c1c", background: "#fee2e2", border: "#fca5a5" },
-  invalid_citation:    { label: "Citation could not be resolved",    color: "#b91c1c", background: "#fee2e2", border: "#fca5a5" },
-  // The claim did cite a source; that source just does not state it. Saying
-  // "not supported by a cited document" would misdescribe what went wrong.
-  evidence_mismatch:   { label: "Cited source does not state this",  color: "#b91c1c", background: "#fee2e2", border: "#fca5a5" },
-  not_checked:         { label: "Not checked",                       color: "#475569", background: "#f1f5f9", border: "#cbd5e1" },
-  check_unavailable:   { label: "Check unavailable",                 color: "#475569", background: "#f1f5f9", border: "#cbd5e1" },
-};
-
-function claimStateKey(claim) {
-  if (claim.status === "supported") return "supported";
-  if (claim.status === "partially_supported") return "partially_supported";
-  if (claim.status === "unsupported") {
-    if (claim.reason === "invalid_citation") return "invalid_citation";
-    if (claim.reason === "evidence_terms_missing") return "evidence_mismatch";
-    return "no_citation";
-  }
-  // unverified: the reason says whether we ran out of budget or the verifier
-  // itself failed. Neither means the claim is wrong.
-  return (claim.reason === "verifier_unavailable" || claim.reason === "verifier_malformed")
-    ? "check_unavailable"
-    : "not_checked";
-}
-
-const SUPPORT_HEADLINE = {
-  supported:   "Supported by your documents",
-  unsupported: "Parts of this answer are not supported by your documents",
-  mixed:       "Some claims in this answer need checking",
-  incomplete:  "Citation check incomplete",
-  unavailable: "Citation check unavailable",
-};
-
-const UNSUPPORTED_KEYS = ["no_citation", "invalid_citation", "evidence_mismatch"];
-
-// The headline is a summary, not a verdict on the weakest sentence. An answer
-// whose substantive claims are all cited and supported should not be shown as
-// wholly unsupported because it opened with a framing sentence like "IRCoT and
-// Step-Back Prompting differ in their approach" — that sentence asserts
-// nothing about the documents, so nothing can cite it.
-//
-// The rule that does not move: an answer with no supported claim at all stays
-// red. Softening only applies where real, supported claims exist alongside the
-// unsupported ones, and the per-claim rows below always show the full detail.
-function supportHeadlineKey(claims) {
-  const keys = claims.map(claimStateKey);
-  const unsupported = keys.filter(k => UNSUPPORTED_KEYS.includes(k)).length;
-  const supported = keys.filter(k => k === "supported" || k === "partially_supported").length;
-  if (unsupported > 0 && supported === 0) return "unsupported";
-  if (unsupported > 0) return "mixed";
-  if (keys.some(k => k === "check_unavailable")) return "unavailable";
-  if (keys.some(k => k === "not_checked")) return "incomplete";
-  return "supported";
-}
-
-function ClaimSupportSummary({ claims, citations, onOpen }) {
-  const [open, setOpen] = useState(false);
-  if (!claims?.length) return null;
-  const headlineKey = supportHeadlineKey(claims);
-  const tone = headlineKey === "supported" ? "#15803d"
-    : headlineKey === "unsupported" ? "#b91c1c"
-    : headlineKey === "mixed" ? "#b45309" : "#475569";
-  return (
-    <div style={{ marginTop: "8px" }}>
-      <button
-        type="button"
-        onClick={() => setOpen(o => !o)}
-        aria-expanded={open}
-        style={{
-          display: "inline-flex", alignItems: "center", gap: "6px",
-          background: "none", border: "none", padding: 0, cursor: "pointer",
-          fontSize: "11.5px", fontWeight: 700, color: tone,
-        }}
-      >
-        {SUPPORT_HEADLINE[headlineKey]}
-        <span style={{ fontSize: "10px", color: "#9ca3af" }}>{open ? "▲ hide details" : "▼ details"}</span>
-      </button>
-      {open && (
-        <div style={{ marginTop: "6px", display: "flex", flexDirection: "column", gap: "5px" }}>
-          {claims.map((claim, i) => {
-            const state = CLAIM_STATE_LABEL[claimStateKey(claim)];
-            return (
-              <div key={i} style={{ display: "flex", gap: "7px", alignItems: "flex-start" }}>
-                <span style={{
-                  flexShrink: 0, padding: "1px 7px", borderRadius: "10px", fontSize: "10px",
-                  fontWeight: 700, color: state.color, background: state.background,
-                  border: `1px solid ${state.border}`,
-                }}>{state.label}</span>
-                <span style={{ fontSize: "11.5px", color: "#4b5563", lineHeight: "1.5" }}>
-                  {/* The claim text is what the model wrote, so it still
-                      carries raw [Cn] registry ids. It goes through the same
-                      rewriter as the answer body so the reader sees compact
-                      public numbers here too, never an internal id. */}
-                  <AnswerText text={claim.text} citations={citations} pending={false} onOpen={onOpen} />
-                </span>
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
 }
 
 function DotsLoader() {
@@ -2405,6 +2303,8 @@ export default function GridApp() {
   const confirmTimerRef = useRef(null);
   const [activeTask,  setActiveTask]  = useState("research");
   const [messages,    setMessages]    = useState([]);
+  // The model tag the backend last reported answering with (evidence event).
+  const [answerModel, setAnswerModel] = useState(null);
   const [input,       setInput]       = useState("");
   const [typing,      setTyping]      = useState(false);
   const [hlPage,      setHlPage]      = useState(null);
@@ -2681,7 +2581,9 @@ export default function GridApp() {
 
   useEffect(() => { setSelPopover(null); }, [activeDoc?.id, sourceOpen]);
   const task      = TASK_MODES.find(t => t.id === activeTask);
-  const modelName = MODEL_LABEL[task?.model] || task?.model || "Llama 3.1 8B";
+  // Named only from what the backend reported; until an answer reports a
+  // model, nothing more specific than "Local model" is known.
+  const modelName = MODEL_LABEL[answerModel] || answerModel || "Local model";
 
   // auto-scroll chat
   useEffect(() => {
@@ -3270,7 +3172,8 @@ export default function GridApp() {
         setSourceOpen(true);
         setMainView("chat");
         setMessages(m => [...m, {
-          id: Date.now(), role: "assistant", model: task?.model,
+          // A client notice, not a model answer, so it names no model.
+          id: Date.now(), role: "assistant",
           text: `"${backendName}" indexed — ${chunksCount} searchable chunk${chunksCount !== 1 ? "s" : ""} from ${parsed.pages} page${parsed.pages !== 1 ? "s" : ""}.${docWarnings.length ? ` Note: ${docWarnings.join(" ")}` : ""} Ask a question or click a suggested question below.`,
           citations: [],
         }]);
@@ -3481,7 +3384,9 @@ export default function GridApp() {
 
     const prefix = effectiveTaskId !== "research" ? TASK_PROMPTS[effectiveTaskId] + "\n\n" : "";
     const msgId  = Date.now() + 1;
-    setMessages(m => [...m, { id: msgId, role: "assistant", model: effectiveTask?.model, text: "", citations: [], streaming: true, unverified: !!flags?.unverified }]);
+    // No model label until the backend reports which model it resolved: the
+    // task's legacy model string does not choose the model and would mislabel it.
+    setMessages(m => [...m, { id: msgId, role: "assistant", model: null, text: "", citations: [], streaming: true, unverified: !!flags?.unverified }]);
 
     // Document scope travels as backend document ids. Combined mode no longer
     // ships the concatenated text of every open document as if the user had
@@ -3539,9 +3444,12 @@ export default function GridApp() {
           // one of them, so nothing is shown until verification reports which
           // ids were actually cited.
           candidates = Array.isArray(event.citations) ? event.citations : [];
+          // The model the backend actually resolved for THIS answer.
+          const answeredBy = typeof event.generation?.model === "string" ? event.generation.model : null;
+          if (answeredBy) setAnswerModel(answeredBy);
           setMessages(prev => prev.map(msg =>
             msg.id === msgId
-              ? { ...msg, citations: [], evidenceMode: event.mode, sourcesPending: true }
+              ? { ...msg, model: answeredBy, citations: [], evidenceMode: event.mode, sourcesPending: true }
               : msg
           ));
         } else if (event.type === "delta") {
@@ -4248,6 +4156,12 @@ export default function GridApp() {
                 onMouseLeave={e => e.currentTarget.style.color = "#a8adbd"}
               ><IconUser width={15} height={15} />Sign In</button>
             )}
+
+            {/* server-reported release identity; renders nothing until /version answers */}
+            <VersionBadge backendUrl={BACKEND} style={{
+              padding: "8px 9px 0", fontSize: "10px", color: "#8b91a3",
+              fontFamily: UI_FONT, letterSpacing: ".02em", fontVariantNumeric: "tabular-nums",
+            }} />
           </div>
         </div>
       </div>
@@ -4807,7 +4721,7 @@ export default function GridApp() {
                             {/* AI analysis is never graded against the documents, so it
                                 never shows a document-support headline. */}
                             {!msg.unverified && (
-                              <ClaimSupportSummary claims={msg.claims} citations={msg.citations} onOpen={handleCitation} />
+                              <ClaimSupportSummary claims={msg.claims} citations={msg.citations} onOpen={handleCitation} ClaimText={AnswerText} />
                             )}
                             {!msg.streaming && msg.entryId && authToken && (
                               <div style={{ display: "flex", alignItems: "center", gap: "4px", marginTop: "8px" }}>
@@ -5904,6 +5818,9 @@ export default function GridApp() {
                           ) : <div style={{ fontSize: "11.5px", color: "#94a3b8" }}>Checking…</div>}
                         </ChartCard>
                       </div>
+
+                      {/* the shared answer model (admin-only; the backend authorizes every call) */}
+                      <AdminGenerationPanel backendUrl={BACKEND} authToken={authToken} />
 
                       {/* breakdowns — by task mode, by user */}
                       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>

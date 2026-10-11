@@ -1,0 +1,10 @@
+{
+  "fixture_id": "C02",
+  "fixture_revision": 1,
+  "question": "What BLEU score did the big Transformer achieve on WMT 2014 English-to-German, and how long did its training take?",
+  "task_prefix": "none (Research & Q&A mode)",
+  "evidence_supply": "manual_evidence",
+  "prompt_evidence_mode": "hybrid_retrieval",
+  "evidence_file": "attention_c02_evidence.json",
+  "evidence_text_sha256": "720f3f61ad85d089e98c2974c61150f32b3114e5aed10e6a23c8ca104f23d3c2"
+}

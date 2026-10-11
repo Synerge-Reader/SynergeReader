@@ -8,9 +8,11 @@ Three kinds of test live here, and none imports the application:
 * Route-composition tests parse ``main.py`` with the stdlib ``ast`` module.
 * Route-execution tests compile only ``ask_question`` and the claim verifier
   out of that same parse tree into an isolated namespace in which every
-  collaborator -- Ollama, the database, evidence planning, the knowledge base
-  -- is an in-memory stub, then drive the real stream generator and decode
-  what it emits.
+  collaborator -- Ollama, the database, evidence planning, the knowledge base,
+  admission and the answer job -- is an in-memory stub, then drive the real
+  stream generator (the job body ``stream_generate``) with an in-memory job
+  and decode what it emits. Admission's own waits, the job thread and the
+  bounded delivery are proven in tests/test_answer_jobs.py.
 
 main.py is never imported, so none of its module-level setup runs, and no
 database, Ollama, network, subprocess, or filesystem write occurs.
@@ -82,6 +84,22 @@ from citation_generation import (
     generate_citations,
     safe_error,
 )
+from answer_jobs import ANSWER_TIMEOUT_ERROR, NOT_DISPATCHED_ERROR
+from generation_admission import DispatchRefused
+from generation_profiles import LLAMA_CONTROL, default_model_registry, shared_generation_snapshot
+from ollama_generation import (
+    FAILURE_OUTPUT_LIMIT,
+    OllamaGenerateStream,
+    completed_generate_response,
+)
+from answer_provenance import (
+    AnswerTimer,
+    answer_provenance_json,
+    build_answer_provenance,
+    new_trace_id,
+)
+from rag_model_profiles import default_embedding_profile
+from release_metadata import release_metadata_from_env
 
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -233,10 +251,12 @@ class _FakeConnection:
 
 
 class _FakeGenerationStream:
-    """A streamed /api/generate response: NDJSON lines cut into small chunks."""
+    """A streamed /api/generate response: NDJSON lines cut into small chunks,
+    ending with Ollama's final ``done`` record as the real server sends it."""
 
     def __init__(self, tokens):
         self._payload = "".join(json.dumps({"response": token}) + "\n" for token in tokens)
+        self._payload += json.dumps({"response": "", "done": True, "done_reason": "stop"}) + "\n"
 
     def __enter__(self):
         return self
@@ -253,21 +273,52 @@ class _FakeGenerationStream:
 
 
 class _FakeVerifierResponse:
-    def __init__(self, word):
-        self._word = word
+    """A non-streamed verifier reply. A word is sent as the ``response`` of a
+    finished generation (``done`` true, ``done_reason`` "stop"), as the real
+    server reports one, so the status parser is what these tests exercise. A
+    dict is sent as the whole body, so a test can send an unfinished or error
+    reply on purpose."""
+
+    def __init__(self, reply):
+        self._reply = reply
 
     def raise_for_status(self):
         pass
 
     def json(self):
-        return {"response": self._word}
+        if isinstance(self._reply, dict):
+            return dict(self._reply)
+        return {"response": self._reply, "done": True, "done_reason": "stop"}
 
 
-class _CapturedStreamingResponse:
-    def __init__(self, content, media_type=None, headers=None):
-        self.content = content
+class _CapturedAnswerResponse:
+    """Stands in for answer_jobs.AdmittedAnswerResponse: keeps the job (here,
+    the job body itself, see ``_new_answer_job`` in the harness)."""
+
+    def __init__(self, job, media_type=None, headers=None):
+        self.content = job
         self.media_type = media_type
         self.headers = headers
+
+
+class _HarnessJob:
+    """The answer job as the body sees it: delivery never abandoned, budget
+    never spent, and the commit point always reached."""
+
+    abandoned = False
+    expired = False
+
+    def observed_stream(self, stream):
+        return True
+
+    def begin_persistence(self):
+        return True
+
+
+def _shared_llama():
+    """The snapshot an answer admitted under the shared control selection
+    carries. No inventory lookup is made for the control."""
+    return shared_generation_snapshot(default_model_registry().get(LLAMA_CONTROL), epoch=1, observed_digest=None)
 
 
 def _evidence_bundle():
@@ -292,7 +343,7 @@ _CALLER_ID = "caller-7"
 def _route_harness(main_tree, connection, verifier_reply="supported", kb_entries=()):
     """The route's real code, with every collaborator an in-memory stub."""
     calls = SimpleNamespace(
-        ollama=[], callers=[], scopes=[], kb_queries=[], kb_used=[],
+        ollama=[], callers=[], scopes=[], kb_queries=[], kb_used=[], admitted=[], released=[],
         auto_saved=threading.Event(),
     )
     planning = EvidencePlanningResult(bundle=_evidence_bundle())
@@ -321,18 +372,53 @@ def _route_harness(main_tree, connection, verifier_reply="supported", kb_entries
             return _FakeGenerationStream(_ANSWER_TOKENS)
         return _FakeVerifierResponse(verifier_reply)
 
+    # Admission and the shared selection, as non-suspending coroutines so the
+    # route still runs to its return with one send(). Route-level admission
+    # and selection are proven in tests/test_answer_model_selection.py and
+    # tests/test_generation_switch_routes.py.
+    async def admit_answer():
+        calls.admitted.append(1)
+        return "admitted-ticket"
+
+    async def answer_generation(ticket):
+        assert ticket == "admitted-ticket"
+        return _shared_llama()
+
     namespace = {
         "app": SimpleNamespace(post=lambda path: (lambda function: function)),
         "AskRequest": object,
         "Optional": Optional,
         "re": re,
-        "StreamingResponse": _CapturedStreamingResponse,
+        "HTTPException": type("HTTPException", (Exception,), {}),
+        "_MODEL_OVERRIDE_RETIRED": "retired",
+        "AdmittedAnswerResponse": _CapturedAnswerResponse,
+        "_new_answer_job": lambda ticket, body: body,
+        "_admit_answer": admit_answer,
+        "_answer_generation": answer_generation,
+        "_release_unstarted_answer": lambda ticket: calls.released.append(ticket),
+        "current_dispatch_permitted": lambda: True,
+        "DispatchRefused": DispatchRefused,
+        "ANSWER_TIMEOUT_ERROR": ANSWER_TIMEOUT_ERROR,
+        "NOT_DISPATCHED_ERROR": NOT_DISPATCHED_ERROR,
         "STREAM_MEDIA_TYPE": STREAM_MEDIA_TYPE,
         "EmbeddingProviderError": type("EmbeddingProviderError", (Exception,), {}),
         "OLLAMA_KEEP_ALIVE": "30m",
         "json": json,
         "datetime": datetime,
         "post_ollama": post_ollama,
+        "OllamaGenerateStream": OllamaGenerateStream,
+        "FAILURE_OUTPUT_LIMIT": FAILURE_OUTPUT_LIMIT,
+        # The real pure validator _ollama_claim_verifier now delegates to;
+        # its rules are proven in tests/test_ollama_generation.py.
+        "completed_generate_response": completed_generate_response,
+        # Answer provenance is built from the real pure modules; its contents
+        # are proven in tests/test_answer_provenance_routes.py.
+        "AnswerTimer": AnswerTimer,
+        "new_trace_id": new_trace_id,
+        "build_answer_provenance": build_answer_provenance,
+        "answer_provenance_json": answer_provenance_json,
+        "_RELEASE": release_metadata_from_env({}),
+        "_EMBEDDING_PROFILE": default_embedding_profile(),
         "connect_to_postgres": lambda: connection,
         "_resolve_caller_id": resolve_caller_id,
         "_resolve_authorized_scope": resolve_authorized_scope,
@@ -364,7 +450,8 @@ def _route_harness(main_tree, connection, verifier_reply="supported", kb_entries
 
 
 def _call_without_event_loop(coroutine):
-    """ask_question awaits nothing, so one send() runs it to its return."""
+    """ask_question's awaits (admission, the model snapshot) are stubbed as
+    coroutines that never suspend, so one send() runs it to its return."""
     try:
         coroutine.send(None)
     except StopIteration as finished:
@@ -388,12 +475,14 @@ def _stream_ask(
         selected_text="",
         auth_token=auth_token,
         model="local-test-model",
+        model_profile_id=None,
         mode=mode,
     )
     response = _call_without_event_loop(namespace["ask_question"](request))
     assert response.media_type == STREAM_MEDIA_TYPE
+    assert calls.admitted == [1] and calls.released == [], "one admission; the response owns the ticket"
 
-    payload = "".join(response.content)
+    payload = "".join(response.content(_HarnessJob()))
     decoder = EventStreamDecoder()
     events = decoder.feed(payload) + decoder.close()
     assert decoder.malformed_lines == 0, "every emitted line must parse as an event"
@@ -856,15 +945,23 @@ def test_the_runtime_claim_verifier_is_local_only(main_tree):
     ]
 
 
-def test_the_claim_verifier_sends_temperature_as_an_ollama_option(main_tree):
+def _default_verifier():
+    """The verifier call a shared-control answer's snapshot carries."""
+    return _shared_llama().verifier
+
+
+def test_the_claim_verifier_sends_bounded_native_options(main_tree):
     """Ollama reads runtime generation settings from ``options`` and ignores an
-    unknown top-level ``temperature``, so the deterministic verifier setting
-    must travel there to take effect."""
+    unknown top-level ``temperature``, so the deterministic verifier setting,
+    its context window and its output cap must all travel there. The verifier
+    call is the one the resolved default answer snapshot carries (the Llama
+    control here), never a request value; no think field is sent to it and
+    its own read timeout reaches the transport."""
     namespace, calls = _route_harness(main_tree, _FakeConnection())
     records = CitationRegistry.from_bundle(_evidence_bundle()).records
 
     status = namespace["_ollama_claim_verifier"](
-        "The term is three years [C1].", records, "local-verifier-model"
+        "The term is three years [C1].", records, _default_verifier()
     )
 
     assert status == "supported"
@@ -873,10 +970,10 @@ def test_the_claim_verifier_sends_temperature_as_an_ollama_option(main_tree):
     assert request.endpoint == "/api/generate"
     assert request.stream is False and request.timeout == 30
     assert set(request.payload) == {"model", "prompt", "stream", "options", "keep_alive"}
-    assert request.payload["options"] == {"temperature": 0.0}
-    assert request.payload["model"] == "local-verifier-model"
+    assert request.payload["options"] == {"temperature": 0.0, "num_ctx": 8192, "num_predict": 16}
+    assert request.payload["model"] == "llama3.1:8b"
     assert request.payload["stream"] is False
-    assert request.payload["keep_alive"] == "30m"
+    assert request.payload["keep_alive"] == "5m"
     assert "[C1] The agreement term is three years" in request.payload["prompt"]
 
 
@@ -888,7 +985,9 @@ _VERIFIED_CLAIM = "The term is three years [C1]."
 def _verifier_result(main_tree, reply):
     namespace, _ = _route_harness(main_tree, _FakeConnection(), reply)
     records = CitationRegistry.from_bundle(_evidence_bundle()).records
-    return namespace["_ollama_claim_verifier"](_VERIFIED_CLAIM, records, "local-verifier-model")
+    return namespace["_ollama_claim_verifier"](
+        _VERIFIED_CLAIM, records, _default_verifier()
+    )
 
 
 def _streamed_claims(main_tree, reply):
@@ -960,6 +1059,56 @@ def test_a_negative_ambiguous_or_malformed_reply_never_yields_a_supported_claim(
     assert [(claim["status"], claim["reason"]) for claim in claims] == [
         ("unverified", "verifier_malformed")
     ]
+
+
+# --- the verifier's reply must also be a FINISHED generation ----------------
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"response": "supported", "done_reason": "stop"},
+        {"response": "supported", "done": False, "done_reason": "stop"},
+        {"response": "supported", "done": True},
+        {"response": "supported", "done": True, "done_reason": "load"},
+        {"response": "supported", "done": True, "done_reason": "length"},
+        {"response": "supported", "done": True, "done_reason": "something_new"},
+    ],
+    ids=["done-missing", "done-false", "reason-missing", "reason-load", "reason-length", "reason-unknown"],
+)
+def test_an_unfinished_verifier_reply_is_malformed_and_never_decides_the_answer(main_tree, body):
+    assert _verifier_result(main_tree, body) is None, "a status word alone is not enough"
+
+    connection = _FakeConnection()
+    _, events, calls = _stream_ask(main_tree, connection, verifier_reply=body)
+
+    [verification] = [event for event in events if event["type"] == "verification"]
+    assert [(claim["status"], claim["reason"]) for claim in verification["claims"]] == [
+        ("unverified", "verifier_malformed")
+    ]
+    assert len(_verifier_calls(calls)) == 1
+    assert [event["entry_id"] for event in events if event["type"] == "entry_id"] == [4242]
+    assert "commit" in connection.steps, "the completed answer is still saved"
+    assert events[-1] == {"type": "done", "ok": True}
+
+
+def test_a_verifier_model_error_is_unavailable_whatever_its_completion_fields(main_tree):
+    body = {
+        "error": "SECRET-VERIFIER-ERROR at /srv/models", "response": "supported",
+        "done": True, "done_reason": "stop",
+    }
+    with pytest.raises(RuntimeError) as excinfo:
+        _verifier_result(main_tree, body)
+    assert "SECRET-VERIFIER-ERROR" not in str(excinfo.value)
+
+    payload, events, _ = _stream_ask(main_tree, _FakeConnection(), verifier_reply=body)
+
+    [verification] = [event for event in events if event["type"] == "verification"]
+    assert [(claim["status"], claim["reason"]) for claim in verification["claims"]] == [
+        ("unverified", "verifier_unavailable")
+    ]
+    assert "SECRET-VERIFIER-ERROR" not in payload and "/srv/models" not in payload
+    assert events[-1] == {"type": "done", "ok": True}
 
 
 # --- answer modes: what the caller renders decides what is graded -----------
@@ -1409,3 +1558,74 @@ def test_public_citation_payloads_never_label_a_chunk():
     assert citation["locator"]["label"] == "Relevant passage"
     assert "chunk 4" not in json.dumps(citation)
     assert "chunk" not in citation["display_label"].lower()
+
+
+# --- the owned answer job: abandonment, budget and refused dispatch ------------------
+
+
+class _AbandonAfterGeneration(_HarnessJob):
+    """Delivery is abandoned once the model's stream was fully read."""
+
+    def __init__(self):
+        self.observed = []
+
+    @property
+    def abandoned(self):
+        return bool(self.observed)
+
+    def observed_stream(self, stream):
+        self.observed.append(stream.done_reason)
+        return True
+
+    def begin_persistence(self):
+        raise AssertionError("no INSERT is begun after known abandonment")
+
+
+def _drive(main_tree, connection, job, *, post_ollama=None):
+    namespace, calls = _route_harness(main_tree, connection)
+    if post_ollama is not None:
+        namespace["post_ollama"] = post_ollama
+    request = SimpleNamespace(question="How long is the agreement term?", selected_text="", auth_token=None,
+                              model=None, model_profile_id=None, mode="document_qa")
+    response = _call_without_event_loop(namespace["ask_question"](request))
+    payload = "".join(response.content(job))
+    decoder = EventStreamDecoder()
+    return decoder.feed(payload) + decoder.close(), calls
+
+
+def test_an_abandoned_answer_drains_its_stream_then_verifies_and_saves_nothing(main_tree):
+    connection = _FakeConnection()
+    job = _AbandonAfterGeneration()
+    events, calls = _drive(main_tree, connection, job)
+    assert job.observed == ["stop"], "the stream was read to its terminal record"
+    assert [call.stream for call in calls.ollama] == [True], "no verifier call after abandonment"
+    assert connection.steps == [], "no INSERT was begun"
+    assert not [e for e in events if e["type"] in ("verification", "entry_id", "done")]
+
+
+def test_a_spent_budget_before_dispatch_sends_nothing_and_ends_not_ok(main_tree):
+    job = _HarnessJob()
+    job.expired = True
+    connection = _FakeConnection()
+    events, calls = _drive(main_tree, connection, job)
+    assert calls.ollama == [] and connection.steps == []
+    assert events[-2:] == [{"type": "error", **ANSWER_TIMEOUT_ERROR}, {"type": "done", "ok": False}]
+
+
+def test_a_refused_dispatch_is_reported_as_not_sent_and_ends_not_ok(main_tree):
+    def refuse(endpoint, payload, *, stream=False, timeout=60):
+        raise DispatchRefused("no admitted job may dispatch")
+
+    connection = _FakeConnection()
+    events, _ = _drive(main_tree, connection, _HarnessJob(), post_ollama=refuse)
+    assert events[-2:] == [{"type": "error", **NOT_DISPATCHED_ERROR}, {"type": "done", "ok": False}]
+    assert connection.steps == []
+
+
+def test_a_per_request_model_override_is_refused_before_identity_or_admission(main_tree):
+    namespace, calls = _route_harness(main_tree, _FakeConnection())
+    request = SimpleNamespace(question="q", selected_text="", auth_token="tok", model=None,
+                              model_profile_id="llama_control", mode="document_qa")
+    with pytest.raises(namespace["HTTPException"]):
+        _call_without_event_loop(namespace["ask_question"](request))
+    assert calls.callers == [] and calls.admitted == [] and calls.ollama == []

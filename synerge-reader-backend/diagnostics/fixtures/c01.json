@@ -1,0 +1,10 @@
+{
+  "fixture_id": "C01",
+  "fixture_revision": 1,
+  "question": "What improvements did Step-Back Prompting report for PaLM-2L on MMLU Physics, MMLU Chemistry, TimeQA, and MuSiQue?",
+  "task_prefix": "none (Research & Q&A mode)",
+  "evidence_supply": "manual_evidence",
+  "prompt_evidence_mode": "hybrid_retrieval",
+  "evidence_file": "stepback_c01_evidence.json",
+  "evidence_text_sha256": "7803ed6a5cacc7692b48ce3ad6b71b4a5c98ce0dd2e20391233568950c5220b1"
+}

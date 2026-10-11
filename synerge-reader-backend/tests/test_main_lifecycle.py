@@ -17,6 +17,8 @@ import importlib.util
 import os
 from pathlib import Path
 import sys
+import threading
+import time
 import uuid
 
 import dotenv
@@ -26,6 +28,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import dbSetup
 from dbSetup import VectorSchemaError
+from generation_admission import CallState
+from helper_jobs import EnqueueOutcome, HelperJobQueue, HelperQueueSettings
 
 
 _MAIN_PATH = Path(__file__).resolve().parents[1] / "main.py"
@@ -207,6 +211,23 @@ def test_vector_schema_error_is_visible_and_blocks_startup(
     )
 
 
+class _RecordingGeneration:
+    """Stands in for main._GENERATION_RUNTIME: records start/stop, starts no
+    thread and opens no database session."""
+
+    def __init__(self, events, start_error=None):
+        self._events = events
+        self._start_error = start_error
+
+    def start(self):
+        self._events.append("generation.start")
+        if self._start_error is not None:
+            raise self._start_error
+
+    def stop(self):
+        self._events.append("generation.stop")
+
+
 def test_initialize_application_uses_resolved_embedding_dimension(
     monkeypatch,
     main_module,
@@ -217,6 +238,9 @@ def test_initialize_application_uses_resolved_embedding_dimension(
         calls.append((args, kwargs))
 
     monkeypatch.setattr(main_module, "init_db", record_init_db)
+    # Initialization ends by starting generation ownership; the recorder keeps
+    # this test from starting a real ownership thread.
+    monkeypatch.setattr(main_module, "_GENERATION_RUNTIME", _RecordingGeneration([]))
 
     main_module._initialize_application()
 
@@ -231,3 +255,199 @@ def test_initialize_application_uses_resolved_embedding_dimension(
         "init_db must receive exactly the dimension resolved by the embedding "
         "profile, so the schema check can never fall back to a hardcoded value"
     )
+
+
+# --- generation ownership's lifecycle ---------------------------------------------------
+
+
+def test_generation_starts_only_after_the_database_and_stops_after_the_queue(monkeypatch, main_module):
+    events = []
+    monkeypatch.setattr(main_module, "init_db", lambda **kwargs: events.append("init_db"))
+    monkeypatch.setattr(main_module, "_GENERATION_RUNTIME", _RecordingGeneration(events))
+    monkeypatch.setattr(main_module, "_INSIGHTS_QUEUE", _RecordingInsightsQueue(events))
+    context = main_module.app.router.lifespan_context(main_module.app)
+
+    _drive_without_event_loop(context.__aenter__())
+    assert events == ["init_db", "generation.start", "queue.start"], (
+        "ownership is sought only after the schema initialized, and never waited for"
+    )
+    _drive_without_event_loop(context.__aexit__(None, None, None))
+    assert events[-2:] == ["queue.close", "generation.stop"], "shutdown fences generation and lets ownership go"
+
+
+def test_a_failed_initialization_never_seeks_generation_ownership(monkeypatch, main_module):
+    events = []
+    monkeypatch.setattr(main_module, "_GENERATION_RUNTIME", _RecordingGeneration(events))
+
+    def fail_init_db(*args, **kwargs):
+        raise VectorSchemaError("document_chunks has an incompatible vector dimension")
+
+    monkeypatch.setattr(main_module, "init_db", fail_init_db)
+    with pytest.raises(VectorSchemaError):
+        _drive_without_event_loop(main_module.app.router.lifespan_context(main_module.app).__aenter__())
+    assert events == []
+
+
+def test_a_generation_start_failure_never_stops_startup_or_leaks_detail(monkeypatch, main_module, capsys):
+    events = []
+    monkeypatch.setattr(main_module, "init_db", lambda **kwargs: None)
+    monkeypatch.setattr(main_module, "_GENERATION_RUNTIME",
+                        _RecordingGeneration(events, start_error=RuntimeError("SECRET-DETAIL")))
+    monkeypatch.setattr(main_module, "_INSIGHTS_QUEUE", _RecordingInsightsQueue(events))
+    context = main_module.app.router.lifespan_context(main_module.app)
+    capsys.readouterr()
+
+    _drive_without_event_loop(context.__aenter__())
+    _drive_without_event_loop(context.__aexit__(None, None, None))
+    assert events == ["generation.start", "queue.start", "queue.close", "generation.stop"]
+    assert "SECRET-DETAIL" not in "".join(capsys.readouterr())
+
+
+def test_importing_main_starts_no_generation_thread_and_opens_no_session(neutral_main_environment, monkeypatch):
+    opened = []
+    monkeypatch.setattr(dbSetup, "connect_to_postgres", lambda: opened.append(1))
+    before = {thread.name for thread in threading.enumerate()}
+    module = _load_isolated_module(_MAIN_PATH, "main")
+    after = {thread.name for thread in threading.enumerate()}
+    assert opened == [] and not {"generation-owner", "generation-coordinator"} & (after - before)
+    assert module._GENERATION_LEDGER.snapshot().admission == "unavailable", "no ownership, no admission"
+
+
+# --- the background-insights queue's lifecycle (B2a-1) -----------------------------
+
+
+class _RecordingInsightsQueue:
+    """Records the lifespan's queue calls; starts no thread."""
+
+    def __init__(self, events, start_result=True, start_error=None):
+        self._events = events
+        self._start_result = start_result
+        self._start_error = start_error
+
+    def start(self):
+        self._events.append("queue.start")
+        if self._start_error is not None:
+            raise self._start_error
+        return self._start_result
+
+    def close(self):
+        self._events.append("queue.close")
+
+
+def test_the_insights_queue_starts_only_after_initialization_and_closes_at_shutdown(monkeypatch, main_module):
+    events = []
+    monkeypatch.setattr(main_module, "_INSIGHTS_QUEUE", _RecordingInsightsQueue(events))
+    monkeypatch.setattr(main_module, "_initialize_application", lambda: events.append("initialize"))
+    context = main_module.app.router.lifespan_context(main_module.app)
+
+    _drive_without_event_loop(context.__aenter__())
+    assert events == ["initialize", "queue.start"], "workers start only after initialization"
+
+    exited = _drive_without_event_loop(context.__aexit__(None, None, None))
+    assert not exited
+    assert events == ["initialize", "queue.start", "queue.close"]
+
+
+def test_a_failed_initialization_starts_no_insights_worker(monkeypatch, main_module, capsys):
+    events = []
+    monkeypatch.setattr(main_module, "_INSIGHTS_QUEUE", _RecordingInsightsQueue(events))
+    error = VectorSchemaError("document_chunks has an incompatible vector dimension")
+
+    def fail_init_db(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(main_module, "init_db", fail_init_db)
+    context = main_module.app.router.lifespan_context(main_module.app)
+
+    with pytest.raises(VectorSchemaError) as excinfo:
+        _drive_without_event_loop(context.__aenter__())
+
+    assert excinfo.value is error
+    assert events == [], "no queue worker may start when initialization failed"
+
+
+@pytest.mark.parametrize("failure", ["returns-false", "raises"])
+def test_an_insights_worker_start_failure_never_stops_startup(monkeypatch, main_module, capsys, failure):
+    events = []
+    queue = (
+        _RecordingInsightsQueue(events, start_result=False)
+        if failure == "returns-false"
+        else _RecordingInsightsQueue(events, start_error=RuntimeError("SECRET-DETAIL no threads"))
+    )
+    monkeypatch.setattr(main_module, "_INSIGHTS_QUEUE", queue)
+    monkeypatch.setattr(main_module, "_initialize_application", lambda: None)
+    context = main_module.app.router.lifespan_context(main_module.app)
+    capsys.readouterr()
+
+    _drive_without_event_loop(context.__aenter__())  # the application still serves
+    exited = _drive_without_event_loop(context.__aexit__(None, None, None))
+
+    assert not exited
+    assert events == ["queue.start", "queue.close"]
+    assert "SECRET-DETAIL" not in "".join(capsys.readouterr())
+
+
+def test_shutdown_closes_the_queue_without_suppressing_an_exception(monkeypatch, main_module):
+    events = []
+    monkeypatch.setattr(main_module, "_INSIGHTS_QUEUE", _RecordingInsightsQueue(events))
+    monkeypatch.setattr(main_module, "_initialize_application", lambda: None)
+    context = main_module.app.router.lifespan_context(main_module.app)
+    _drive_without_event_loop(context.__aenter__())
+    error = RuntimeError("serving failed")
+
+    # contextlib reports "not suppressed" by returning False once the lifespan
+    # re-raised this same exception; a suppressing or replacing lifespan would
+    # return True or raise something else instead.
+    exited = _drive_without_event_loop(context.__aexit__(RuntimeError, error, None))
+
+    assert exited is False, "lifespan shutdown must not suppress the exception"
+    assert events == ["queue.start", "queue.close"], "the queue is still closed"
+
+
+def test_repeated_lifespans_keep_one_queue_and_never_duplicate_a_busy_worker(monkeypatch, main_module):
+    """A second lifespan in the same process reuses the same queue -- its
+    accounting is never cleared -- and does not start a second worker while
+    the first is still running a job. Shutdown never waits for that job."""
+    created = []
+    release = threading.Event()
+    running = threading.Event()
+    finished = []
+
+    def run_job(document_id, call):
+        running.set()
+        assert release.wait(5)
+        call.dispatching()
+        call.observed({"done": True, "done_reason": "stop"})
+
+    def thread_factory(*args, **kwargs):
+        thread = threading.Thread(*args, **kwargs)
+        created.append(thread)
+        return thread
+
+    queue = HelperJobQueue(
+        settings=HelperQueueSettings(workers=1, max_queued=4), run_job=run_job,
+        thread_factory=thread_factory, on_finished=lambda doc, state: finished.append((doc, state)),
+        log=lambda line: None,
+    )
+    monkeypatch.setattr(main_module, "_INSIGHTS_QUEUE", queue)
+    monkeypatch.setattr(main_module, "_initialize_application", lambda: None)
+
+    first = main_module.app.router.lifespan_context(main_module.app)
+    _drive_without_event_loop(first.__aenter__())
+    assert queue.enqueue(5) is EnqueueOutcome.ACCEPTED
+    assert running.wait(5)
+    _drive_without_event_loop(first.__aexit__(None, None, None))  # returns while the job still runs
+    assert queue.enqueue(6) is EnqueueOutcome.UNAVAILABLE
+
+    second = main_module.app.router.lifespan_context(main_module.app)
+    _drive_without_event_loop(second.__aenter__())
+    assert main_module._INSIGHTS_QUEUE is queue
+    assert len(created) == 1, "the busy worker is not duplicated"
+    assert queue.enqueue(5) is EnqueueOutcome.DUPLICATE, "the running id is still accounted for"
+
+    release.set()
+    deadline = time.monotonic() + 5
+    while not finished and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert finished == [(5, CallState.OBSERVED_TERMINAL)]
+    _drive_without_event_loop(second.__aexit__(None, None, None))
