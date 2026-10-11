@@ -37,6 +37,7 @@ from generation_profiles import (
     LLAMA_CONTROL,
     SMOKE_OPTIONS,
     ModelRegistry,
+    Qualification,
     _snapshot,
     default_model_registry,
 )
@@ -84,13 +85,24 @@ _PAYLOAD_SHAS = {
 }
 
 
+# Gemma with only its think:false gate recorded: an explicitly unqualified
+# candidate, so these tests do not depend on the released qualification.
+_UNQUALIFIED_GEMMA = Qualification(think_false_verified=True, combined_capacity_verified=False,
+                                   quality_verified=False, evidence_ref="synthetic unqualified candidate")
+
+
+def _synthetic_profile(profile):
+    fields = {"expected_digest": _SYNTHETIC_DIGESTS[profile.model_tag]}
+    if profile.profile_id == GEMMA_CANDIDATE:
+        fields["qualification"] = _UNQUALIFIED_GEMMA
+    return dataclasses.replace(profile, **fields)
+
+
 def _synthetic_registry():
-    """The production profiles with synthetic expected digests."""
+    """The production profiles with synthetic expected digests; Gemma unqualified."""
     registry = default_model_registry()
     return ModelRegistry(
-        profiles=tuple(
-            dataclasses.replace(p, expected_digest=_SYNTHETIC_DIGESTS[p.model_tag]) for p in registry.profiles
-        ),
+        profiles=tuple(_synthetic_profile(p) for p in registry.profiles),
         default_profile_id=LLAMA_CONTROL,
     )
 
@@ -871,7 +883,8 @@ def test_identity_and_qualification_flags_are_unchanged(tmp_path):
     run = _live(tmp_path, FakeOllama())
     after = default_model_registry()
     assert before == after
-    gemma = after.get(GEMMA_CANDIDATE)
+    # The run used the explicitly unqualified candidate; it stays unqualified.
+    gemma = _synthetic_registry().get(GEMMA_CANDIDATE)
     assert (gemma.selectable, gemma.requires_qualification) == (False, True)
     assert run.summary["profile"] == {
         "profile_id": GEMMA_CANDIDATE, "model_tag": "gemma4:31b", "production_selectable": False,

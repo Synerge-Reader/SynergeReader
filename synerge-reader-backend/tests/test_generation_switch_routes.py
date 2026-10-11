@@ -6,7 +6,8 @@ the Ollama HTTP transport (``requests.post``), the persisted selection store
 (in memory, with the PostgreSQL store's compare-and-set rules) and the
 read-only inventory and loaded-model probes are in-memory doubles. No
 database, model, network or subprocess is reached. The registry is SYNTHETIC:
-Gemma's qualification gates are set here for testing only.
+Gemma's qualification gates are set here for testing only, except where a test
+names the production registry.
 
 What these prove: the admin generation routes authorize server-side -- from
 the Authorization header, with the existing admin lookup -- before any
@@ -76,12 +77,12 @@ _USERS = {"tok-admin": ("admin-id", 1), "tok-alice": ("alice-id", 0)}
 _DOCUMENT = (10, "lease.txt", "alice-id", "The lease term is two years.")
 
 
-def _registry():
+def _registry(qualified=True):
     base = default_model_registry()
     gemma = dataclasses.replace(
         base.get(GEMMA_CANDIDATE), expected_digest=SYNTHETIC_GEMMA_DIGEST,
-        qualification=Qualification(think_false_verified=True, combined_capacity_verified=True,
-                                    quality_verified=True, evidence_ref="synthetic test identity"),
+        qualification=Qualification(think_false_verified=True, combined_capacity_verified=qualified,
+                                    quality_verified=qualified, evidence_ref="synthetic test identity"),
     )
     return ModelRegistry(profiles=(base.get(LLAMA_CONTROL), gemma), default_profile_id=LLAMA_CONTROL)
 
@@ -507,9 +508,12 @@ def test_an_unknown_or_already_active_profile_is_refused(env, target, status_cod
 
 
 def test_an_unqualified_profile_is_refused_and_a_mismatched_identity_fails_without_fallback(env, monkeypatch):
-    monkeypatch.setattr(env.main, "_MODEL_REGISTRY", default_model_registry())  # production: Gemma unqualified
+    monkeypatch.setattr(env.main, "_MODEL_REGISTRY", _registry(qualified=False))
     assert _admin("/admin/generation/select", env, "post", json={"profile_id": GEMMA_CANDIDATE}).status_code == 409
-    monkeypatch.setattr(env.main, "_MODEL_REGISTRY", _registry())
+    # The released production Gemma is eligible, but only with its pinned identity.
+    monkeypatch.setattr(env.main, "_MODEL_REGISTRY", default_model_registry())
+    assert {c["profile_id"]: c["eligible"] for c in _status(env)["choices"]} == {LLAMA_CONTROL: True,
+                                                                                  GEMMA_CANDIDATE: True}
     env.probes.digests["gemma4:31b"] = "77" * 32
     assert _admin("/admin/generation/select", env, "post", json={"profile_id": GEMMA_CANDIDATE}).status_code == 202
     _wait_for(lambda: _status(env)["last_switch"] is not None)

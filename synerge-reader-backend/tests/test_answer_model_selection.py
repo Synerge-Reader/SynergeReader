@@ -344,7 +344,7 @@ def client(monkeypatch, main_module, db, ollama, inventory):
 
 def _qualified_gemma_registry(default=LLAMA_CONTROL):
     """A synthetic registry in which Gemma's gates are all recorded, pinned to
-    a synthetic digest. Production Gemma stays unqualified."""
+    a synthetic digest instead of the production pin."""
     base = default_model_registry()
     gemma = dataclasses.replace(
         base.get(GEMMA_CANDIDATE),
@@ -359,6 +359,25 @@ def _qualified_gemma_registry(default=LLAMA_CONTROL):
     return ModelRegistry(
         profiles=(base.get(LLAMA_CONTROL), gemma),
         default_profile_id=default,
+    )
+
+
+def _unqualified_gemma_registry():
+    """The synthetic registry with Gemma's capacity and quality gates
+    unrecorded: an explicitly ineligible candidate."""
+    base = _qualified_gemma_registry()
+    gemma = dataclasses.replace(
+        base.get(GEMMA_CANDIDATE),
+        qualification=Qualification(
+            think_false_verified=True,
+            combined_capacity_verified=False,
+            quality_verified=False,
+            evidence_ref="synthetic unqualified candidate",
+        ),
+    )
+    return ModelRegistry(
+        profiles=(base.get(LLAMA_CONTROL), gemma),
+        default_profile_id=LLAMA_CONTROL,
     )
 
 
@@ -607,8 +626,8 @@ def test_a_gemma_answer_keeps_its_verifier_if_the_registry_changes_mid_stream(
     real_scope = main_module._resolve_authorized_scope
 
     def scope_then_swap(token):
-        # The production registry, in which Gemma is unqualified again.
-        monkeypatch.setattr(main_module, "_MODEL_REGISTRY", default_model_registry())
+        # A registry in which Gemma is unqualified again.
+        monkeypatch.setattr(main_module, "_MODEL_REGISTRY", _unqualified_gemma_registry())
         return real_scope(token)
 
     monkeypatch.setattr(main_module, "_resolve_authorized_scope", scope_then_swap)
@@ -1458,8 +1477,9 @@ def test_an_unusable_candidate_identity_stops_both_helpers_before_generation(
 
 
 def test_an_ineligible_selection_stops_both_helpers_without_any_lookup(monkeypatch, main_module, inventory, capsys):
-    # The persisted selection names Gemma, but this process's registry has the
-    # production (unqualified) Gemma: no snapshot, and no fallback model.
+    # The persisted selection names Gemma, but this process's registry has an
+    # unqualified Gemma: no snapshot, and no fallback model.
+    monkeypatch.setattr(main_module, "_MODEL_REGISTRY", _unqualified_gemma_registry())
     _ready_generation(monkeypatch, main_module, GEMMA_CANDIDATE, 3)
     table = _InsightsTable({10: _EXISTING_INSIGHT})
     monkeypatch.setattr(main_module, "connect_to_postgres", table.connect)

@@ -62,13 +62,13 @@ _WAIT = 5.0
 _TERMINAL = {"response": "x", "done": True, "done_reason": "stop"}
 
 
-def _registry():
+def _registry(qualified=True):
     base = default_model_registry()
     gemma = dataclasses.replace(
         base.get(GEMMA_CANDIDATE),
         expected_digest=SYNTHETIC_GEMMA_DIGEST,
-        qualification=Qualification(think_false_verified=True, combined_capacity_verified=True,
-                                    quality_verified=True, evidence_ref="synthetic test identity"),
+        qualification=Qualification(think_false_verified=True, combined_capacity_verified=qualified,
+                                    quality_verified=qualified, evidence_ref="synthetic test identity"),
     )
     return ModelRegistry(profiles=(base.get(LLAMA_CONTROL), gemma), default_profile_id=LLAMA_CONTROL)
 
@@ -436,9 +436,9 @@ def test_switch_requests_are_validated_in_memory(stop_all):
     stop_all(env)
     assert env.coordinator.request_switch("qwen3_latest").status_code == 400
     assert env.coordinator.request_switch(LLAMA_CONTROL).status_code == 409, "already active"
-    production = default_model_registry()
-    env.coordinator._registry = lambda: production
-    assert env.coordinator.request_switch(GEMMA_CANDIDATE).status_code == 409, "the production Gemma is unqualified"
+    unqualified = _registry(qualified=False)
+    env.coordinator._registry = lambda: unqualified
+    assert env.coordinator.request_switch(GEMMA_CANDIDATE).status_code == 409, "an unqualified Gemma is refused"
     env.coordinator._registry = _registry
     held = _setup()
     stop_all(held)

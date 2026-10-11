@@ -29,7 +29,13 @@ from diagnostics import gemma_capacity_probe as probe  # noqa: E402
 from diagnostics import gemma_qualification as gq  # noqa: E402
 from diagnostics import generation_diagnostic as base  # noqa: E402
 from generation_admission import CallState  # noqa: E402
-from generation_profiles import GEMMA_CANDIDATE, LLAMA_CONTROL, ModelRegistry, default_model_registry  # noqa: E402
+from generation_profiles import (  # noqa: E402
+    GEMMA_CANDIDATE,
+    LLAMA_CONTROL,
+    ModelRegistry,
+    Qualification,
+    default_model_registry,
+)
 
 _PROBE_PATH = Path(probe.__file__)
 SYNTHETIC_GEMMA = "9a" * 32
@@ -48,10 +54,23 @@ _C05_ANSWER = "IRCoT stops on the answer-is string or a step limit [C1]. It used
 _THINKING = "PRIVATE-PROBE-THINKING"
 
 
+# Gemma with only its think:false gate recorded: an explicitly unqualified
+# candidate, so these tests do not depend on the released qualification.
+_UNQUALIFIED_GEMMA = Qualification(think_false_verified=True, combined_capacity_verified=False,
+                                   quality_verified=False, evidence_ref="synthetic unqualified candidate")
+
+
+def _synthetic_profile(profile):
+    fields = {"expected_digest": _DIGESTS[profile.model_tag]}
+    if profile.profile_id == GEMMA_CANDIDATE:
+        fields["qualification"] = _UNQUALIFIED_GEMMA
+    return dataclasses.replace(profile, **fields)
+
+
 def _synthetic_registry():
     registry = default_model_registry()
     return ModelRegistry(
-        profiles=tuple(dataclasses.replace(p, expected_digest=_DIGESTS[p.model_tag]) for p in registry.profiles),
+        profiles=tuple(_synthetic_profile(p) for p in registry.profiles),
         default_profile_id=LLAMA_CONTROL,
     )
 
@@ -588,7 +607,14 @@ def test_the_dry_run_reports_the_plan_without_network(monkeypatch):
     assert report["max_concurrent_generation_calls"] == 2
     assert report["smoke_options"] == {"temperature": 0.2, "num_ctx": 8192, "num_predict": 32}
     assert {lane["id"]: lane["answer_payload_sha256"] for lane in report["lanes"]} == _PAYLOAD_SHAS
-    assert report["profile"]["production_selectable"] is False
+    assert report["profile"]["production_selectable"] is True, "the released Gemma profile"
+    # An unqualified candidate is reported as such, and the plan is unchanged.
+    out = io.StringIO()
+    assert probe.main(["--dry-run", "--embedding-model", EMBED_MODEL], stdout=out,
+                      registry_factory=_synthetic_registry) == 0
+    unqualified = json.loads(out.getvalue())
+    assert unqualified["profile"]["production_selectable"] is False
+    assert {lane["id"]: lane["answer_payload_sha256"] for lane in unqualified["lanes"]} == _PAYLOAD_SHAS
 
 
 @pytest.mark.parametrize(

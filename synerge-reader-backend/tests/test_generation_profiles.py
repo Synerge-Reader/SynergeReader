@@ -74,6 +74,12 @@ def _gemma(**overrides):
     return dataclasses.replace(base, **fields)
 
 
+def _unqualified_gemma(**overrides):
+    """Gemma with only its think:false gate recorded: an explicitly unqualified
+    candidate, independent of the released production qualification."""
+    return _gemma(qualification=_evidence(combined_capacity_verified=False, quality_verified=False), **overrides)
+
+
 def _registry(gemma, default=LLAMA_CONTROL):
     return ModelRegistry(
         profiles=(default_model_registry().get(LLAMA_CONTROL), gemma),
@@ -118,12 +124,16 @@ def test_production_qualification_policy_is_explicit_and_records_only_evidenced_
     assert llama.requires_qualification is False and llama.qualification is None
     assert llama.think is None, "Llama never receives a think field"
 
-    assert gemma.requires_qualification is True
+    assert gemma.requires_qualification is True, "qualified, but every job still checks its identity"
     assert gemma.qualification.think_false_verified is True
-    assert gemma.qualification.combined_capacity_verified is False
-    assert gemma.qualification.quality_verified is False
+    assert gemma.qualification.combined_capacity_verified is True
+    assert gemma.qualification.quality_verified is True
     assert gemma.think is False, "think:false is evidenced, so it is the Gemma policy"
-    assert not gemma.selectable and not registry.is_selectable(gemma)
+    assert gemma.selectable and registry.is_selectable(gemma)
+    # The recorded gates name a reviewable release record kept in the repository.
+    record = "diagnostics/GEMMA_RELEASE_QUALIFICATION_20261010.md"
+    assert record in gemma.qualification.evidence_ref
+    assert os.path.isfile(os.path.join(os.path.dirname(__file__), "..", *record.split("/")))
 
 
 def test_answer_profiles_request_the_reviewed_settings_and_timeouts():
@@ -145,12 +155,48 @@ def test_answer_profiles_request_the_reviewed_settings_and_timeouts():
     assert (gemma.verifier_read_timeout_s, gemma.helper_read_timeout_s) == (150.0, 150.0)
 
 
-def test_production_gemma_cannot_be_the_shared_selection():
+def test_production_gemma_is_selectable_only_with_its_pinned_identity():
     registry = default_model_registry()
-    with pytest.raises(ProfileNotQualifiedError):
-        select_shared_profile(registry, GEMMA_CANDIDATE)
-    with pytest.raises(ProfileNotQualifiedError):
-        shared_generation_snapshot(registry.get(GEMMA_CANDIDATE), epoch=1, observed_digest=OPERATOR_GEMMA_DIGEST)
+    gemma = select_shared_profile(registry, GEMMA_CANDIDATE)
+    lookups = []
+    snapshot = _shared(registry, GEMMA_CANDIDATE, epoch=2,
+                       lookup=lambda tag: lookups.append(tag) or OPERATOR_GEMMA_DIGEST)
+    assert lookups == ["gemma4:31b"], "the exact tag, read once for this job"
+    assert (snapshot.profile_id, snapshot.selection, snapshot.selection_epoch) == (GEMMA_CANDIDATE, SHARED_SELECTION, 2)
+    assert snapshot.expected_digest == snapshot.observed_digest == OPERATOR_GEMMA_DIGEST
+    for observed in (None, OTHER_DIGEST):
+        with pytest.raises(ModelIdentityUnavailableError):
+            shared_generation_snapshot(gemma, epoch=1, observed_digest=observed)
+
+
+def test_production_gemma_answer_verifier_and_helpers_keep_the_reviewed_settings():
+    snapshot = _shared(default_model_registry(), GEMMA_CANDIDATE, lookup=lambda tag: OPERATOR_GEMMA_DIGEST)
+    answer_options = {"temperature": 0.2, "num_ctx": 8192, "num_predict": 1200}
+    assert snapshot.ollama_payload("p") == {
+        "model": "gemma4:31b", "prompt": "p", "stream": True,
+        "options": answer_options, "keep_alive": "5m", "think": False,
+    }
+    assert snapshot.requested_settings() == {"options": answer_options, "keep_alive": "5m", "think": False}
+    assert snapshot.public_metadata() == {"profile_id": GEMMA_CANDIDATE, "model": "gemma4:31b"}
+    assert snapshot.answer_read_timeout_s == 150.0
+    # The answer's verifier is the same model and identity with bounded options.
+    verifier = snapshot.verifier
+    assert verifier.ollama_payload("p") == {
+        "model": "gemma4:31b", "prompt": "p", "stream": False,
+        "options": {"temperature": 0.0, "num_ctx": 8192, "num_predict": 16},
+        "keep_alive": "5m", "think": False,
+    }
+    assert (verifier.profile_id, verifier.read_timeout_s) == (GEMMA_CANDIDATE, 150.0)
+    assert verifier.expected_digest == verifier.observed_digest == OPERATOR_GEMMA_DIGEST
+    for temperature in (0.2, 0.1):
+        helper = snapshot.helper_call(temperature)
+        assert helper.ollama_payload("p") == {
+            "model": "gemma4:31b", "prompt": "p", "stream": False,
+            "options": {"temperature": temperature, "num_ctx": 8192, "num_predict": 1200},
+            "keep_alive": "5m", "think": False,
+        }
+        assert (helper.profile_id, helper.read_timeout_s) == (GEMMA_CANDIDATE, 150.0)
+        assert helper.expected_digest == helper.observed_digest == OPERATOR_GEMMA_DIGEST
 
 
 def test_verifier_and_helpers_are_bounded_llama_calls_without_think():
@@ -315,7 +361,7 @@ def test_the_registry_has_no_independent_verifier_or_helper_selector():
         _evidence(quality_verified=False),
         _evidence(combined_capacity_verified=False, quality_verified=False),
     ],
-    ids=["no-evidence", "no-capacity", "no-quality", "production-shape"],
+    ids=["no-evidence", "no-capacity", "no-quality", "pre-release-shape"],
 )
 def test_an_incomplete_candidate_cannot_be_constructed_as_default(qualification):
     think = False if qualification is not None else None
@@ -323,17 +369,20 @@ def test_an_incomplete_candidate_cannot_be_constructed_as_default(qualification)
         _registry(_gemma(qualification=qualification, think=think), default=GEMMA_CANDIDATE)
 
 
-def test_the_production_gemma_cannot_be_made_default():
+def test_the_production_default_stays_llama_and_an_unqualified_gemma_cannot_be_default():
+    """Qualification makes Gemma eligible for the administrator's switch; it
+    does not make Gemma the default that seeds a new shared selection."""
     registry = default_model_registry()
+    assert registry.default_profile_id == LLAMA_CONTROL and registry.default.profile_id == LLAMA_CONTROL
     with pytest.raises(GenerationProfileError):
         ModelRegistry(
-            profiles=registry.profiles,
+            profiles=(registry.get(LLAMA_CONTROL), _unqualified_gemma()),
             default_profile_id=GEMMA_CANDIDATE,
         )
 
 
 def test_an_unqualified_selection_is_refused_with_no_fallback():
-    registry = _registry(_gemma())
+    registry = _registry(_unqualified_gemma())
     with pytest.raises(ProfileNotQualifiedError):
         select_shared_profile(registry, GEMMA_CANDIDATE)
     # Even handed the profile directly, an unqualified one yields no snapshot.
@@ -403,7 +452,7 @@ def test_a_qualified_candidate_needs_its_exact_digest_read_once():
     assert snapshot.verifier.observed_digest == SYNTHETIC_DIGEST
 
 
-@pytest.mark.parametrize(
+_WRONG_IDENTITY_LOOKUPS = pytest.mark.parametrize(
     "lookup, error",
     [
         (lambda tag: None, ModelIdentityMismatchError),
@@ -413,9 +462,20 @@ def test_a_qualified_candidate_needs_its_exact_digest_read_once():
     ],
     ids=["absent", "changed", "malformed", "unreadable"],
 )
+
+
+@_WRONG_IDENTITY_LOOKUPS
 def test_a_qualified_selection_with_the_wrong_identity_fails_closed(lookup, error):
     with pytest.raises(error) as excinfo:
         _shared(_qualified_registry(), GEMMA_CANDIDATE, lookup=lookup)
+    assert "ollama down" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+
+
+@_WRONG_IDENTITY_LOOKUPS
+def test_production_gemma_with_a_missing_or_mismatched_identity_fails_closed(lookup, error):
+    with pytest.raises(error) as excinfo:
+        _shared(default_model_registry(), GEMMA_CANDIDATE, lookup=lookup)
     assert "ollama down" not in str(excinfo.value)
     assert excinfo.value.__cause__ is None
 

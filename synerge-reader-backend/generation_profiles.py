@@ -95,8 +95,9 @@ ANSWER_KEEP_ALIVE = "5m"
 # 60 s would time out a cold Gemma answer before its first token. 150 s leaves
 # margin for that load plus prompt evaluation. Any Gemma role call can be the
 # one that finds the model cold, so its verifier and helpers get the same
-# provisional 150 s. Gemma remains unqualified: this only removes a
-# guaranteed premature timeout and says nothing about acceptable latency.
+# provisional 150 s. Gemma's later qualification left these values unchanged:
+# they only remove a guaranteed premature timeout and say nothing about
+# acceptable latency.
 LLAMA_ANSWER_READ_TIMEOUT_S = 60.0
 LLAMA_VERIFIER_READ_TIMEOUT_S = 30.0
 LLAMA_HELPER_READ_TIMEOUT_S = 120.0
@@ -615,25 +616,34 @@ class ModelRegistry:
         return profile.selectable
 
 
-# Only the evidenced Gemma result is recorded: think:false accepted, thinking
-# contained, in one bounded smoke. Capacity and quality remain unverified, so
-# the profile stays registered but unselectable.
+# Every Gemma gate is recorded and reviewed: think:false accepted with thinking
+# contained in a bounded smoke; the pinned model resident with the embedder
+# while two overlapping answer-plus-verifier jobs ran inside the application
+# job budget; and six-fixture answer quality, checked against the frozen
+# source excerpts beside a Llama control. Selectable means an
+# administrator MAY switch to it through the coordinator. It changes neither
+# the registry default nor any persisted selection.
 GEMMA_CANDIDATE_EVIDENCE = Qualification(
     think_false_verified=True,
-    combined_capacity_verified=False,
-    quality_verified=False,
+    combined_capacity_verified=True,
+    quality_verified=True,
     evidence_ref=(
-        "Operator-reported bounded smoke on installed gemma4:31b (digest "
-        "6316f0629137b426...ff47e7): native /api/generate, num_ctx 4096, "
-        "num_predict 32, think:false accepted and thinking contained; 102.527 s "
-        "total, 91.783 s load. Combined generator/verifier/embedder capacity, "
-        "answer quality and website latency are not evidenced."
+        "Reviewed release record diagnostics/GEMMA_RELEASE_QUALIFICATION_20261010.md "
+        "for installed gemma4:31b (digest 6316f0629137b426...ff47e7) on Ollama "
+        "0.30.8: capacity probe gcp-40002734529445dea22bc7c110a88d4d (resident "
+        "with mxbai-embed-large:335m; two overlapping C04/C05 answer-plus-verifier "
+        "jobs); quality runs gq-eaec840f08924dd38218e87dedcbea1c (C01-C06) and "
+        "gq-21958b73c99146198dc397fc406af74f (C01/C05 repeat) beside llama_control "
+        "runs gq-0d6f1de739934be0bbc32ff99124b63b and "
+        "gq-db4735babd264d02a1eedfd50ec4f55b; earlier think:false smoke 102.527 s "
+        "total, 91.783 s load. Short frozen-evidence fixtures only: not full-length "
+        "answers, retrieval, upload throughput or website latency."
     ),
 )
 
 
 def default_model_registry() -> ModelRegistry:
-    """The production registry: Llama is the default; Gemma unqualified.
+    """The production registry: Llama is the default; Gemma is qualified.
 
     The default only seeds the shared selection the first time ownership
     creates it; after that the persisted selection decides which profile
