@@ -1,0 +1,9 @@
+**/__pycache__
+**/*.pyc
+.pytest_cache
+tests
+tools
+locks/resolve
+locks/*.json
+models/**/*.partial
+README.md

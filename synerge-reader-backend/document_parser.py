@@ -54,6 +54,10 @@ class ParsedDocument:
     char_count: int = 0
     truncated: bool = False
     warnings: list[str] = field(default_factory=list)
+    # Optional page-coverage summary written by the enhanced extraction path
+    # (which pages were native, OCR'd or table-extracted). None for the
+    # standard parser, so existing callers see no change.
+    extraction_report: Optional[dict] = None
 
     @property
     def text(self) -> str:
@@ -207,6 +211,50 @@ def _extract_pdf(content: bytes, filename: str) -> ParsedDocument:
             char_count=len(text),
             truncated=truncated,
             warnings=["Document truncated to 300,000 characters."] if truncated else [],
+        )
+
+
+def detect_file_type(filename: str, content: bytes) -> str:
+    """Public form of the content-based type detection used by the parser."""
+    return _detect_file_type(filename, content)
+
+
+def extract_pdf_native_pages(content: bytes) -> tuple[int, list[ParsedPage]]:
+    """Native text for EVERY physical page of a PDF, empty pages included.
+
+    Used by the enhanced extraction path to decide which pages need OCR or
+    table extraction. Applies the same size and page limits as the standard
+    parser and raises the same ExtractionError messages; unlike
+    ``_extract_pdf`` it never rejects a PDF for having no text, because that is
+    exactly the case OCR exists for. Page numbers are true 1-based physical
+    page numbers.
+    """
+    if len(content) == 0:
+        raise ExtractionError("Uploaded file is empty.", 422)
+    if len(content) > MAX_FILE_BYTES:
+        raise ExtractionError("File exceeds the 50 MB size limit.", 413)
+    try:
+        import pdfplumber
+    except ImportError as e:
+        raise ExtractionError("PDF processing is not available on the server.", 500) from e
+    try:
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            pdf_pages = pdf.pages
+            if len(pdf_pages) > MAX_PDF_PAGES:
+                raise ExtractionError(
+                    f"PDF exceeds the {MAX_PDF_PAGES}-page limit. Please upload a shorter document.",
+                    422,
+                )
+            pages = [
+                ParsedPage(page_number=i, text=_extract_page_text(page) or "")
+                for i, page in enumerate(pdf_pages, start=1)
+            ]
+            return len(pdf_pages), pages
+    except ExtractionError:
+        raise
+    except Exception:
+        raise ExtractionError(
+            "Failed to extract text from this file. The file may be corrupted.", 422
         )
 
 

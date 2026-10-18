@@ -16,6 +16,12 @@ The binding answer-context priority implemented here, in order:
 3. Authorized hybrid retrieval. Multiple documents, or one document that
    exceeds the complete-document limit.
 
+Retrieved chunks are completed before they are budgeted: a chunk cut part-way
+through a serialized table row gets the rest of that row back from the same
+document's stored text (table_row_completion.py), within its own bound and
+only in room the ranked evidence leaves under the character budget. Ranking,
+the item limit and the character limit are unchanged.
+
 Everything the planner loads from the server is authorization-scoped by the
 caller: the planner is handed an ``AuthorizedScope`` and can only ever see the
 documents inside it. Client-supplied document ids and filenames are treated as
@@ -34,6 +40,16 @@ import re
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
+
+from table_row_completion import (
+    DEFAULT_ROW_COMPLETION_LIMITS,
+    CanonicalText,
+    LineCompletion,
+    RowCompletionLimits,
+    complete_fragment,
+    completed_text,
+    may_hold_table_text,
+)
 
 
 EVIDENCE_CONTRACT_VERSION = "e2.evidence.v1"
@@ -192,6 +208,9 @@ class EvidenceItem:
     combined_score: Optional[float] = None
     truncated: bool = False
     selection_id: Optional[str] = None
+    # Table-line text added to ``text`` from the same document's stored text,
+    # one record per completed side; empty when ``text`` is the chunk as stored.
+    row_completion: tuple[LineCompletion, ...] = ()
 
     @property
     def dedupe_key(self) -> tuple:
@@ -227,6 +246,7 @@ class EvidenceItem:
             "combined_score": self.combined_score,
             "truncated": self.truncated,
             "selection_id": self.selection_id,
+            "row_completion": [line.to_dict() for line in self.row_completion],
         }
 
 
@@ -402,6 +422,9 @@ class AnswerEvidencePlanner:
     # degraded into "no evidence" -- an embedding-provider outage, for example,
     # is a service failure the route reports as such, not an empty result.
     propagate_exceptions: tuple = ()
+    # Bounds for completing table rows cut at a retrieved chunk's start or end
+    # (table_row_completion.py). None turns the completion off.
+    row_completion_limits: Optional[RowCompletionLimits] = DEFAULT_ROW_COMPLETION_LIMITS
 
     # -- priority level 1 ----------------------------------------------------
     def _selected_text_items(
@@ -451,11 +474,12 @@ class AnswerEvidencePlanner:
         self,
         scoped: Sequence[AuthorizedDocument],
         warnings: list[str],
+        load: Callable[[Any], Optional[str]],
     ) -> Optional[list[EvidenceItem]]:
         if len(scoped) != 1:
             return None
         document = scoped[0]
-        text = self.load_document_text(document.document_id) or ""
+        text = load(document.document_id) or ""
         if not text.strip():
             return None
         if len(text) > self.limits.complete_document_chars:
@@ -505,6 +529,81 @@ class AnswerEvidencePlanner:
             authorized.append(replace(item, filename=item.filename or document.filename))
         return authorized
 
+    # -- between ranking and budgeting ---------------------------------------
+    def _complete_table_rows(
+        self,
+        items: Sequence[EvidenceItem],
+        scoped: Sequence[AuthorizedDocument],
+        texts: "_DocumentTexts",
+    ) -> list[EvidenceItem]:
+        """Ranked chunks, with any table row cut at their start or end completed.
+
+        Only the items the item limit will keep are considered, in rank order.
+        A completion comes from the stored text of the chunk's own document,
+        loaded by id -- never by filename -- through the planner's owner-scoped
+        loader, and only for a document inside the requested, authorized scope.
+
+        A document's chunks are checked when this plan already holds its text
+        (one document in scope: the complete-document check read it) or when
+        one of its ranked chunks carries table structure. Ordinary text alone
+        never causes a read. So in a multi-document scope, a chunk holding only
+        the last value of a row followed by prose is completed only when
+        another ranked chunk of its document shows table structure.
+
+        Completions spend only the room the ranked items leave under the
+        character budget, within their own cap, so they never displace,
+        reorder or cut ranked evidence. A chunk that cannot be matched exactly
+        stays as retrieved.
+        """
+        limits = self.row_completion_limits
+        if limits is None:
+            return list(items)
+        allowed = {document.document_id for document in scoped}
+        ranked = items[: self.limits.max_evidence_items]
+        wanted = {
+            item.document_id
+            for item in ranked
+            if item.source_type == "document_chunk"
+            and item.document_id in allowed
+            and (texts.holds(item.document_id) or may_hold_table_text(item.text))
+        }
+        room = self.limits.total_evidence_chars - sum(len(item.text or "") for item in ranked)
+        allowance = max(0, min(limits.max_total_chars, room))
+        sources: dict[Any, Optional[CanonicalText]] = {}
+        completed: list[EvidenceItem] = []
+        for item in ranked:
+            if (
+                allowance <= 0
+                or item.source_type != "document_chunk"
+                or item.document_id not in wanted
+            ):
+                completed.append(item)
+                continue
+            if item.document_id not in sources:
+                sources[item.document_id] = _stored_table_text(texts, item.document_id)
+            source = sources[item.document_id]
+            if source is None:
+                completed.append(item)
+                continue
+            result = complete_fragment(
+                source, item.text, item.page_start, item.page_end, limits.max_side_chars
+            )
+            granted: list[LineCompletion] = []
+            for line in result.lines:
+                if line.cost <= allowance:
+                    allowance -= line.cost
+                    granted.append(line)
+            if granted:
+                item = replace(
+                    item,
+                    text=completed_text(item.text, granted),
+                    row_completion=tuple(granted),
+                )
+            completed.append(item)
+        # Items past the item limit are passed through untouched; the budget drops them.
+        completed.extend(items[self.limits.max_evidence_items:])
+        return completed
+
     # -- entry point ---------------------------------------------------------
     def plan(
         self,
@@ -535,8 +634,12 @@ class AnswerEvidencePlanner:
                 message=INSUFFICIENT_EVIDENCE_MESSAGE,
             )
 
+        # One fetch per document per plan, shared by the complete-document
+        # check and table-row completion.
+        texts = _DocumentTexts(self.load_document_text)
+
         # Priority 2: exactly one authorized document that fits, supplied whole.
-        complete = self._complete_document_items(scoped, warnings)
+        complete = self._complete_document_items(scoped, warnings, texts)
         if complete:
             return self._finalize(EvidenceMode.COMPLETE_DOCUMENT, complete, warnings)
 
@@ -548,6 +651,7 @@ class AnswerEvidencePlanner:
                 warnings=tuple(warnings),
                 message=INSUFFICIENT_EVIDENCE_MESSAGE,
             )
+        retrieved = self._complete_table_rows(_dedupe(retrieved), scoped, texts)
         return self._finalize(EvidenceMode.HYBRID_RETRIEVAL, retrieved, warnings)
 
     def _scoped_documents(
@@ -601,3 +705,36 @@ class AnswerEvidencePlanner:
 def _note(warnings: list[str], warning: EvidenceWarning) -> None:
     if warning.value not in warnings:
         warnings.append(warning.value)
+
+
+class _DocumentTexts:
+    """Each document's stored text, fetched through ``load`` at most once per plan."""
+
+    def __init__(self, load: Callable[[Any], Optional[str]]):
+        self._load = load
+        self._texts: dict[Any, Optional[str]] = {}
+
+    def __call__(self, document_id: Any) -> Optional[str]:
+        if document_id not in self._texts:
+            self._texts[document_id] = self._load(document_id)
+        return self._texts[document_id]
+
+    def holds(self, document_id: Any) -> bool:
+        """True when this plan has already fetched the document's text."""
+        return document_id in self._texts
+
+
+def _stored_table_text(
+    load: Callable[[Any], Optional[str]],
+    document_id: Any,
+) -> Optional[CanonicalText]:
+    """One document's stored text, indexed for row completion, or None.
+
+    None when the text cannot be loaded or holds no table line. A failed load
+    only means no completion: the chunk is still evidence exactly as retrieved.
+    """
+    try:
+        text = load(document_id)
+    except Exception:
+        return None
+    return CanonicalText.with_table_lines(text)

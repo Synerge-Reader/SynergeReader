@@ -1,0 +1,24 @@
+[project]
+name = "synergereader-extractor-lock"
+version = "0"
+requires-python = "==3.11.*"
+dependencies = [
+  "docling-slim[convert-core,feat-ocr-tesserocr,format-pdf,models-local]==2.140.0",
+  "docling-ibm-models[opencv-python-headless]==4.0.3",
+  "tesserocr==2.10.0",
+  "pypdfium2==5.9.0",
+  "torch==2.9.1",
+  "torchvision==0.24.1",
+  "fastapi==0.116.2",
+  "starlette==0.48.0",
+  "uvicorn==0.35.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

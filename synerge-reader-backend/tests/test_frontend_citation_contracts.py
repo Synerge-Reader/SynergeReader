@@ -348,10 +348,12 @@ def test_original_file_upload_behaviour_is_unchanged(grid_app_source):
         "// Generate suggested questions",
         "GridApp.jsx",
     )
-    assert 'fd.append("files", file, file.name)' in block, (
+    transport = (_GRID_APP_PATH.parent / "uploadJobs.js").read_text(encoding="utf-8")
+    assert "await uploadAndWait({" in block and "          file,\n" in block
+    assert 'fd.append("files", file, file.name)' in transport, (
         "E1b's original-file transport must survive this milestone"
     )
-    assert "new Blob(" not in block
+    assert "new Blob(" not in block and "new Blob(" not in transport
     assert 'result.status !== "indexed"' in block
     assert "result?.error_message" in block
 
