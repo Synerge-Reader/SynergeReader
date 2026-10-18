@@ -27,8 +27,9 @@ google-auth-oauthlib==1.2.0
 PyJWT==2.10.1
 psycopg2-binary==2.9.9
 pgvector==0.4.2
-resend
+resend==2.49.1
 pdfplumber
+Pillow==12.3.0
 python-docx
 lxml==6.1.1
 email-validator==2.3.0
