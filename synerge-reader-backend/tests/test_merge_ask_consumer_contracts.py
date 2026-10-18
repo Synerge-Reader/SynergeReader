@@ -211,8 +211,10 @@ def test_suggestions_are_scoped_to_the_uploaded_document_under_the_callers_token
     assert "active_document_id: Number.isInteger(documentId) ? documentId : null," in suggestions
     assert "auth_token: token || null," in suggestions
     assert "authToken" not in suggestions, "the caller passes its current token in; none is captured"
+    # docText is the local parse, or the server's text when a scanned PDF has no text layer.
+    assert 'let docText = parsed.text || "";' in src
     assert (
-        'fetchSuggestions(parsed.text.slice(0, 2500), file.name, task?.model || "llama3.1:8b", docId, authToken);'
+        'fetchSuggestions(docText.slice(0, 2500), file.name, task?.model || "llama3.1:8b", docId, authToken);'
         in src
     )
 

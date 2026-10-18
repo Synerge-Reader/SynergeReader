@@ -679,6 +679,7 @@ def test_route_composes_service_with_expected_dependencies(
         "embedding_provider",
         "embedding_profile",
         "dispatch_after_commit",
+        "extractor",
     }, f"unexpected ingestion service composition: {sorted(kwargs)}"
     assert kwargs["connection_factory"] is main_module.connect_to_postgres, (
         "the service must receive connect_to_postgres itself -- it is the only "
@@ -687,6 +688,14 @@ def test_route_composes_service_with_expected_dependencies(
     assert kwargs["embedding_provider"] is main_module._EMBEDDING_PROVIDER
     assert kwargs["embedding_profile"] is main_module._EMBEDDING_PROFILE
     assert kwargs["dispatch_after_commit"] is main_module._dispatch_upload_followups
+    # LIVE-EXTRACTION: the enhanced PDF extractor, in the default standard
+    # mode, and with no worker configured in tests (so no network client).
+    from enhanced_extraction import EnhancedPdfExtractor
+
+    extractor = kwargs["extractor"]
+    assert isinstance(extractor, EnhancedPdfExtractor)
+    assert extractor.mode == "standard"
+    assert extractor.client is None
 
 
 @pytest.fixture(scope="module")
@@ -733,6 +742,7 @@ def test_build_ingestion_service_binds_the_expected_names(main_tree):
         "embedding_provider",
         "embedding_profile",
         "dispatch_after_commit",
+        "extractor",
     }
     expected = {
         "connection_factory": "connect_to_postgres",
@@ -745,6 +755,13 @@ def test_build_ingestion_service_binds_the_expected_names(main_tree):
         assert isinstance(value, ast.Name) and value.id == name, (
             f"{keyword}= must be the bare name {name}"
         )
+    # LIVE-EXTRACTION: the extractor is built per request for the caller's mode.
+    extractor = kwargs["extractor"]
+    assert (
+        isinstance(extractor, ast.Call)
+        and isinstance(extractor.func, ast.Name)
+        and extractor.func.id == "_build_document_extractor"
+    ), "extractor= must be _build_document_extractor(<mode>)"
 
 
 def test_upload_route_opens_no_connection_of_its_own(main_tree):

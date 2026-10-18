@@ -6,6 +6,7 @@ import UserAuth from "./components/UserAuth/UserAuth";
 import { ClaimSupportSummary } from "./components/ClaimSupportSummary";
 import VersionBadge from "./components/VersionBadge";
 import AdminGenerationPanel from "./components/AdminGenerationPanel";
+import { uploadAndWait } from "./uploadJobs";
 
 GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.js",
@@ -13,6 +14,9 @@ GlobalWorkerOptions.workerSrc = new URL(
 ).toString();
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || "http://localhost:5000";
+// Table extraction is offered only in builds that opt in, after its qualification passes; the
+// backend refuses "enhanced" uploads unless an operator has enabled it as well.
+const TABLE_EXTRACTION_ENABLED = process.env.REACT_APP_ENABLE_TABLE_EXTRACTION === "true";
 // Uploading and asking both create records that belong to a signed-in user;
 // the backend refuses them without a valid session.
 const SIGN_IN_TO_USE_DOCUMENTS = "Sign in to upload documents and ask questions about them.";
@@ -2312,6 +2316,8 @@ export default function GridApp() {
   const [hlRange,     setHlRange]     = useState(null);
   const [uploading,   setUploading]   = useState(false);
   const [uploadErr,   setUploadErr]   = useState("");
+  const [uploadStatus, setUploadStatus] = useState(""); // progress line while a background upload job runs
+  const [extractTables, setExtractTables] = useState(false); // opt-in table structure extraction for PDFs (slower)
   const [isDragging,  setIsDragging]  = useState(false);
   const [mainView,    setMainView]    = useState("chat"); // chat | precedents | kb
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -3111,19 +3117,19 @@ export default function GridApp() {
         // questions only. The server re-parses the original PDF/DOCX/TXT bytes
         // itself, so wrapping parsed.text in a Blob here would destroy the very
         // bytes ingestion needs.
-        const fd = new FormData();
-        fd.append("files", file, file.name);
-        if (authToken) fd.append("auth_token", authToken);
-
-        let result = null;
-        try {
-          const res = await fetch(`${BACKEND}/upload`, { method: "POST", body: fd });
-          // 207/422/503 still carry the structured batch envelope, so the body
-          // is read regardless of res.ok and only network/parse errors fall
-          // through to the catch below.
-          const data = await res.json().catch(() => null);
-          if (data && Array.isArray(data.results)) result = data.results[0] || null;
-        } catch (_) {}
+        // Indexing runs as a background job on the server (scanned pages are
+        // read with OCR there, which can take minutes), so the upload is
+        // submitted once and then polled. The finished job carries the same
+        // batch envelope as a direct upload.
+        const isPdf = file.type === "application/pdf";
+        const { result, error } = await uploadAndWait({
+          backend: BACKEND,
+          file,
+          authToken,
+          extraction: isPdf && extractTables && TABLE_EXTRACTION_ENABLED ? "enhanced" : "standard",
+          onStatus: s => setUploadStatus(`${file.name}: ${s}…`),
+        });
+        setUploadStatus("");
 
         // Only a document the backend actually indexed may enter the UI —
         // anything else would claim a searchable document that does not exist.
@@ -3133,7 +3139,9 @@ export default function GridApp() {
           setUploadErr(
             result?.error_message
               ? `${file.name}: ${result.error_message}`
-              : `${file.name} could not be indexed. Please try again.`
+              : error
+                ? `${file.name}: ${error}`
+                : `${file.name} could not be indexed. Please try again.`
           );
           continue;
         }
@@ -3146,6 +3154,15 @@ export default function GridApp() {
         const docType = /contract|agreement/i.test(file.name) ? "contract"
           : /code|statute|regulation/i.test(file.name) ? "statute" : "case";
 
+        // A scanned PDF has no text layer for the local parser; the start of
+        // the server's OCR/table text (returned to the uploader in the upload
+        // result) then feeds the suggested questions instead.
+        let docText = parsed.text || "";
+        const recoveredPreview = result.extraction?.recovered_text_preview;
+        if (isPdf && docText.trim().length < 40 && typeof recoveredPreview === "string" && recoveredPreview.trim()) {
+          docText = recoveredPreview;
+        }
+
         const newDoc = {
           // Only an indexed document reaches this point (see the status check
           // above), so it always has a backend id and a server row to delete.
@@ -3154,7 +3171,7 @@ export default function GridApp() {
           name:              file.name,
           backendFilename:   backendName,
           chunksCount:       chunksCount,
-          text:              parsed.text,
+          text:              docText,
           pages:             parsed.pages,
           isPdf:             parsed.isPdf,
           isDocx:            parsed.isDocx            || false,
@@ -3179,8 +3196,8 @@ export default function GridApp() {
         }]);
 
         // Generate suggested questions
-        fetchSuggestions(parsed.text.slice(0, 2500), file.name, task?.model || "llama3.1:8b", docId, authToken);
-        searchPrecedents(parsed.text.slice(0, 300), file.name);
+        fetchSuggestions(docText.slice(0, 2500), file.name, task?.model || "llama3.1:8b", docId, authToken);
+        searchPrecedents(docText.slice(0, 300), file.name);
 
       } catch (err) {
         setUploadErr(`Error processing ${file.name}: ${err.message}`);
@@ -3196,8 +3213,9 @@ export default function GridApp() {
     }
 
     setUploading(false);
+    setUploadStatus("");
     if (fileInputRef.current) fileInputRef.current.value = "";
-  }, [task, docs.length, authToken]);
+  }, [task, docs.length, authToken, extractTables]);
 
   // ── remove a document — the small × button on each sidebar row.
   //
@@ -3902,6 +3920,26 @@ export default function GridApp() {
               onMouseEnter={e => e.currentTarget.style.filter = "brightness(1.08)"}
               onMouseLeave={e => e.currentTarget.style.filter = "brightness(1)"}
             ><IconPlus width={16} height={16} />{uploading ? "Processing…" : "Upload Document"}</button>
+            {TABLE_EXTRACTION_ENABLED && (
+              <label style={{
+                display: "flex", alignItems: "center", gap: "7px", marginTop: "8px",
+                fontSize: "11px", color: "#8b90a0", cursor: uploading ? "default" : "pointer",
+              }} title="Also read table structure on PDF pages that look like tables. Takes longer.">
+                <input
+                  type="checkbox"
+                  checked={extractTables}
+                  disabled={uploading}
+                  onChange={e => setExtractTables(e.target.checked)}
+                  data-testid="extract-tables-toggle"
+                />
+                Read tables in PDFs (slower)
+              </label>
+            )}
+            {uploading && uploadStatus && (
+              <div data-testid="upload-status" style={{
+                fontSize: "10.5px", color: "#9fb4d9", marginTop: "6px", lineHeight: "1.45",
+              }}>{uploadStatus}</div>
+            )}
             {uploadErr && (
               <div style={{
                 fontSize: "10.5px", color: "#fca5a5",
@@ -4566,6 +4604,9 @@ export default function GridApp() {
                     placeholder="Upload a document first…"
                   />
                 </div>
+                {uploading && uploadStatus && (
+                  <div style={{ marginTop: "12px", color: "#4b5563", fontSize: "12px" }}>{uploadStatus}</div>
+                )}
                 {uploadErr && (
                   <div style={{
                     marginTop: "14px", background: "#fee2e2", border: "1px solid #fca5a5",
@@ -4826,6 +4867,9 @@ export default function GridApp() {
                       placeholder={selectedContext ? "Ask a question about the selected text…" : isAllScope ? `Ask across all ${docs.length} documents…` : activeDoc ? "Ask a legal question…" : "Select a document…"}
                       autoFocus={!!selectedContext}
                     />
+                    {uploading && uploadStatus && (
+                      <div style={{ marginTop: "6px", color: "#4b5563", fontSize: "11.5px" }}>{uploadStatus}</div>
+                    )}
                     {uploadErr && (
                       <div style={{
                         marginTop: "8px", background: "#fee2e2", border: "1px solid #fca5a5",

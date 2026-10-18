@@ -110,6 +110,9 @@ _ROUTES_ADDED_SINCE_FC64A5A = frozenset(
         ("GET", "/admin/generation"),
         ("POST", "/admin/generation/select"),
         ("POST", "/admin/generation/abort"),
+        # LIVE-EXTRACTION-20261017: owner-scoped status of a background upload
+        # job (Bearer token); a job of another owner reads as not found.
+        ("GET", "/upload/jobs/{job_id}"),
     }
 )
 

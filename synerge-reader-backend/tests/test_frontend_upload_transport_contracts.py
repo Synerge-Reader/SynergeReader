@@ -17,6 +17,11 @@ so unrelated ``new Blob(...)`` uses elsewhere (CSV/JSONL export, transcript
 download) stay legal. The final test in this file pins that narrowness down by
 asserting one of those unrelated uses is still present and still passing.
 
+GridApp's transport lives in ``src/uploadJobs.js`` (``uploadAndWait``): it posts
+the original File for background processing and polls the job for the same
+batch envelope. GridApp's processFiles block hands it the File object and keeps
+the "indexed only" acceptance rule, so both pieces are inspected here.
+
 What these tests do NOT prove: they do not prove the upload works at runtime,
 that the response renders correctly, or that the local preview parses anything.
 """
@@ -28,6 +33,7 @@ import pytest
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _GRID_APP_PATH = _REPOSITORY_ROOT / "synerge-reader-frontend" / "src" / "GridApp.jsx"
+_UPLOAD_JOBS_PATH = _REPOSITORY_ROOT / "synerge-reader-frontend" / "src" / "uploadJobs.js"
 _FILE_UPLOAD_PATH = (
     _REPOSITORY_ROOT
     / "synerge-reader-frontend"
@@ -62,16 +68,31 @@ def file_upload_source():
 
 @pytest.fixture(scope="module")
 def grid_app_upload_block(grid_app_source):
-    """Just the active upload transport: the processFiles body up to and just
-    past its POST to /upload. Everything outside this window is out of scope."""
+    """Just the active upload path: the processFiles body up to its suggested
+    questions. Everything outside this window is out of scope."""
     block = _slice_between(
         grid_app_source,
         "const processFiles = useCallback",
         "// Generate suggested questions",
         label="GridApp.jsx",
     )
-    assert "${BACKEND}/upload" in block, (
-        "the inspected GridApp block must be the one that POSTs to /upload"
+    assert "await uploadAndWait({" in block, (
+        "the inspected GridApp block must be the one that hands the file to the upload transport"
+    )
+    return block
+
+
+@pytest.fixture(scope="module")
+def upload_transport_block():
+    """GridApp's upload transport: uploadAndWait in uploadJobs.js."""
+    block = _slice_between(
+        _read(_UPLOAD_JOBS_PATH),
+        "export async function uploadAndWait",
+        "onStatus(describeJob(job));",
+        label="uploadJobs.js",
+    )
+    assert "${backend}/upload`" in block, (
+        "the inspected transport block must be the one that POSTs to /upload"
     )
     return block
 
@@ -94,18 +115,22 @@ def file_upload_block(file_upload_source):
 # --- the active GridApp path sends the original File -------------------------
 
 
-def test_grid_app_uploads_the_original_file_object(grid_app_upload_block):
-    assert 'fd.append("files", file, file.name)' in grid_app_upload_block, (
-        "GridApp must append the original File object under its own name, so the "
+def test_grid_app_uploads_the_original_file_object(grid_app_upload_block, upload_transport_block):
+    assert "          file,\n" in grid_app_upload_block, (
+        "GridApp must hand the original File object to the upload transport"
+    )
+    assert 'fd.append("files", file, file.name)' in upload_transport_block, (
+        "the transport must append the original File object under its own name, so the "
         "backend receives the original PDF/DOCX/TXT bytes"
     )
 
 
-def test_grid_app_upload_block_constructs_no_blob(grid_app_upload_block):
-    assert "new Blob(" not in grid_app_upload_block, (
-        "the GridApp upload transport must not construct any Blob -- a Blob here "
-        "replaces the original file bytes with client-extracted text"
-    )
+def test_grid_app_upload_block_constructs_no_blob(grid_app_upload_block, upload_transport_block):
+    for block in (grid_app_upload_block, upload_transport_block):
+        assert "new Blob(" not in block, (
+            "the GridApp upload path must not construct any Blob -- a Blob here "
+            "replaces the original file bytes with client-extracted text"
+        )
 
 
 def test_grid_app_never_uploads_a_parsed_text_blob_anywhere(grid_app_source):
@@ -124,23 +149,30 @@ def test_grid_app_still_parses_locally_for_preview(grid_app_upload_block):
     assert "await parseTXT(file)" in grid_app_upload_block
 
 
-def test_grid_app_sends_auth_token_when_present(grid_app_upload_block):
-    assert 'fd.append("auth_token", authToken)' in grid_app_upload_block
+def test_grid_app_sends_auth_token_when_present(grid_app_upload_block, upload_transport_block):
+    assert "          authToken,\n" in grid_app_upload_block
+    assert 'if (authToken) fd.append("auth_token", authToken)' in upload_transport_block
+    assert "Authorization: `Bearer ${authToken" in upload_transport_block, (
+        "job polling must identify the caller with the bearer token"
+    )
 
 
 # --- the active GridApp path reads the batch envelope truthfully ------------
 
 
-def test_grid_app_reads_the_batch_envelope_results(grid_app_upload_block):
-    assert "Array.isArray(data.results)" in grid_app_upload_block, (
-        "GridApp must read the batch envelope's results array, not the old "
+def test_grid_app_reads_the_batch_envelope_results(upload_transport_block):
+    assert "Array.isArray(data.results)" in upload_transport_block, (
+        "the transport must read the batch envelope's results array, not the old "
         "bare-list response shape"
+    )
+    assert "Array.isArray(envelope.results)" in upload_transport_block, (
+        "a finished background job must be read through the same batch envelope"
     )
 
 
-def test_grid_app_reads_non_2xx_envelopes_too(grid_app_upload_block):
-    assert "res.json()" in grid_app_upload_block
-    assert "if (res.ok)" not in grid_app_upload_block, (
+def test_grid_app_reads_non_2xx_envelopes_too(upload_transport_block):
+    assert "res.json()" in upload_transport_block
+    assert "if (res.ok)" not in upload_transport_block, (
         "422 and 503 responses still carry a structured envelope, so the body "
         "must not be gated behind res.ok"
     )
@@ -182,6 +214,15 @@ def test_grid_app_keeps_the_users_original_file_name(grid_app_upload_block):
     assert "name:              file.name," in grid_app_upload_block, (
         "the document must keep the name the user recognises"
     )
+
+
+def test_table_extraction_control_is_behind_an_explicit_build_flag(grid_app_source, grid_app_upload_block):
+    # Tables stay unavailable in a public build until their qualification passes.
+    assert 'const TABLE_EXTRACTION_ENABLED = process.env.REACT_APP_ENABLE_TABLE_EXTRACTION === "true";' in grid_app_source
+    assert 'extraction: isPdf && extractTables && TABLE_EXTRACTION_ENABLED ? "enhanced" : "standard",' in grid_app_upload_block
+    checkbox = grid_app_source.index('data-testid="extract-tables-toggle"')
+    gate = grid_app_source.rfind("{TABLE_EXTRACTION_ENABLED && (", 0, checkbox)
+    assert gate != -1 and checkbox - gate < 800, "the checkbox renders only inside the flag"
 
 
 # --- the dormant FileUpload.js path cannot reintroduce the defect -----------

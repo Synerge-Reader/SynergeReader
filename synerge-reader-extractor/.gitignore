@@ -1,0 +1,3 @@
+# Model weights are staged into the build context by tools/stage_models.py and never committed.
+/models/
+__pycache__/

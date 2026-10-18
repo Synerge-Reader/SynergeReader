@@ -195,6 +195,9 @@ class IngestionResult:
     ingestion_contract_version: str = INGESTION_CONTRACT_VERSION
     parser_version: str = PARSER_CONTRACT_VERSION
     chunker_version: str = CHUNKER_CONTRACT_VERSION
+    # Page-coverage summary from the enhanced extraction path (which pages were
+    # native, OCR'd or table-extracted); None for the standard parser.
+    extraction: Optional[dict[str, Any]] = None
 
     @property
     def failure_scope(self) -> Optional[FailureScope]:
@@ -226,6 +229,7 @@ class IngestionResult:
             "ingestion_contract_version": self.ingestion_contract_version,
             "parser_version": self.parser_version,
             "chunker_version": self.chunker_version,
+            "extraction": self.extraction,
         }
 
 
@@ -315,6 +319,7 @@ def _failure(
         error_message=_SAFE_ERROR_MESSAGES[category],
         content_sha256=content_sha256,
         embedding_profile_id=profile_id,
+        extraction=parsed.extraction_report if parsed else None,
     )
 
 
@@ -654,6 +659,7 @@ class DocumentIngestionService:
             locator_coverage=coverage,
             content_sha256=content_sha256,
             embedding_profile_id=profile_id,
+            extraction=parsed.extraction_report,
         )
 
     def ingest_batch(self, uploads: Iterable[UploadDocument]) -> BatchIngestionResult:

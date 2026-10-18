@@ -98,6 +98,9 @@ from generation_admission import (
     current_generation_ticket,
 )
 from helper_jobs import EnqueueOutcome, HelperJobQueue, HelperQueueSettings
+from enhanced_extraction import EXTRACTION_MODES, ExtractionSettings, build_document_extractor
+from upload_jobs import SubmitOutcome, UploadJobRegistry, UploadJobSettings
+from starlette.concurrency import run_in_threadpool
 from answer_jobs import (
     ANSWER_TIMEOUT_ERROR,
     NOT_DISPATCHED_ERROR,
@@ -1209,6 +1212,32 @@ _ENQUEUE_FAILURE_LABELS = {
     EnqueueOutcome.UNAVAILABLE: "queue unavailable",
 }
 
+# --- Enhanced extraction (OCR / tables) and background upload jobs ----------
+#
+# OCR and table extraction run in a separate private worker service reached
+# through EXTRACTOR_URL with the deployment-supplied EXTRACTOR_TOKEN (never
+# logged or returned). With no worker configured, PDFs are processed exactly
+# as before. Background jobs keep slow uploads off the request loop; the
+# registry is bounded and in-memory (see upload_jobs.py). Constructing it
+# starts no thread; the worker starts on the first accepted job.
+_UPLOAD_JOBS = UploadJobRegistry(UploadJobSettings())
+_UPLOAD_PROCESSING_MODES = ("sync", "background")
+_UPLOAD_JOB_REFUSALS = {
+    SubmitOutcome.QUEUE_FULL: (429, "The processing queue is full. Please try again in a few minutes."),
+    SubmitOutcome.OWNER_LIMIT: (429, "You already have uploads processing. Please wait for them to finish."),
+    SubmitOutcome.TOO_LARGE: (413, "The upload batch is too large to process in the background."),
+    SubmitOutcome.UNAVAILABLE: (503, "Background processing is temporarily unavailable."),
+}
+
+
+def _build_document_extractor(extraction_mode: str = "standard"):
+    """The per-request PDF extractor: native text, plus OCR/tables via the worker.
+
+    Settings are read from the environment at call time, so a deployment's
+    EXTRACTOR_URL / EXTRACTOR_TOKEN apply without import-order coupling.
+    """
+    return build_document_extractor(ExtractionSettings.from_env(), mode=extraction_mode)
+
 
 def _start_insights_queue(queue) -> None:
     """Start the background-insights workers; a failure leaves the queue
@@ -1268,7 +1297,7 @@ def _dispatch_upload_followups(committed: CommittedDocument) -> None:
     raise _PostCommitDispatchError("post-commit follow-up could not be started")
 
 
-def _build_ingestion_service() -> DocumentIngestionService:
+def _build_ingestion_service(extraction_mode: str = "standard") -> DocumentIngestionService:
     """Compose the verified ingestion service with this application's parts.
 
     connect_to_postgres is passed as the connection factory specifically
@@ -1277,12 +1306,16 @@ def _build_ingestion_service() -> DocumentIngestionService:
     list[float], which psycopg2 can only adapt to the `vector` type on a
     registered connection. No second, unregistered psycopg2 connection path
     is introduced anywhere in the upload flow.
+
+    The extractor is the enhanced PDF extractor for the requested mode; DOCX,
+    text and (without a configured worker) PDFs keep the standard parser.
     """
     return DocumentIngestionService(
         connection_factory=connect_to_postgres,
         embedding_provider=_EMBEDDING_PROVIDER,
         embedding_profile=_EMBEDDING_PROFILE,
         dispatch_after_commit=_dispatch_upload_followups,
+        extractor=_build_document_extractor(extraction_mode),
     )
 
 
@@ -1296,6 +1329,8 @@ async def upload_documents(
     source: Optional[str] = Form(None),
     doi_url: Optional[str] = Form(None),
     auth_token: Optional[str] = Form(None),
+    extraction: Optional[str] = Form(None),
+    processing: Optional[str] = Form(None),
 ):
     """Thin transport adapter over DocumentIngestionService.
 
@@ -1306,7 +1341,23 @@ async def upload_documents(
     the service's own aggregated HTTP status (200 / 207 / 422 / 503). Each
     document owns a separate transaction inside the service, so one file's
     failure can never erase a sibling that already committed.
+
+    ``extraction`` is "standard" (default: native text, OCR for pages without
+    usable text when the worker is configured) or "enhanced" (adds table
+    structure extraction). ``processing`` is "sync" (default: the envelope is
+    returned when the batch finishes; the work runs off the event loop) or
+    "background" (HTTP 202 with a job id; poll GET /upload/jobs/{job_id}).
     """
+    extraction_mode = (extraction or "standard").strip().lower()
+    processing_mode = (processing or "sync").strip().lower()
+    if extraction_mode not in EXTRACTION_MODES:
+        raise HTTPException(422, "extraction must be 'standard' or 'enhanced'")
+    if processing_mode not in _UPLOAD_PROCESSING_MODES:
+        raise HTTPException(422, "processing must be 'sync' or 'background'")
+    # Table extraction stays unavailable until its qualification passes and an operator
+    # enables it (EXTRACTOR_ENABLE_TABLES=1). Scanned-page OCR does not depend on this.
+    if extraction_mode == "enhanced" and not ExtractionSettings.from_env().tables_enabled:
+        raise HTTPException(422, "Table extraction is not available on this server yet.")
     # The empty-request check comes first on purpose: a request with no files
     # has nothing to ingest, so it must not open a database connection or run
     # an uploader lookup even when an auth_token field was supplied.
@@ -1352,8 +1403,55 @@ async def upload_documents(
             )
         )
 
-    batch = _build_ingestion_service().ingest_batch(uploads)
+    service = _build_ingestion_service(extraction_mode)
+
+    if processing_mode == "background":
+        def _run_batch():
+            batch = service.ingest_batch(uploads)
+            return batch.http_status, batch.to_dict()
+
+        submitted = _UPLOAD_JOBS.submit(
+            uploader_id,
+            _run_batch,
+            size_bytes=sum(len(u.content) for u in uploads if isinstance(u.content, bytes)),
+            file_count=len(uploads),
+        )
+        if submitted.outcome is not SubmitOutcome.ACCEPTED:
+            status_code, message = _UPLOAD_JOB_REFUSALS[submitted.outcome]
+            headers = {"Retry-After": "60"} if status_code == 429 else None
+            raise HTTPException(status_code, message, headers=headers)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "job_id": submitted.job_id,
+                "status": "queued",
+                "status_url": f"/upload/jobs/{submitted.job_id}",
+                "extraction": extraction_mode,
+                "file_count": len(uploads),
+            },
+        )
+
+    # Parsing, OCR/table calls and embedding are blocking; run them off the
+    # event loop so other requests (status polls, /ask streams) stay responsive.
+    batch = await run_in_threadpool(service.ingest_batch, uploads)
     return JSONResponse(status_code=batch.http_status, content=batch.to_dict())
+
+
+@app.get("/upload/jobs/{job_id}")
+async def upload_job_status(job_id: str, authorization: Optional[str] = Header(None)):
+    """Status and, once finished, the batch envelope of the caller's own upload job.
+
+    The caller is identified from ``Authorization: Bearer <token>``. A job that
+    belongs to someone else is reported exactly like one that does not exist,
+    so job ids cannot be probed. Jobs are kept in memory only: after a backend
+    restart an unfinished or old job reads as not found, and the documents
+    list is the source of truth for what was actually indexed.
+    """
+    caller_id = _resolve_caller_id(_bearer_token(authorization))
+    view = _UPLOAD_JOBS.get(job_id, caller_id)
+    if view is None:
+        raise HTTPException(404, "Upload job not found or expired")
+    return JSONResponse(status_code=200, content=view.to_dict())
 
 
 

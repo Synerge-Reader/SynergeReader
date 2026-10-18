@@ -1,0 +1,122 @@
+{
+ "schema": "synergereader.extractor.model-lock.v1",
+ "container_root": "/models",
+ "source": {
+  "lock": "prototype/docling_d12_20261016/amend_setup_20261017T183731Z/packet_opencv_amendment/DOCLING_ARTIFACT_LOCK_AMENDED.json",
+  "lock_sha256": "faf6c2972ee9ecf2acee1f7632c6f7f84b7338d2924090fc3579e48e0120012d",
+  "lock_schema": "synergereader.docling-d12.artifact-lock.v2",
+  "note": "Same model bytes as the reviewed D12 candidate; staged by tools/stage_models.py and verified again inside the image build."
+ },
+ "files": [
+  {
+   "path": "docling-project--docling-layout-heron/config.json",
+   "sha256": "fdea30805ce2f5666b147fca941dcdd27ad468e27d6ed21902207d3da056a97d",
+   "bytes": 3268,
+   "role": "layout_config",
+   "repository": "docling-project/docling-layout-heron",
+   "revision": "8f39ad3c0b4c58e9c2d2c84a38465abf757272d8",
+   "source_filename": "config.json",
+   "license": "Apache-2.0 (pinned model card)",
+   "required_for_inference": true
+  },
+  {
+   "path": "docling-project--docling-layout-heron/preprocessor_config.json",
+   "sha256": "cd38cd59999e7a95d68e487fbe5132df3d4e5c32a0836add57e6126ba0c4eaf1",
+   "bytes": 444,
+   "role": "layout_config",
+   "repository": "docling-project/docling-layout-heron",
+   "revision": "8f39ad3c0b4c58e9c2d2c84a38465abf757272d8",
+   "source_filename": "preprocessor_config.json",
+   "license": "Apache-2.0 (pinned model card)",
+   "required_for_inference": true
+  },
+  {
+   "path": "docling-project--docling-layout-heron/README.md",
+   "sha256": "175700839bc7808eac6af1d0c23e4f483606ab2276fe01122f4093e61a1a65b6",
+   "bytes": 3219,
+   "role": "license_declaration",
+   "repository": "docling-project/docling-layout-heron",
+   "revision": "8f39ad3c0b4c58e9c2d2c84a38465abf757272d8",
+   "source_filename": "README.md",
+   "license": "Apache-2.0 (pinned model card)",
+   "required_for_inference": false
+  },
+  {
+   "path": "docling-project--docling-layout-heron/model.safetensors",
+   "sha256": "00333a43451945aaf89db8ca9c0a17e75d1537c17db60fdb91aa95f4c7929e0c",
+   "bytes": 171658996,
+   "role": "layout_weights",
+   "repository": "docling-project/docling-layout-heron",
+   "revision": "8f39ad3c0b4c58e9c2d2c84a38465abf757272d8",
+   "source_filename": "model.safetensors",
+   "license": "Apache-2.0 (pinned model card)",
+   "required_for_inference": true
+  },
+  {
+   "path": "docling-project--docling-models/model_artifacts/tableformer/accurate/tm_config.json",
+   "sha256": "984e122ceb8ccf84d84c9d2882f6f2302a44b4f1e577babd6289892c36f3cffd",
+   "bytes": 7060,
+   "role": "table_config",
+   "repository": "docling-project/docling-models",
+   "revision": "fc0f2d45e2218ea24bce5045f58a389aed16dc23",
+   "source_filename": "model_artifacts/tableformer/accurate/tm_config.json",
+   "license": "CDLA-Permissive-2.0 (pinned model card)",
+   "required_for_inference": true
+  },
+  {
+   "path": "docling-project--docling-models/README.md",
+   "sha256": "d17f233378eff1240b623b36da76ee8b40afcca05d505949713bf03f7e00822a",
+   "bytes": 3413,
+   "role": "license_declaration",
+   "repository": "docling-project/docling-models",
+   "revision": "fc0f2d45e2218ea24bce5045f58a389aed16dc23",
+   "source_filename": "README.md",
+   "license": "CDLA-Permissive-2.0 (pinned model card)",
+   "required_for_inference": false
+  },
+  {
+   "path": "docling-project--docling-models/model_artifacts/tableformer/accurate/tableformer_accurate.safetensors",
+   "sha256": "2a7d6c924b3cd12fb99a09280ca9c33a89c5d60b93253617d2e088c1a40374d9",
+   "bytes": 212758388,
+   "role": "table_weights",
+   "repository": "docling-project/docling-models",
+   "revision": "fc0f2d45e2218ea24bce5045f58a389aed16dc23",
+   "source_filename": "model_artifacts/tableformer/accurate/tableformer_accurate.safetensors",
+   "license": "CDLA-Permissive-2.0 (pinned model card)",
+   "required_for_inference": true
+  },
+  {
+   "path": "tessdata/eng.traineddata",
+   "sha256": "7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2",
+   "bytes": 4113088,
+   "role": "ocr_language",
+   "repository": "tesseract-ocr/tessdata_fast",
+   "revision": "65727574dfcd264acbb0c3e07860e4e9e9b22185",
+   "source_filename": "eng.traineddata",
+   "license": "Apache-2.0",
+   "required_for_inference": true
+  },
+  {
+   "path": "tessdata/osd.traineddata",
+   "sha256": "9cf5d576fcc47564f11265841e5ca839001e7e6f38ff7f7aacf46d15a96b00ff",
+   "bytes": 10562727,
+   "role": "ocr_orientation",
+   "repository": "tesseract-ocr/tessdata_fast",
+   "revision": "65727574dfcd264acbb0c3e07860e4e9e9b22185",
+   "source_filename": "osd.traineddata",
+   "license": "Apache-2.0",
+   "required_for_inference": true
+  },
+  {
+   "path": "tessdata/LICENSE",
+   "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+   "bytes": 11358,
+   "role": "license_text",
+   "repository": "tesseract-ocr/tessdata_fast",
+   "revision": "65727574dfcd264acbb0c3e07860e4e9e9b22185",
+   "source_filename": "LICENSE",
+   "license": "Apache-2.0",
+   "required_for_inference": false
+  }
+ ]
+}
