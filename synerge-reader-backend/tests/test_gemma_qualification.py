@@ -102,7 +102,8 @@ def _synthetic_registry():
     """The production profiles with synthetic expected digests; Gemma unqualified."""
     registry = default_model_registry()
     return ModelRegistry(
-        profiles=tuple(_synthetic_profile(p) for p in registry.profiles),
+        # The diagnostics run only the control and qualified profiles.
+        profiles=tuple(_synthetic_profile(p) for p in registry.profiles if not p.experimental),
         default_profile_id=LLAMA_CONTROL,
     )
 

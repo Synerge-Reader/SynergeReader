@@ -25,6 +25,10 @@ Event types:
 ``entry_id``      the chat_history row id for this answer (unchanged semantics).
 ``error``         a fixed, safe error code and message. Never raw exceptions.
 ``done``          explicit terminator. Its absence means the stream was cut.
+``heartbeat``     no payload. Written by the response sender (answer_jobs.py)
+                  while nothing else was sent for a while -- for example
+                  during a cold model load -- so idle-timeout proxies keep
+                  the stream open. Carries no content; clients ignore it.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ EVENT_VERIFICATION = "verification"
 EVENT_ENTRY_ID = "entry_id"
 EVENT_ERROR = "error"
 EVENT_DONE = "done"
+EVENT_HEARTBEAT = "heartbeat"
 
 EVENT_TYPES = frozenset(
     {
@@ -51,6 +56,7 @@ EVENT_TYPES = frozenset(
         EVENT_ENTRY_ID,
         EVENT_ERROR,
         EVENT_DONE,
+        EVENT_HEARTBEAT,
     }
 )
 

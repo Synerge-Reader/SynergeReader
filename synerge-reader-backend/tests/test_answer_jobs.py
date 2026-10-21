@@ -20,8 +20,9 @@ is bounded -- a stalled response start abandons a started answer as a client
 stall (no further dispatch or INSERT, an unobserved call stays UNKNOWN), and
 a stalled start or body of the not-started 503 ends at the same bound; the
 sender ends the response at the whole-job budget even while the job thread is
-blocked, without treating that as proof the model stopped; and each ticket is
-released exactly once.
+blocked, without treating that as proof the model stopped; an idle stream
+carries content-free heartbeat lines (never after ``done``, never extending
+the budget); and each ticket is released exactly once.
 
 What these do NOT prove: a real ASGI server's (uvicorn) disconnect or
 back-pressure behaviour, or anything about Ollama.
@@ -45,6 +46,7 @@ from answer_jobs import (  # noqa: E402
     DELIVERY_CANCELLED,
     DELIVERY_INTERRUPTED_ERROR,
     DELIVERY_OVERFLOW,
+    HEARTBEAT_LINE,
     AdmittedAnswerResponse,
     AnswerChannel,
     AnswerJob,
@@ -573,3 +575,63 @@ def test_persistence_is_decided_once_and_never_begun_after_abandonment_or_expiry
     assert other.begin_persistence() is False
     for item in (job, other):
         ledger.release_unstarted(item.ticket)
+
+
+# --- heartbeats ---------------------------------------------------------------------
+
+
+def test_an_idle_stream_carries_contentless_heartbeats_until_the_answer_resumes():
+    ledger, intents = _ledger()
+    ticket = _ticket(ledger)
+    gate = threading.Event()
+    job = _job(ledger, ticket, _body_with_one_call(gate=gate), heartbeat_s=0.1)
+    asgi = _Asgi()
+
+    async def release_after_idle(task, peer):
+        await asyncio.sleep(0.45)  # the model call is silent, as during a cold load
+        gate.set()
+
+    _serve(job, asgi, after_start=release_after_idle)
+    assert job.finished.wait(_WAIT) and asgi.completed
+    bodies = [m["body"] for m in asgi.messages if m["type"] == "http.response.body"]
+    beats = [i for i, body in enumerate(bodies) if body == HEARTBEAT_LINE]
+    assert len(beats) >= 2, "one line per idle interval while the call was silent"
+    types = [e["type"] for e in asgi.events]
+    assert types[0] == "delta" and types[-3:] == ["delta", "entry_id", "done"]
+    assert set(types[1:-3]) == {"heartbeat"}, "heartbeats only fill the silence; content order is unchanged"
+    done_at = next(i for i, body in enumerate(bodies) if b'"done"' in body)
+    assert bodies[done_at + 1:] == [b""], "nothing after the done line but the end of the body"
+    assert intents.events == [("dispatch", "answer"), ("outcome", CallState.OBSERVED_TERMINAL)]
+    assert ticket.released
+
+
+def test_a_prompt_answer_carries_no_heartbeat():
+    ledger, _ = _ledger()
+    job = _job(ledger, _ticket(ledger), _body_with_one_call([evidence_event([], mode="none")]))
+    asgi = _Asgi()
+    _serve(job, asgi)
+    assert job.finished.wait(_WAIT)
+    assert HEARTBEAT_LINE not in [m.get("body") for m in asgi.messages]
+    assert "heartbeat" not in [e["type"] for e in asgi.events]
+
+
+def test_a_heartbeat_does_not_extend_the_job_budget():
+    ledger, intents = _ledger(answer_job_budget_s=1.0)
+    ticket = _ticket(ledger)
+    gate = threading.Event()
+    job = _job(ledger, ticket, _body_with_one_call(terminal=False, gate=gate), heartbeat_s=0.1)
+    asgi = _Asgi()
+    started = time.monotonic()
+    _serve(job, asgi)
+    assert time.monotonic() - started < 2.5
+    assert "heartbeat" in [e["type"] for e in asgi.events]
+    assert asgi.events[-2:] == [{"type": "error", **ANSWER_TIMEOUT_ERROR}, {"type": "done", "ok": False}]
+    gate.set()
+    assert job.finished.wait(_WAIT)
+    assert ticket.state is CallState.UNKNOWN and ledger.snapshot().unresolved_answers == 1
+
+
+@pytest.mark.parametrize("value", [0, 0.0, 91, float("nan"), float("inf"), True, "15"])
+def test_the_heartbeat_interval_is_bounded_inside_the_proxy_idle_limit(value):
+    with pytest.raises(ValueError):
+        DeliverySettings(heartbeat_s=value)

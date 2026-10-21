@@ -209,7 +209,10 @@ class HelperCapacity:
 # helper jobs, at most ``answer_waiters`` answers waiting for up to
 # ``answer_wait_s``. A freed slot goes to waiting answers first, in arrival
 # order; helpers take a slot only when no answer is waiting. Unresolved work
-# counts against every bound.
+# counts against every bound. While a profile with a ``SelectionPolicy`` is
+# the shared selection (an experimental profile: one combined job), its
+# ``max_jobs`` tightens every bound and its budgets replace the shared ones
+# for jobs granted under it; it never widens a bound.
 #
 # This module stays free of clocks and event loops, so nothing time-based in
 # it can release capacity: the ledger is handed a clock only to stamp job
@@ -328,6 +331,33 @@ class SharedSelection:
         if not isinstance(self.profile_id, str) or not _PROFILE_ID_PATTERN.match(self.profile_id):
             raise AdmissionSettingsError("a selection names a well-formed profile id")
         require_selection_epoch(self.epoch)
+
+
+@dataclass(frozen=True)
+class SelectionPolicy:
+    """Admission limits that apply while one profile is the shared selection,
+    on top of ``AdmissionSettings`` (they can only tighten its slot limits).
+
+    ``max_jobs`` caps admitted-or-unresolved jobs of either kind together;
+    the budgets replace the shared whole-job budgets for jobs granted under
+    that selection. None keeps the shared setting. Provisional, unmeasured:
+    an experimental profile starts at one combined job at a time."""
+
+    max_jobs: Optional[int] = None
+    answer_job_budget_s: Optional[float] = None
+    helper_job_budget_s: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.max_jobs is not None:
+            require_positive_int("max_jobs", self.max_jobs, maximum=MAX_SLOTS)
+        for name in ("answer_job_budget_s", "helper_job_budget_s"):
+            if getattr(self, name) is not None:
+                _require_real(name, getattr(self, name), 1.0, 3600.0)
+
+
+# What a selection policy resolver that fails, or returns something else,
+# is treated as: the most conservative admission, never a wider one.
+_FAIL_CLOSED_POLICY = SelectionPolicy(max_jobs=1)
 
 
 @dataclass(frozen=True)
@@ -548,18 +578,36 @@ class LedgerSnapshot:
     total_slots: int
     answer_slots: int
     helper_slots: int
+    # The combined job limit of the current selection's policy (None: the
+    # shared settings apply unchanged).
+    selection_job_limit: Optional[int] = None
 
 
 class GenerationLedger:
-    """The process's one admission ledger for every generation job."""
+    """The process's one admission ledger for every generation job.
 
-    def __init__(self, settings: AdmissionSettings, *, clock: Callable[[], float]) -> None:
+    ``selection_policy`` (optional, pure, no I/O) maps the shared selection
+    to the ``SelectionPolicy`` that applies while it is active. It is
+    resolved when a selection is installed or resumed -- never per request --
+    and a resolver that fails is treated as one job at a time."""
+
+    def __init__(
+        self,
+        settings: AdmissionSettings,
+        *,
+        clock: Callable[[], float],
+        selection_policy: Optional[Callable[[SharedSelection], Optional[SelectionPolicy]]] = None,
+    ) -> None:
         if not isinstance(settings, AdmissionSettings):
             raise TypeError("settings must be AdmissionSettings")
         if not callable(clock):
             raise TypeError("clock must be callable")
+        if selection_policy is not None and not callable(selection_policy):
+            raise TypeError("selection_policy must be callable")
         self._settings = settings
         self._clock = clock
+        self._selection_policy = selection_policy
+        self._policy: Optional[SelectionPolicy] = None
         self._lock = threading.Lock()
         self._changed = threading.Condition(self._lock)
         self._intents: Optional[DispatchIntents] = None
@@ -576,6 +624,18 @@ class GenerationLedger:
     @property
     def settings(self) -> AdmissionSettings:
         return self._settings
+
+    def _resolve_policy(self, selection: Optional[SharedSelection]) -> Optional[SelectionPolicy]:
+        """Outside the lock: the policy for ``selection``, or None."""
+        if selection is None or self._selection_policy is None:
+            return None
+        try:
+            policy = self._selection_policy(selection)
+        except Exception:
+            return _FAIL_CLOSED_POLICY
+        if policy is None or isinstance(policy, SelectionPolicy):
+            return policy
+        return _FAIL_CLOSED_POLICY
 
     # --- ownership (the owner manager) ---------------------------------------------
 
@@ -601,12 +661,14 @@ class GenerationLedger:
         counts = {kind: int(recovered.get(kind, 0)) for kind in JobKind}
         if any(count < 0 for count in counts.values()):
             raise ValueError("recovered counts are non-negative")
+        policy = self._resolve_policy(selection)
         with self._lock:
             if self._fenced or self._intents is not None:
                 return False
             self._intents = intents
             self._owner_seq = owner_seq
             self._selection = selection
+            self._policy = policy
             self._paused_by = paused_by
             for kind, count in counts.items():
                 self._unresolved[kind] += count
@@ -681,10 +743,12 @@ class GenerationLedger:
         switch, or none, holds the pause."""
         if not isinstance(selection, SharedSelection):
             raise TypeError("selection must be a SharedSelection")
+        policy = self._resolve_policy(selection)
         with self._lock:
             if self._fenced or self._paused_by is None or self._paused_by != switch_id:
                 return False
             self._selection = selection
+            self._policy = policy
             self._paused_by = None
             grants = self._grant_waiters_locked()
             self._changed.notify_all()
@@ -740,6 +804,7 @@ class GenerationLedger:
                 total_slots=self._settings.total_slots,
                 answer_slots=self._settings.answer_slots,
                 helper_slots=self._settings.helper_slots,
+                selection_job_limit=self._policy.max_jobs if self._policy is not None else None,
             )
 
     def add_listener(self, listener: Callable[[], None]) -> None:
@@ -757,21 +822,38 @@ class GenerationLedger:
             return AdmissionRefusal.SWITCHING
         return None
 
+    def _total_limit_locked(self) -> int:
+        cap = self._policy.max_jobs if self._policy is not None else None
+        return self._settings.total_slots if cap is None else min(self._settings.total_slots, cap)
+
+    def _kind_limit_locked(self, kind: JobKind) -> int:
+        cap = self._policy.max_jobs if self._policy is not None else None
+        limit = self._settings.limit(kind)
+        return limit if cap is None else min(limit, cap)
+
+    def _budget_locked(self, kind: JobKind) -> float:
+        policy = self._policy
+        if policy is not None:
+            override = policy.answer_job_budget_s if kind is JobKind.ANSWER else policy.helper_job_budget_s
+            if override is not None:
+                return float(override)
+        return self._settings.budget(kind)
+
     def _has_capacity_locked(self, kind: JobKind) -> bool:
         used = sum(len(jobs) for jobs in self._outstanding.values()) + sum(self._unresolved.values())
         used_kind = len(self._outstanding[kind]) + self._unresolved[kind]
-        return used < self._settings.total_slots and used_kind < self._settings.limit(kind)
+        return used < self._total_limit_locked() and used_kind < self._kind_limit_locked(kind)
 
     def _exhausted_by_unresolved_locked(self, kind: JobKind) -> bool:
         return (
-            sum(self._unresolved.values()) >= self._settings.total_slots
-            or self._unresolved[kind] >= self._settings.limit(kind)
+            sum(self._unresolved.values()) >= self._total_limit_locked()
+            or self._unresolved[kind] >= self._kind_limit_locked(kind)
         )
 
     def _new_ticket_locked(self, kind: JobKind, phase: str) -> GenerationTicket:
         ticket = GenerationTicket(
             self, kind, self._selection, self._owner_seq,
-            self._clock() + self._settings.budget(kind), phase,
+            self._clock() + self._budget_locked(kind), phase,
         )
         self._outstanding[kind].add(ticket)
         return ticket
@@ -864,7 +946,7 @@ class GenerationLedger:
                 return 0
             used = sum(len(jobs) for jobs in self._outstanding.values()) + sum(self._unresolved.values())
             used_kind = len(self._outstanding[JobKind.HELPER]) + self._unresolved[JobKind.HELPER]
-            return max(0, min(self._settings.total_slots - used, self._settings.helper_slots - used_kind))
+            return max(0, min(self._total_limit_locked() - used, self._kind_limit_locked(JobKind.HELPER) - used_kind))
 
     # --- answer handoff and release ----------------------------------------------------
 

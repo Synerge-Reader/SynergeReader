@@ -4,8 +4,9 @@ A switch request is validated in memory and queued; the HTTP route answers
 202 at once. The coordinator's own thread -- never a request worker or the
 event loop -- then, in order:
 
-1. reads the target's installed identity (read-only inventory) and refuses a
-   target whose tag is absent, re-pulled or unreadable;
+1. reads the target's installed identity (read-only inventory) on the
+   target's OWN runtime and refuses a target whose tag is absent, re-pulled
+   or unreadable there;
 2. pauses new generation admission in this process, then moves the persisted
    selection active -> switching with a compare-and-set on the exact state,
    active profile and epoch it paused;
@@ -13,13 +14,21 @@ event loop -- then, in order:
    the snapshot it was admitted under -- nothing is rerouted or cancelled;
    any job that ends with an unobserved model call, and any unresolved call
    row in the database, aborts the switch;
-4. waits, bounded, for the previous generation model to leave Ollama's
-   loaded-model list by its own keep-alive expiry (read-only ``/api/ps``).
-   An empty job count is not proof that weights left GPU memory, so a model
-   that stays listed, or a list that cannot be read -- a reply without an
-   explicit ``models`` list, or any entry without a usable model identity --
-   aborts the switch; only an explicitly empty list confirms that nothing is
-   loaded. No unload, warm-up or service operation is ever sent;
+4. waits, bounded, for the previous generation model to leave the
+   loaded-model list of the runtime that served it, by its own keep-alive
+   expiry (read-only ``/api/ps``). The runtimes share one GPU pool, so the
+   loaded-model list of EVERY configured runtime is read on each poll, and
+   the barrier also waits for any other registered generation model (the
+   target's own excepted) to leave any of them; querying only the
+   destination would miss a model still holding memory elsewhere. An
+   embedding model or another client's model is not a registered generation
+   model and never blocks the barrier: no list has to become empty. An empty
+   job count is not proof that weights left GPU memory, so a model that stays
+   listed, or a list that cannot be read -- a reply without an explicit
+   ``models`` list, any entry without a usable model identity, or a runtime
+   the previous profile needs that is not configured -- aborts the switch.
+   No unload, warm-up or service operation is ever sent, so a committed
+   switch selects the model; it does not claim the model was loaded;
 5. re-reads the target identity and commits switching -> active with a
    compare-and-set on state, target, epoch, switch id and switch-owner boot
    id; only then is admission reopened with the new profile and epoch.
@@ -47,11 +56,18 @@ from typing import Callable, Optional
 
 from generation_admission import GenerationLedger, JobKind, SharedSelection
 from generation_profiles import (
+    INELIGIBLE_EXPERIMENTAL_DISABLED,
+    INELIGIBLE_RUNTIME_NOT_CONFIGURED,
     ModelIdentityMismatchError,
     ModelSelectionError,
     check_installed_identity,
     normalize_digest,
 )
+
+_INELIGIBLE_DETAILS = {
+    INELIGIBLE_EXPERIMENTAL_DISABLED: "Experimental model profiles are disabled on this server.",
+    INELIGIBLE_RUNTIME_NOT_CONFIGURED: "That model profile's runtime is not configured on this server.",
+}
 from generation_selection import (
     STATE_ACTIVE,
     STATE_SWITCHING,
@@ -150,14 +166,19 @@ def loaded_model_entries(payload: object) -> list:
 
 
 class SwitchCoordinator:
+    """``installed_digest(tag, runtime_key)`` reads one runtime's installed
+    identity of ``tag``; ``resident_models(runtime_key)`` reads one runtime's
+    loaded-model list. Both are read-only and are always called with the
+    runtime a profile actually uses."""
+
     def __init__(
         self,
         *,
         ledger: GenerationLedger,
         owner: GenerationOwner,
         registry_provider: Callable[[], object],
-        installed_digest: Callable[[str], Optional[str]],
-        resident_models: Callable[[], list],
+        installed_digest: Callable[[str, str], Optional[str]],
+        resident_models: Callable[[str], list],
         settings: CoordinatorSettings = CoordinatorSettings(),
         clock: Callable[[], float] = time.monotonic,
         thread_factory: Callable[..., object] = threading.Thread,
@@ -213,8 +234,11 @@ class SwitchCoordinator:
         profile = registry.get(target_profile_id) if isinstance(target_profile_id, str) else None
         if profile is None:
             return SwitchRequestOutcome(False, 400, "Unknown model profile.")
-        if not profile.selectable:
-            return SwitchRequestOutcome(False, 409, "That model profile is not qualified for selection.")
+        reason = registry.ineligible_reason(profile)
+        if reason is not None:
+            return SwitchRequestOutcome(
+                False, 409, _INELIGIBLE_DETAILS.get(reason, "That model profile is not qualified for selection.")
+            )
         snap = self._ledger.snapshot()
         with self._lock:
             if self._stopping or not self._started or not snap.owner:
@@ -297,17 +321,29 @@ class SwitchCoordinator:
                 "model": profile.model_tag if profile is not None else None,
                 "epoch": snap.selection.epoch,
                 "registered": profile is not None,
+                "experimental": bool(profile is not None and profile.experimental),
+                "runtime": profile.runtime_key if profile is not None else None,
+                # A persisted selection this server would refuse to answer
+                # with (disabled experimental profile, unconfigured runtime).
+                "eligible": bool(profile is not None and registry.is_selectable(profile)),
             }
-        choices = [
-            {
+        choices = []
+        for profile in registry.profiles:
+            smoke = profile.runtime_smoke
+            choices.append({
                 "profile_id": profile.profile_id,
                 "display_name": profile.display_name,
                 "model": profile.model_tag,
-                "eligible": bool(profile.selectable),
+                "eligible": registry.is_selectable(profile),
+                "ineligible_reason": registry.ineligible_reason(profile),
                 "active": active is not None and profile.profile_id == active["profile_id"],
-            }
-            for profile in registry.profiles
-        ]
+                # Backend-owned key only; never an endpoint.
+                "runtime": profile.runtime_key,
+                "evidence": profile.evidence_tier,
+                "experimental": profile.experimental,
+                "runtime_smoke_verdict": smoke.verdict if smoke is not None else None,
+                "review_note": smoke.review_note if smoke is not None else None,
+            })
         return {
             "ownership": self._owner.state.value,
             "admission": snap.admission,
@@ -324,7 +360,9 @@ class SwitchCoordinator:
                 "total_slots": snap.total_slots,
                 "answer_slots": snap.answer_slots,
                 "helper_slots": snap.helper_slots,
+                "selection_job_limit": snap.selection_job_limit,
             },
+            "experimental_enabled": bool(getattr(registry, "experimental_enabled", False)),
             "settings_provisional": True,
         }
 
@@ -374,8 +412,9 @@ class SwitchCoordinator:
             self._work.wait_for(lambda: switch.abort_requested or self._stopping, timeout=max(0.0, seconds))
 
     def _verify_target(self, profile) -> Optional[str]:
+        runtime_key = profile.runtime_key
         try:
-            check_installed_identity(profile, self._installed_digest)
+            check_installed_identity(profile, lambda tag: self._installed_digest(tag, runtime_key))
         except ModelIdentityMismatchError:
             return "target_identity_mismatch"
         except ModelSelectionError:
@@ -386,7 +425,7 @@ class SwitchCoordinator:
         store = self._owner.store
         registry = self._registry()
         target = registry.get(switch.target_profile_id)
-        if store is None or target is None or not target.selectable:
+        if store is None or target is None or not registry.is_selectable(target):
             return self._finish(switch, "failed", "ownership_unavailable" if store is None else "target_unavailable")
 
         switch.phase = "verifying_target"
@@ -444,7 +483,7 @@ class SwitchCoordinator:
         deadline = self._clock() + self._settings.residency_timeout_s
         while True:
             try:
-                resident = self._is_resident(previous)
+                resident = self._generation_resident(registry, previous, target)
             except Exception:
                 return self._abort(store, switch, "residency_unavailable")
             if not resident:
@@ -478,18 +517,60 @@ class SwitchCoordinator:
         self._ledger.resume(switch.switch_id, committed.shared)
         return self._finish(switch, "committed", None)
 
-    def _is_resident(self, profile) -> bool:
-        models = self._resident_models()
+    def _listed(self, runtime_key: str) -> list:
+        """One runtime's loaded-model entries as (tags, digest); ValueError
+        when the list is unreadable. Every entry must be identifiable before
+        any is trusted: one entry that names no model makes the list
+        unreadable."""
+        models = self._resident_models(runtime_key)
         if not isinstance(models, list):
             raise ValueError("unreadable loaded-model list")
-        # Every entry must be identifiable before any is trusted: one entry
-        # that names no model makes the whole list unreadable.
-        listed = [_listed_identity(entry) for entry in models]
-        for tags, digest in listed:
-            if profile.model_tag in tags:
+        return [_listed_identity(entry) for entry in models]
+
+    @staticmethod
+    def _matches(listed: list, model_tag: str, digest: Optional[str]) -> bool:
+        for tags, listed_digest in listed:
+            if model_tag in tags:
                 return True
-            if profile.expected_digest is not None and digest == profile.expected_digest:
+            if digest is not None and listed_digest == digest:
                 return True
+        return False
+
+    def _generation_resident(self, registry, previous, target) -> bool:
+        """True while a generation model that is not the target, where the
+        target will serve, still holds memory in the shared GPU pool;
+        ValueError when that cannot be read.
+
+        The previous profile is looked for on the runtime that served it,
+        which must be configured here. Every configured runtime's list is
+        also checked for every registered generation model, so a switch
+        between runtimes -- either way -- and between two compatibility
+        profiles waits for whichever model is still loaded. The target's own
+        tag and digest are exempt ONLY on the target's runtime, where it may
+        already be resident: a copy of the target's model on any other
+        runtime is a conflicting generator and blocks like any other.
+        Unregistered models (the embedder, other clients) are never waited
+        for."""
+        runtimes = set(registry.configured_runtimes)
+        if previous.runtime_key not in runtimes:
+            raise ValueError("the previous profile's runtime is not configured")
+        identities = [(tag, digest) for _profile_id, tag, digest in registry.generation_identities()]
+        for runtime_key in sorted(runtimes):
+            listed = self._listed(runtime_key)
+            if runtime_key == previous.runtime_key and self._matches(
+                listed, previous.model_tag, previous.expected_digest
+            ):
+                return True
+            if runtime_key == target.runtime_key:
+                # Where the target serves, its own tag/digest never blocks.
+                listed = [
+                    (tags, digest) for tags, digest in listed
+                    if target.model_tag not in tags
+                    and not (target.expected_digest is not None and digest == target.expected_digest)
+                ]
+            for tag, digest in identities:
+                if self._matches(listed, tag, digest):
+                    return True
         return False
 
     def _read(self, store) -> Optional[SelectionRecord]:

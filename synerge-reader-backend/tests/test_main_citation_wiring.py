@@ -707,7 +707,8 @@ def test_generation_failure_ends_with_a_safe_error_then_an_explicit_done(main_tr
         if isinstance(h.type, ast.Name) and h.type.id == "Exception"
     ][0]
     yields = [node for node in ast.walk(handler) if isinstance(node, ast.Yield)]
-    assert len(yields) == 2
+    # HTTP error, primary runtime unreachable, experimental runtime unreachable.
+    assert len(yields) == 3
     for node in yields:
         assert isinstance(node.value, ast.Constant), (
             "a generation-failure line must be a literal, so no exception text "

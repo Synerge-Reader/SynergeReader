@@ -263,6 +263,11 @@ def load_profiles(profile_ids: Iterable[str], registry: Optional[ModelRegistry] 
         profile = registry.get(profile_id)
         if profile is None:
             raise HarnessUsageError(f"unknown profile {profile_id!r}")
+        if profile.experimental:
+            # This harness talks to one Ollama URL and knows only the
+            # think:false policy; experimental profiles run on their own
+            # runtime and are exercised by the bounded candidate check.
+            raise HarnessUsageError(f"profile {profile_id!r} is experimental; this harness does not run it")
         if profile.expected_digest is None:
             raise HarnessUsageError(f"profile {profile_id!r} has no expected digest to verify")
         profiles.append(profile)

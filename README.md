@@ -125,6 +125,7 @@ npm start
 - `GENERATION_*`: profile definitions exist in `rag_model_profiles.py` (`resolve_generation_profile()`), but nothing in `main.py` reads these, so setting them has no effect on `/ask`; answer models and their options come from `generation_profiles.py`
 - `OLLAMA_KEEP_ALIVE`: keep-alive for embedding requests only; generation keep-alive comes from the model registry
 - `SYNERGE_BUILD_SHA`: the full 40-character commit this deployment was built from, injected by the release operator — see "Release identity and answer provenance" below
+- `SYNERGE_EXPERIMENTAL_MODELS` and `SYNERGE_COMPAT_OLLAMA_URL`: both off/unset by default. Together they make the three experimental reasoning profiles (Qwen3.8 27B, Nemotron 3.5 Lightning 30B, Mistral Medium 3.5 128B) selectable by an administrator; they run on a separate private Ollama runtime while Gemma, Llama and the embedder stay on `OLLAMA_BASE_URL` — see `synerge-reader-compat-runtime/README.md`
 - **Chunk size**: not environment-driven. `document_chunker.py` currently uses a code default of 500 characters per chunk with no overlap.
 - **File size limits**: not environment-driven, and enforced at two different layers with two different values — the current GridApp upload UI rejects files over 20MB client-side, while the backend's own parser (`document_parser.py`) accepts up to 50MB.
 

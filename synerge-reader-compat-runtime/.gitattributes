@@ -1,0 +1,3 @@
+# Byte-exact files: the build recipe is pinned by its SHA-256 and every file here
+# runs on Linux, so the checkout keeps LF line endings on every platform.
+* text=auto eol=lf

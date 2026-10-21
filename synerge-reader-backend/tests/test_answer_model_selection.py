@@ -750,10 +750,17 @@ def test_post_ollama_sends_generation_only_for_an_admitted_job_after_its_intent(
     assert sent == [], "no admitted job on this thread: nothing is sent"
 
     ticket = _admitted_scope(ledger)
+    own = {"model": ticket.snapshot.model_tag}
     with generation_scope(ticket):
-        main_module.post_ollama("/api/generate", {}, stream=True, timeout=150.0)
+        # A generation payload must name its own job's model; anything else
+        # is refused before the endpoint is resolved or an intent recorded.
+        for foreign in ({}, {"model": "gemma4:31b"}):
+            with pytest.raises(DispatchRefused):
+                main_module.post_ollama("/api/generate", foreign, stream=True, timeout=150.0)
+        assert sent == [] and intents.events == []
+        main_module.post_ollama("/api/generate", own, stream=True, timeout=150.0)
         assert ticket.observed({"done": True, "done_reason": "stop"})  # the body observes the stream
-        main_module.post_ollama("/api/generate", {}, timeout=30).json()
+        main_module.post_ollama("/api/generate", own, timeout=30).json()
     main_module.post_ollama("/api/embed", {}, timeout=30)  # embeddings are not generation
 
     assert [entry[:3] for entry in sent] == [
@@ -775,14 +782,15 @@ def test_post_ollama_clamps_the_read_timeout_to_the_jobs_remaining_budget(monkey
     monkeypatch.setattr(main_module.requests, "post",
                         lambda url, json=None, stream=False, timeout=None: sent.append(timeout))
     ticket = _admitted_scope(ledger)
+    own = {"model": ticket.snapshot.model_tag}
     ticket.deadline = time.monotonic() + 20.0
     with generation_scope(ticket):
-        main_module.post_ollama("/api/generate", {}, stream=True, timeout=150.0)
+        main_module.post_ollama("/api/generate", own, stream=True, timeout=150.0)
     assert sent and 19.0 <= sent[0][1] <= 20.0, "a read can never outlast the job's whole budget"
     ticket.deadline = time.monotonic() - 1.0
     assert ticket.observed({"done": True, "done_reason": "stop"})
     with generation_scope(ticket), pytest.raises(DispatchRefused):
-        main_module.post_ollama("/api/generate", {}, stream=True, timeout=150.0)
+        main_module.post_ollama("/api/generate", own, stream=True, timeout=150.0)
     assert len(sent) == 1, "a spent budget sends nothing"
     ledger.release(ticket)
 
@@ -1295,7 +1303,12 @@ def test_a_stored_insight_logs_counts_only(monkeypatch, main_module, capsys):
 
     assert table.commits == 1, "the insight was stored"
     out = _assert_logs_are_private(capsys)
-    assert out.strip() == "[Insights] Stored: 1 keywords, 1 facts, 1 entities"
+    assert out.strip().splitlines() == [
+        "[Generation] completion role=insights profile=llama_control result=completed done_reason=stop "
+        "prompt_eval_count=unknown eval_count=unknown num_predict=1200 at_output_limit=unknown "
+        f"thinking_chars=absent response_chars={len(_PRIVATE_INSIGHTS)}",
+        "[Insights] Stored: 1 keywords, 1 facts, 1 entities",
+    ]
 
 
 @pytest.mark.parametrize("kind", ["transport-error", "model-error", "unfinished", "unparseable"])
@@ -1321,7 +1334,9 @@ def test_an_insight_database_failure_logs_no_private_text(monkeypatch, main_modu
 
     main_module._extract_document_insights(10, f"{_PRIVATE}-lease.pdf", _PRIVATE_TEXT)
 
-    assert _assert_logs_are_private(capsys).strip() == "[Insights] Extraction failed (non-critical): RuntimeError"
+    completion, failure = _assert_logs_are_private(capsys).strip().splitlines()
+    assert completion.startswith("[Generation] completion role=insights profile=llama_control result=completed ")
+    assert failure == "[Insights] Extraction failed (non-critical): RuntimeError"
 
 
 @pytest.mark.parametrize("helper", ["insights", "qa"])

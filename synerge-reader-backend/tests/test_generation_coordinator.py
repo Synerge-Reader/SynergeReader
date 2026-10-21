@@ -146,18 +146,22 @@ class _Probes:
         self.loaded = [{"name": "llama3.1:8b", "model": "llama3.1:8b", "digest": LLAMA_CONTROL_DIGEST}]
         self.loaded_polls_left = 0  # polls during which the old model is still listed
         self.inventory_calls = []
+        self.inventory_runtimes = []
         self.residency_calls = 0
+        self.residency_runtimes = []
         self.residency_error = None
 
-    def installed_digest(self, tag):
+    def installed_digest(self, tag, runtime_key):
         self.inventory_calls.append(tag)
+        self.inventory_runtimes.append(runtime_key)
         value = self.digests.get(tag)
         if isinstance(value, Exception):
             raise value
         return value
 
-    def resident_models(self):
+    def resident_models(self, runtime_key):
         self.residency_calls += 1
+        self.residency_runtimes.append(runtime_key)
         if self.residency_error is not None:
             raise self.residency_error
         if self.loaded_polls_left > 0:
@@ -255,7 +259,9 @@ def test_a_switch_commits_only_after_drain_and_residency_then_admits_the_new_pro
     env.ledger.release(new)
     status = env.coordinator.status()
     assert status["active"] == {"profile_id": GEMMA_CANDIDATE, "display_name": "Gemma 4 31B", "model": "gemma4:31b",
-                                "epoch": 3, "registered": True}
+                                "epoch": 3, "registered": True, "experimental": False, "runtime": "primary",
+                                "eligible": True}
+    assert set(env.probes.inventory_runtimes) == {"primary"} and set(env.probes.residency_runtimes) == {"primary"}
     assert status["switch"] is None and status["admission"] == "open"
 
 
@@ -472,12 +478,15 @@ def test_the_status_reports_choices_and_counts_without_io(stop_all):
     status = env.coordinator.status()
     assert status["choices"] == [
         {"profile_id": LLAMA_CONTROL, "display_name": "Llama 3.1 8B", "model": "llama3.1:8b", "eligible": True,
-         "active": True},
+         "ineligible_reason": None, "active": True, "runtime": "primary", "evidence": "control",
+         "experimental": False, "runtime_smoke_verdict": None, "review_note": None},
         {"profile_id": GEMMA_CANDIDATE, "display_name": "Gemma 4 31B", "model": "gemma4:31b", "eligible": True,
-         "active": False},
+         "ineligible_reason": None, "active": False, "runtime": "primary", "evidence": "qualified",
+         "experimental": False, "runtime_smoke_verdict": None, "review_note": None},
     ]
+    assert status["capacity"]["selection_job_limit"] is None and status["experimental_enabled"] is False
     assert status["ownership"] == "owner" and status["settings_provisional"] is True
     assert set(status["capacity"]) == {"answers_running", "helpers_running", "unresolved_answers",
                                        "unresolved_helpers", "answer_waiters", "total_slots", "answer_slots",
-                                       "helper_slots"}
+                                       "helper_slots", "selection_job_limit"}
     assert env.probes.inventory_calls == [] and env.probes.residency_calls == 0 and env.store.writes == []

@@ -216,11 +216,14 @@ class _Probes:
         self.inventory = []
         self.residency_reads = 0
 
-    def installed_digest(self, tag):
+    # Stands in for the coordinator's runtime-keyed probes and for
+    # main._installed_model_digest, which the primary runtime still calls
+    # with the tag alone.
+    def installed_digest(self, tag, runtime_key="primary"):
         self.inventory.append(tag)
         return self.digests.get(tag)
 
-    def resident_models(self):
+    def resident_models(self, runtime_key="primary"):
         self.residency_reads += 1
         return [{"name": tag, "model": tag} for tag in self.resident]
 
@@ -512,8 +515,12 @@ def test_an_unqualified_profile_is_refused_and_a_mismatched_identity_fails_witho
     assert _admin("/admin/generation/select", env, "post", json={"profile_id": GEMMA_CANDIDATE}).status_code == 409
     # The released production Gemma is eligible, but only with its pinned identity.
     monkeypatch.setattr(env.main, "_MODEL_REGISTRY", default_model_registry())
-    assert {c["profile_id"]: c["eligible"] for c in _status(env)["choices"]} == {LLAMA_CONTROL: True,
-                                                                                  GEMMA_CANDIDATE: True}
+    # The experimental profiles are registered but ineligible: this deployment
+    # has no compatibility runtime and experimental profiles are off.
+    assert {c["profile_id"]: c["eligible"] for c in _status(env)["choices"]} == {
+        LLAMA_CONTROL: True, GEMMA_CANDIDATE: True, "qwen38_27b_experimental": False,
+        "nemotron35_lightning_30b_experimental": False, "mistral_medium35_128b_experimental": False,
+    }
     env.probes.digests["gemma4:31b"] = "77" * 32
     assert _admin("/admin/generation/select", env, "post", json={"profile_id": GEMMA_CANDIDATE}).status_code == 202
     _wait_for(lambda: _status(env)["last_switch"] is not None)

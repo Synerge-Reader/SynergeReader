@@ -1,0 +1,94 @@
+{
+  "schema": 1,
+  "runtime_key": "compat_cuda121",
+  "scope": "Experimental compatibility generation runtime for three runtime-smoke-tested reasoning models. Gemma, Llama and the embedder stay on the existing host Ollama. Nothing here records a quality, capacity or vision qualification.",
+  "build": {
+    "recipe": "build/SynergeReader_Qwen38_CUDA121_Build_20261019_reviewed.sh",
+    "recipe_sha256": "b63b5c9a8edb92122ccfa31fb9158280a494587922ba4c05a89d3548bde3e351",
+    "runtime_image": "ollama/ollama@sha256:07e04ed05eb2232d66060e082da9ee6db9f37e9bf6d4260acb2535a6fd8e6ea7",
+    "ollama_version": "0.32.12",
+    "ollama_commit": "e0e1d3c7d960f5879386871deb23582800c8599d",
+    "llama_cpp_commit": "0b1bad14ff204627636aeb1de22ddcd5acb859d4",
+    "llama_cpp_version": "b10380",
+    "builder_image": "nvidia/cuda@sha256:327c9e046fbf662275be0934742f7e5412f9b24402ee90bf4d649c1a21707912",
+    "cuda_runtime_library": "libcudart.so.12.1.105",
+    "source_archive_sha256": {
+      "ollama.tar.gz": "afc434194f7e24f32bc0d59d74f5ce700d8745305e91cb751cca8746975b4752",
+      "llama.cpp.tar.gz": "ba920d45a2a916f2c5a100ef40cebbfd9deea866c553992a7f979e5344ba08de"
+    },
+    "build_tools": {"cmake": "3.31.2", "ninja": "1.11.1.3"},
+    "cuda_architectures": "70-real",
+    "flash_attention": false,
+    "cuda_graphs": false,
+    "nccl": false
+  },
+  "tested_image": {
+    "id": "sha256:96e3cc4e4155ef96d11578415f1ac36892d8bdc3a83c40623cc8ffdfbf4392ed",
+    "tag": "synergereader-test/ollama-cuda121:cuda121-build-20261019t155454z-2sxha4",
+    "build_evidence": "/home/haihua/synergereader-model-tests/cuda121_build_20261019T155454Z_2Sxha4",
+    "rebuild_note": "A rebuild from this recipe may produce a different image ID. Record the new ID and run a bounded compatibility check before substituting it; the backend pins the tested ID in its runtime-smoke evidence."
+  },
+  "serving": {
+    "service_alias": "synergereader-compat-ollama",
+    "port": 11434,
+    "published_port": null,
+    "gpu_indexes": [0, 1, 3],
+    "gpu_indexes_never_used": [2],
+    "gpu_selection": "by UUID, resolved on the host from these indexes when the compose file is rendered",
+    "model_store_mount": "/cached",
+    "environment": {
+      "OLLAMA_MODELS": "/cached/models",
+      "OLLAMA_HOST": "0.0.0.0:11434",
+      "OLLAMA_NOPRUNE": "1",
+      "OLLAMA_NO_CLOUD": "1",
+      "OLLAMA_LLM_LIBRARY": "cuda_v12",
+      "OLLAMA_FLASH_ATTENTION": "false",
+      "OLLAMA_KV_CACHE_TYPE": "f16",
+      "OLLAMA_SCHED_SPREAD": "1",
+      "OLLAMA_NUM_PARALLEL": "1",
+      "OLLAMA_MAX_LOADED_MODELS": "1",
+      "OLLAMA_CONTEXT_LENGTH": "8192",
+      "OLLAMA_KEEP_ALIVE": "5m",
+      "CUDA_MODULE_LOADING": "EAGER"
+    },
+    "limits": {"memory": "128g", "memory_swap": "128g", "cpus": 8, "pids": 512, "tmp_tmpfs": "2g", "state_tmpfs": "64m"},
+    "limits_note": "The limits Mistral was smoke-tested with at a 2,048-token context. The application requests 8,192 tokens; the bounded candidate check records whether these limits hold there. The DGX kernel has no swap-limit support, so the daemon records MemorySwap=-1 and memory_swap is not enforced."
+  },
+  "model_sources": {
+    "qwen": {"kind": "docker_volume", "name": "sr-qwen38-20261019T032515Z-x17f6I-models", "models_dir": "models"},
+    "nemotron": {"kind": "docker_volume", "name": "sr-nemotron35-lightning-20261019-models", "models_dir": "models"},
+    "mistral": {"kind": "host_directory", "path": "/usr/share/ollama/.ollama/models", "models_dir": ""}
+  },
+  "model_store": {
+    "kind": "docker_volume",
+    "name": "synergereader-compat-models-20261019",
+    "estimated_size_gib": 115,
+    "staging_tool": "stage_model_store.py"
+  },
+  "models": [
+    {
+      "tag": "qwen3.8:27b",
+      "manifest_digest": "aaee06c39dcf2437cde036998d960e1fc1494b8191be7cc9657d01e509097813",
+      "source": "qwen",
+      "profile_id": "qwen38_27b_experimental",
+      "answer_think": true,
+      "smoke": {"verdict": "PASS", "evidence": "/home/haihua/synergereader-model-tests/qwen38_cuda121_generation_20261019T161846Z_zpCMYz", "num_ctx": 2048}
+    },
+    {
+      "tag": "nemotron-3.5-lightning:30b",
+      "manifest_digest": "e6905fffe2e2d9bbe325a9a2d2e074e3bd32683721bc6dfba409dede2f17f4dc",
+      "source": "nemotron",
+      "profile_id": "nemotron35_lightning_30b_experimental",
+      "answer_think": true,
+      "smoke": {"verdict": "PASS", "evidence": "/home/haihua/synergereader-model-tests/nemotron35_cuda121_generation_20261019T164233Z_tMMcgC", "num_ctx": 2048}
+    },
+    {
+      "tag": "mistral-medium-3.5:128b",
+      "manifest_digest": "0341632adb051badc332bd814779ab931ab78619750bebe3b7c7b1401e9d70df",
+      "source": "mistral",
+      "profile_id": "mistral_medium35_128b_experimental",
+      "answer_think": "high",
+      "smoke": {"verdict": "REVIEW_REQUIRED", "evidence": "/home/haihua/synergereader-model-tests/mistral35_cuda121_generation_20261019T163014Z_s56gYq", "num_ctx": 2048, "note": "Only the original 99% GPU-residency target failed (91.27%, 70.35 of 77.08 GiB)."}
+    }
+  ]
+}
