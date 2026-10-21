@@ -19,6 +19,19 @@ What these prove, for the primary and compatibility runtimes:
 * an unreadable loaded-model list, or a previous profile whose runtime is not
   configured, aborts with the unchanged profile at a bumped epoch; so do a
   timeout and an administrator's abort; nothing falls back to another model;
+* review B2: with the experimental tier off the barrier reads only the
+  primary, previous and target runtimes, so a stopped compatibility runtime
+  never blocks a Gemma/Llama switch in either direction; with the tier on, or
+  for a persisted experimental selection, the compatibility runtime is read;
+* review B1: the bounded return to control -- an experimental profile on
+  the compatibility runtime back to Gemma or Llama, when only that runtime is
+  unavailable or unconfigured -- keeps polling every other runtime, commits
+  only after the full 420 s window (controlled clocks; no real waiting), and
+  reports ``residency_unverified``; a malformed list, an answering-but-failing
+  runtime, an unreadable primary, a lingering model ever seen, uncertain
+  work, a short window or keep-alive, and every switch toward or between
+  experimental profiles still fail closed; an administrator's abort and the
+  commit's compare-and-set fence still hold;
 * in-flight jobs keep their immutable snapshot through the drain, and the
   committed experimental selection admits one job at a time;
 * the coordinator only ever READS inventories and loaded-model lists: no
@@ -27,6 +40,7 @@ What these prove, for the primary and compatibility runtimes:
   memory with fixed messages, and the status says why.
 """
 
+import dataclasses
 import os
 import sys
 import time
@@ -44,7 +58,13 @@ from generation_admission import (  # noqa: E402
     SelectionPolicy,
     SharedSelection,
 )
-from generation_coordinator import CoordinatorSettings, SwitchCoordinator  # noqa: E402
+from generation_coordinator import (  # noqa: E402
+    RESIDENCY_UNVERIFIED,
+    CoordinatorSettings,
+    RuntimeInventoryUnavailable,
+    SwitchCoordinator,
+    keep_alive_seconds,
+)
 from generation_profiles import (  # noqa: E402
     COMPAT_RUNTIME,
     GEMMA_CANDIDATE,
@@ -58,6 +78,7 @@ from generation_profiles import (  # noqa: E402
     PRIMARY_RUNTIME,
     QWEN38_DIGEST,
     QWEN38_EXPERIMENTAL,
+    ModelRegistry,
     default_model_registry,
     shared_generation_snapshot,
 )
@@ -144,6 +165,7 @@ class _Runtimes:
         self.errors = {}
         self.inventory_calls = []
         self.residency_calls = []
+        self.on_read = None  # called with the runtime key before each read (controlled clocks)
 
     def listed_for(self, runtime_key, profile_id, polls):
         self.loaded[runtime_key].append([_entry(profile_id), polls])
@@ -153,6 +175,8 @@ class _Runtimes:
         return self.installed[runtime_key].get(tag)
 
     def resident_models(self, runtime_key):
+        if self.on_read is not None:
+            self.on_read(runtime_key)
         self.residency_calls.append(runtime_key)
         error = self.errors.get(runtime_key)
         if error is not None:
@@ -175,23 +199,27 @@ def _policy(registry):
     return resolve
 
 
-def _setup(active=GEMMA_CANDIDATE, *, registry=None, residency_timeout_s=1.0):
+def _setup(active=GEMMA_CANDIDATE, *, registry=None, residency_timeout_s=1.0, clock=time.monotonic, store=None):
     registry = registry or default_model_registry(experimental_enabled=True, configured_runtimes=BOTH)
-    store = _Store(SelectionRecord(active, None, "active", 4, None, None, None, None))
+    store = store or _Store(SelectionRecord(active, None, "active", 4, None, None, None, None))
     ledger = GenerationLedger(AdmissionSettings(), clock=time.monotonic, selection_policy=_policy(registry))
     assert ledger.install_owner(intents=store, owner_seq=1, selection=store.record.shared, paused_by=None,
                                 recovered={})
     owner = SimpleNamespace(store=store, state=OwnerState.OWNER, recovery=SimpleNamespace(selection=store.record))
     runtimes = _Runtimes()
+    logs = []
     coordinator = SwitchCoordinator(
         ledger=ledger, owner=owner, registry_provider=lambda: registry,
         installed_digest=runtimes.installed_digest, resident_models=runtimes.resident_models,
         settings=CoordinatorSettings(drain_timeout_s=2.0, residency_timeout_s=residency_timeout_s,
-                                     residency_poll_s=0.02, check_interval_s=0.01),
-        log=lambda line: None,
+                                     residency_poll_s=0.01 if clock is not time.monotonic else 0.02,
+                                     check_interval_s=0.01),
+        clock=clock,
+        log=logs.append,
     )
     assert coordinator.start()
-    return SimpleNamespace(store=store, ledger=ledger, runtimes=runtimes, coordinator=coordinator, registry=registry)
+    return SimpleNamespace(store=store, ledger=ledger, runtimes=runtimes, coordinator=coordinator, registry=registry,
+                           logs=logs)
 
 
 @pytest.fixture
@@ -428,9 +456,12 @@ def test_an_unreadable_compatibility_list_aborts_a_switch_in_either_direction(en
 
 
 def test_a_previous_profile_on_an_unconfigured_runtime_cannot_be_proven_gone(envs):
-    """A persisted experimental selection on a server without its runtime:
-    switching back to Gemma is accepted but aborts at the barrier, because
-    the compatibility runtime's list cannot be read here."""
+    """A persisted experimental selection on a server without its runtime,
+    with a residency window SHORTER than the return to control requires
+    (1 s < 420 s): switching back to Gemma is accepted but aborts at the
+    barrier, because the compatibility runtime's list cannot be read here.
+    With the full window the same switch commits unverified (see the
+    return-to-control tests below)."""
     env = _setup(QWEN38_EXPERIMENTAL, registry=default_model_registry())
     envs.append(env)
     assert env.coordinator.status()["active"]["eligible"] is False
@@ -518,3 +549,286 @@ def test_the_status_reports_experimental_choices_honestly(envs):
     assert "91.27%" in choices[MISTRAL35_EXPERIMENTAL]["review_note"]
     assert choices[QWEN38_EXPERIMENTAL]["runtime_smoke_verdict"] == "PASS"
     assert choices[GEMMA_CANDIDATE]["evidence"] == "qualified" and choices[LLAMA_CONTROL]["evidence"] == "control"
+
+
+# --- review B2: with the tier off, the compatibility runtime never blocks Gemma/Llama ----------
+
+TIER_OFF_BOTH = dict(experimental_enabled=False, configured_runtimes=BOTH)  # URL set, tier off
+
+
+@pytest.mark.parametrize("active, target", [(GEMMA_CANDIDATE, LLAMA_CONTROL), (LLAMA_CONTROL, GEMMA_CANDIDATE)],
+                         ids=["gemma-to-llama", "llama-to-gemma"])
+@pytest.mark.parametrize("failure", [RuntimeInventoryUnavailable("down"), RuntimeError("answered 500"),
+                                     ValueError("malformed")], ids=["down", "error", "malformed"])
+def test_with_the_tier_off_a_failing_compat_runtime_never_blocks_a_primary_switch(envs, active, target, failure):
+    env = _setup(active, registry=default_model_registry(**TIER_OFF_BOTH))
+    envs.append(env)
+    env.runtimes.errors[COMPAT_RUNTIME] = failure
+    env.runtimes.listed_for(PRIMARY_RUNTIME, active, polls=2)
+    assert _switch(env, target) == ("committed", None)
+    assert COMPAT_RUNTIME not in env.runtimes.residency_calls, "nothing this backend loads can be there"
+    assert env.runtimes.residency_calls.count(PRIMARY_RUNTIME) >= 3, "the primary is still read until clear"
+    assert env.store.record.active_profile_id == target
+
+
+def test_with_the_tier_on_the_compat_runtime_is_still_read_for_a_primary_switch(envs):
+    down = _setup(GEMMA_CANDIDATE)
+    envs.append(down)
+    down.runtimes.errors[COMPAT_RUNTIME] = RuntimeInventoryUnavailable("down")
+    assert _switch(down, LLAMA_CONTROL) == ("aborted", "residency_unavailable")
+    assert down.store.record.active_profile_id == GEMMA_CANDIDATE
+
+    lingering = _setup(GEMMA_CANDIDATE, residency_timeout_s=0.3)
+    envs.append(lingering)
+    lingering.runtimes.listed_for(COMPAT_RUNTIME, NEMOTRON35_EXPERIMENTAL, polls=None)
+    assert _switch(lingering, LLAMA_CONTROL) == ("aborted", "residency_timeout")
+    assert COMPAT_RUNTIME in lingering.runtimes.residency_calls
+
+
+def test_a_persisted_experimental_selection_with_the_tier_off_still_reads_its_own_runtime(envs):
+    env = _setup(QWEN38_EXPERIMENTAL, registry=default_model_registry(**TIER_OFF_BOTH))
+    envs.append(env)
+    env.runtimes.listed_for(COMPAT_RUNTIME, QWEN38_EXPERIMENTAL, polls=3)
+    assert _switch(env, GEMMA_CANDIDATE) == ("committed", None), "verified: Qwen was seen to leave"
+    assert env.runtimes.residency_calls.count(COMPAT_RUNTIME) >= 4
+
+
+# --- review B1: the bounded return to control (controlled clocks) ------------------------------
+#
+# The clock only moves when the test moves it: by a fixed step after each residency poll (the
+# coordinator's wait between polls), or not at all. Nothing waits seven real minutes.
+
+WINDOW = 420.0
+
+
+class _Clock:
+    def __init__(self, step=0.0):
+        self.now = 1000.0
+        self.step = step
+        self.primary_reads = []  # controlled time of each primary-runtime read
+
+    def __call__(self):
+        return self.now
+
+    def on_read(self, runtime_key):
+        if runtime_key == PRIMARY_RUNTIME:
+            self.primary_reads.append(self.now)
+
+    def tick(self):
+        self.now += self.step
+
+
+class _TimedStore(_Store):
+    """Records the controlled time of the commit, and can count unresolved rows on a script."""
+
+    def __init__(self, record, clock, unresolved=None):
+        super().__init__(record)
+        self.clock = clock
+        self.commit_time = None
+        self.unresolved = list(unresolved or [])
+
+    def count_unresolved(self):
+        return self.unresolved.pop(0) if self.unresolved else 0
+
+    def commit_switch(self, *, switching):
+        self.commit_time = self.clock.now
+        return super().commit_switch(switching=switching)
+
+
+def _recovery(active=QWEN38_EXPERIMENTAL, *, step=30.0, registry=None, window=WINDOW, unresolved=None,
+              store_cls=_TimedStore):
+    clock = _Clock(step)
+    store = store_cls(SelectionRecord(active, None, "active", 4, None, None, None, None), clock, unresolved)
+    env = _setup(active, registry=registry, residency_timeout_s=window, clock=clock, store=store)
+    env.clock = clock
+    env.runtimes.on_read = clock.on_read
+    real_wait = env.coordinator._wait
+
+    def wait_then_tick(switch, seconds):
+        real_wait(switch, seconds)
+        clock.tick()
+    env.coordinator._wait = wait_then_tick
+    return env
+
+
+@pytest.mark.parametrize("target", [GEMMA_CANDIDATE, LLAMA_CONTROL], ids=["to-gemma", "to-llama"])
+def test_compat_down_return_to_control_commits_unverified_only_after_the_full_window(envs, target):
+    env = _recovery()
+    envs.append(env)
+    env.runtimes.errors[COMPAT_RUNTIME] = RuntimeInventoryUnavailable("connection refused")
+    assert _switch(env, target) == ("committed", RESIDENCY_UNVERIFIED)
+    started = env.clock.primary_reads[0]
+    assert env.store.commit_time - started >= WINDOW, "never before the full window after draining"
+    assert len(env.clock.primary_reads) >= WINDOW / 30.0, "the primary runtime was polled throughout"
+    assert env.runtimes.residency_calls.count(COMPAT_RUNTIME) >= WINDOW / 30.0, "compat kept being tried"
+    assert env.store.writes == ["begin", "commit"] and env.store.record.active_profile_id == target
+    assert env.ledger.snapshot().selection == SharedSelection(target, 6)
+    assert env.ledger.snapshot().admission == "open"
+    unverified = [line for line in env.logs if "residency unverified" in line]
+    assert unverified and "does not prove the previous model unloaded" in unverified[0]
+    assert env.coordinator.status()["last_switch"]["reason"] == RESIDENCY_UNVERIFIED
+
+
+def test_compat_unconfigured_return_to_control_commits_unverified_after_the_full_window(envs):
+    """Review R3: a restart without SYNERGE_COMPAT_OLLAMA_URL kept the persisted Qwen selection."""
+    env = _recovery(registry=default_model_registry())  # primary only, tier off
+    envs.append(env)
+    assert env.coordinator.status()["active"]["eligible"] is False
+    assert _switch(env, GEMMA_CANDIDATE) == ("committed", RESIDENCY_UNVERIFIED)
+    assert COMPAT_RUNTIME not in env.runtimes.residency_calls, "an unconfigured runtime is never contacted"
+    assert env.store.commit_time - env.clock.primary_reads[0] >= WINDOW
+
+
+def test_the_deadline_is_enforced_and_polling_continues_while_the_clock_stands_still(envs):
+    env = _recovery(step=0.0)  # time does not move by itself
+    envs.append(env)
+    env.runtimes.errors[COMPAT_RUNTIME] = RuntimeInventoryUnavailable("down")
+    assert env.coordinator.request_switch(GEMMA_CANDIDATE).accepted
+    _phase(env, "awaiting_residency_unverified")
+    deadline = time.monotonic() + _WAIT
+    while len(env.clock.primary_reads) < 25 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(env.clock.primary_reads) >= 25, "still polling every runtime it needs"
+    env.clock.now += WINDOW - 1.0  # one second short of the window
+    reads = len(env.clock.primary_reads)
+    while len(env.clock.primary_reads) < reads + 10 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert env.coordinator.status()["switch"]["phase"] == "awaiting_residency_unverified"
+    assert env.store.writes == ["begin"], "no commit before the full window"
+    env.clock.now += 1.0
+    assert _outcome(env) == ("committed", RESIDENCY_UNVERIFIED)
+
+
+def test_compat_coming_back_clean_during_the_window_commits_verified(envs):
+    env = _recovery(step=10.0)
+    envs.append(env)
+    env.runtimes.errors[COMPAT_RUNTIME] = RuntimeInventoryUnavailable("down")
+
+    def recover(runtime_key):
+        env.clock.on_read(runtime_key)
+        if len(env.clock.primary_reads) == 5:
+            env.runtimes.errors.pop(COMPAT_RUNTIME, None)  # back, nothing loaded
+    env.runtimes.on_read = recover
+    assert _switch(env, GEMMA_CANDIDATE) == ("committed", None), "a readable clean list verifies residency"
+    assert env.store.commit_time - env.clock.primary_reads[0] < WINDOW
+
+
+def test_an_administrator_can_abort_the_unverified_wait(envs):
+    env = _recovery(step=0.0)
+    envs.append(env)
+    env.runtimes.errors[COMPAT_RUNTIME] = RuntimeInventoryUnavailable("down")
+    assert env.coordinator.request_switch(GEMMA_CANDIDATE).accepted
+    _phase(env, "awaiting_residency_unverified")
+    assert env.coordinator.abort_switch().accepted
+    assert _outcome(env) == ("aborted", "admin_abort")
+    assert env.store.record.active_profile_id == QWEN38_EXPERIMENTAL
+    assert env.store.writes == ["begin", "abort:admin_abort"]
+    env.clock.now += 10 * WINDOW
+    time.sleep(0.05)
+    assert env.store.writes == ["begin", "abort:admin_abort"], "no late commit after an acknowledged abort"
+
+
+class _ConflictStore(_TimedStore):
+    """The selection changed under the switch: the commit's compare-and-set fails."""
+
+    def commit_switch(self, *, switching):
+        self.commit_time = self.clock.now
+        return None
+
+
+def test_the_commit_fence_still_holds_for_an_unverified_return(envs):
+    env = _recovery(store_cls=_ConflictStore)
+    envs.append(env)
+    env.runtimes.errors[COMPAT_RUNTIME] = RuntimeInventoryUnavailable("down")
+    assert _switch(env, GEMMA_CANDIDATE) == ("aborted", "selection_conflict")
+    assert env.store.record.active_profile_id == QWEN38_EXPERIMENTAL
+
+
+# Each must stay fail-closed even with the full window and the compatibility runtime down.
+def _fail_closed_cases():
+    down = RuntimeInventoryUnavailable("down")
+    return {
+        "toward-experimental": dict(active=GEMMA_CANDIDATE, target=QWEN38_EXPERIMENTAL,
+                                    errors={COMPAT_RUNTIME: down}, outcome=("aborted", "residency_unavailable")),
+        "between-experimental": dict(active=QWEN38_EXPERIMENTAL, target=MISTRAL35_EXPERIMENTAL,
+                                     errors={COMPAT_RUNTIME: down}, outcome=("aborted", "residency_unavailable")),
+        "primary-unavailable": dict(errors={COMPAT_RUNTIME: down, PRIMARY_RUNTIME: RuntimeInventoryUnavailable("x")},
+                                    outcome=("aborted", "residency_unavailable")),
+        "primary-malformed": dict(errors={COMPAT_RUNTIME: down}, replies={PRIMARY_RUNTIME: [{"size": 1}]},
+                                  outcome=("aborted", "residency_unavailable")),
+        "compat-malformed": dict(replies={COMPAT_RUNTIME: [{"size": 1}]},
+                                 outcome=("aborted", "residency_unavailable")),
+        "compat-not-a-list": dict(replies={COMPAT_RUNTIME: {"models": "nope"}},
+                                  outcome=("aborted", "residency_unavailable")),
+        "compat-answered-with-an-error": dict(errors={COMPAT_RUNTIME: RuntimeError("HTTP 500")},
+                                              outcome=("aborted", "residency_unavailable")),
+        "compat-lists-qwen-until-the-deadline": dict(listed=[(COMPAT_RUNTIME, QWEN38_EXPERIMENTAL)],
+                                                     outcome=("aborted", "residency_timeout")),
+        "registered-model-lingers-on-primary": dict(errors={COMPAT_RUNTIME: down},
+                                                    listed=[(PRIMARY_RUNTIME, MISTRAL35_EXPERIMENTAL)],
+                                                    outcome=("aborted", "residency_timeout")),
+        "uncertain-work-appears-in-the-window": dict(errors={COMPAT_RUNTIME: down}, unresolved=[0, 1],
+                                                     outcome=("aborted", "uncertain_work")),
+    }
+
+
+@pytest.mark.parametrize("case", sorted(_fail_closed_cases()))
+def test_everything_outside_the_bounded_return_stays_fail_closed(envs, case):
+    spec = _fail_closed_cases()[case]
+    active = spec.get("active", QWEN38_EXPERIMENTAL)
+    env = _recovery(active, unresolved=spec.get("unresolved"))
+    envs.append(env)
+    env.runtimes.errors.update(spec.get("errors", {}))
+    for runtime_key, profile_id in spec.get("listed", []):
+        env.runtimes.listed_for(runtime_key, profile_id, polls=None)
+    replies = spec.get("replies", {})
+    if replies:
+        real = env.runtimes.resident_models
+
+        def resident(key):
+            if key in replies:
+                env.clock.on_read(key)
+                return replies[key]
+            return real(key)
+        env.coordinator._resident_models = resident
+    assert _switch(env, spec.get("target", GEMMA_CANDIDATE)) == spec["outcome"]
+    assert env.store.record.active_profile_id == active, "the unchanged profile, at a bumped epoch"
+    assert "commit" not in env.store.writes
+    assert not any("residency unverified" in line for line in env.logs)
+
+
+def test_lingering_seen_on_a_readable_list_then_unavailable_never_commits_unverified(envs):
+    env = _recovery()
+    envs.append(env)
+    env.runtimes.listed_for(COMPAT_RUNTIME, QWEN38_EXPERIMENTAL, polls=None)
+
+    def go_dark(runtime_key):
+        env.clock.on_read(runtime_key)
+        # Qwen was listed on the first three compat reads; from the fourth the runtime is gone.
+        if runtime_key == COMPAT_RUNTIME and env.runtimes.residency_calls.count(COMPAT_RUNTIME) == 3:
+            env.runtimes.errors[COMPAT_RUNTIME] = RuntimeInventoryUnavailable("crashed")
+    env.runtimes.on_read = go_dark
+    assert _switch(env, GEMMA_CANDIDATE) == ("aborted", "residency_timeout")
+    assert env.store.record.active_profile_id == QWEN38_EXPERIMENTAL
+    assert COMPAT_RUNTIME in env.runtimes.errors, "the runtime did go dark before the deadline"
+
+
+@pytest.mark.parametrize("window, keep_alive", [(WINDOW - 1.0, "5m"), (WINDOW, "10m"), (WINDOW, "7m")],
+                         ids=["window-below-420", "keep-alive-10m", "keep-alive-equals-window"])
+def test_a_window_that_does_not_outlast_the_previous_keep_alive_stays_fail_closed(envs, window, keep_alive):
+    base = default_model_registry(experimental_enabled=True, configured_runtimes=BOTH)
+    profiles = tuple(dataclasses.replace(p, keep_alive=keep_alive) if p.profile_id == QWEN38_EXPERIMENTAL else p
+                     for p in base.profiles)
+    registry = ModelRegistry(profiles=profiles, default_profile_id=base.default_profile_id,
+                             experimental_enabled=True, configured_runtimes=BOTH)
+    env = _recovery(registry=registry, window=window)
+    envs.append(env)
+    env.runtimes.errors[COMPAT_RUNTIME] = RuntimeInventoryUnavailable("down")
+    assert _switch(env, GEMMA_CANDIDATE) == ("aborted", "residency_unavailable")
+    assert env.store.record.active_profile_id == QWEN38_EXPERIMENTAL
+
+
+@pytest.mark.parametrize("value, seconds", [("5m", 300.0), ("300s", 300.0), ("1h", 3600.0), ("10m", 600.0),
+                                            ("0m", None), ("5", None), ("m", None), (None, None), ("05m", None)])
+def test_keep_alive_seconds(value, seconds):
+    assert keep_alive_seconds(value) == seconds

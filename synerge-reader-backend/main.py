@@ -116,7 +116,13 @@ from answer_jobs import (
     acquire_answer,
 )
 from generation_selection import GenerationOwner, OwnerSettings, PostgresGenerationStore
-from generation_coordinator import CoordinatorSettings, GenerationRuntime, SwitchCoordinator, loaded_model_entries
+from generation_coordinator import (
+    CoordinatorSettings,
+    GenerationRuntime,
+    RuntimeInventoryUnavailable,
+    SwitchCoordinator,
+    loaded_model_entries,
+)
 import requests
 import json
 import time
@@ -1276,12 +1282,68 @@ def _resident_models(runtime_key: str = PRIMARY_RUNTIME) -> list:
     (/api/ps). Used only as the switch coordinator's residency barrier; it is
     a point-in-time view and never proves exclusive GPU use. A successful
     response alone is not a readable inventory: a reply without an explicit
-    models list, or with an entry that names no model, raises -- as does a
-    runtime that is not configured or not reachable."""
-    base_url = _runtime_base_url(runtime_key)
-    response = requests.get(f"{base_url}/api/ps", timeout=(OLLAMA_CONNECT_TIMEOUT, 5))
-    response.raise_for_status()
-    return loaded_model_entries(response.json())
+    models list, or with an entry that names no model, raises.
+
+    Two kinds of failure are kept apart, because the coordinator may excuse
+    only the first, and only for the previous compatibility runtime on a
+    return to Gemma or Llama. RuntimeInventoryUnavailable is raised ONLY for
+    a compatibility runtime that is not configured here, or for a CONFIRMED
+    connection-establishment failure: a connect timeout, or a new connection
+    that could not be made (refused, unreachable, name not resolved). Every
+    other failure fails closed -- the runtime may have answered and may
+    still hold weights: a timeout or protocol error while reading the status
+    line, headers or body (Requests can report a body read timeout as a
+    ConnectionError), any other or ambiguous ConnectionError, an HTTP error
+    status, a body that is not JSON, or a malformed list.
+
+    The response is streamed so the HTTP status is checked BEFORE the body is
+    read, and it is always closed. Redirects are never followed, and only
+    HTTP 200 is accepted: any other status, a 3xx included (which
+    ``raise_for_status`` lets through), fails closed without its body being
+    read. The compatibility list is read directly from its configured
+    endpoint (no reachability cache) so a failure is classified by this read
+    itself."""
+    if runtime_key == COMPAT_RUNTIME:
+        if not _COMPAT_RUNTIME_URL:
+            raise RuntimeInventoryUnavailable("the compatibility runtime is not configured")
+        base_url = _COMPAT_RUNTIME_URL
+    else:
+        base_url = _runtime_base_url(runtime_key)
+    try:
+        response = requests.get(
+            f"{base_url}/api/ps", timeout=(OLLAMA_CONNECT_TIMEOUT, 5), stream=True, allow_redirects=False,
+        )
+    except requests.exceptions.ConnectTimeout:
+        raise RuntimeInventoryUnavailable("the runtime did not accept a connection") from None
+    except requests.exceptions.ConnectionError as exc:
+        if _connection_never_established(exc):
+            raise RuntimeInventoryUnavailable("the runtime did not accept a connection") from None
+        raise RuntimeError("the runtime's loaded-model list could not be read") from None
+    except Exception:
+        # A read timeout on the status line or headers, or anything else: fail closed.
+        raise RuntimeError("the runtime's loaded-model list could not be read") from None
+    try:
+        if response.status_code != 200:
+            raise ValueError("not HTTP 200")  # a redirect or any other status: fail closed
+        payload = response.json()
+    except Exception:
+        raise RuntimeError("the runtime's loaded-model list could not be read") from None
+    finally:
+        response.close()
+    return loaded_model_entries(payload)
+
+
+def _connection_never_established(exc: BaseException) -> bool:
+    """Whether a Requests ConnectionError is a confirmed failure to OPEN the
+    connection: urllib3's NewConnectionError (refused, unreachable, name not
+    resolved) as the reason of the MaxRetryError Requests wraps. Anything
+    else -- a protocol error, a dropped connection, a body read timeout that
+    Requests reports as a ConnectionError, or an error without that exact
+    cause -- is not confirmed and returns False."""
+    from urllib3.exceptions import MaxRetryError, NewConnectionError
+
+    cause = exc.args[0] if exc.args else None
+    return isinstance(cause, MaxRetryError) and isinstance(cause.reason, NewConnectionError)
 
 
 def _coordinator_settings() -> CoordinatorSettings:

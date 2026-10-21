@@ -125,12 +125,128 @@ A persisted experimental selection survives a restart unchanged. If the tier is 
 runtime unconfigured, answers are refused with a 503 and the administrator panel says why.
 Nothing switches automatically.
 
+## 5. Switching, and returning to Gemma or Llama when this runtime is down
+
+The switch barrier waits for the previous model to leave by its own keep-alive. Which runtimes it
+reads:
+
+- **Always:** the primary runtime, and the previous and target profiles' runtimes.
+- **This runtime too, only while `SYNERGE_EXPERIMENTAL_MODELS` is on.** With the tier off, nothing this
+  backend loads can be resident here. A stopped or crashed compatibility container therefore never
+  blocks a Gemma↔Llama switch, even when the URL is still set.
+- **A persisted experimental selection** still reads its own runtime as the previous one.
+
+Anything the barrier needs and cannot read aborts the switch. That covers:
+- any status other than HTTP 200, including a redirect (redirects are never followed, and a redirect's
+  body is never read as an inventory);
+- a timeout or protocol error while the status line, headers or body are read;
+- a body that is not JSON, or a malformed list;
+- an ambiguous connection error, or an unreachable primary runtime.
+
+The selection stays unchanged at a bumped epoch.
+
+**One bounded exception, the return to control.** It applies when all of these hold:
+- the switch is from an experimental profile on this runtime to Gemma or Llama on the primary runtime;
+- the only runtime that cannot be read is this one, and either its URL is not configured on this server
+  (for example after a restart without the URL), or a connection to it could **not be established**:
+  - the connection was refused;
+  - the host could not be reached or resolved;
+  - the connect timed out.
+- the window exceeds the previous profile's configured keep-alive.
+
+A runtime that accepted the connection and then failed — including one that sent a status and part
+of a body before stalling — does not qualify. Its response status is checked before the body is
+read, and the response is always closed.
+
+When they hold, the coordinator:
+- keeps admission paused;
+- requires all admitted work to drain, and no unknown or unresolved call (in memory and in the database);
+- keeps polling every other runtime it needs;
+- commits only after the **full 420 s residency window** that starts once draining has finished.
+
+The window exceeds the previous profile's configured 5-minute keep-alive. That bounds how long this
+backend's own last request should keep the model loaded, but whether the model actually expired and
+unloaded is **not verified**.
+
+The switch is then reported as **committed with `residency_unverified`** in the status and the
+administrator panel, with a log line saying the timer does not prove the old model unloaded. The
+database keeps `last_outcome = 'committed'`; there is no schema change.
+
+It still fails closed when:
+- this runtime answered but its list was unusable, or it was readable and still listed a blocking
+  model at any point in the window;
+- the primary runtime cannot be read, or lists a lingering registered model;
+- work becomes uncertain;
+- the window is shorter than 420 s or does not outlast the keep-alive;
+- the switch is toward or between experimental profiles.
+
+Throughout, an administrator can abort, and the commit keeps its compare-and-set fence. If this
+runtime comes back with a readable, clean list during the window, the switch commits as an ordinary,
+verified switch.
+
+`recovery/restore_selection_to_gemma.sql` in the candidate bundle remains for the case the new
+backend cannot run at all.
+
+## 6. Default-off is not a pure no-op
+
+With `SYNERGE_EXPERIMENTAL_MODELS` unset, these behaviours still change for every deployment of
+this backend (release notes):
+
+- **Heartbeats:** every `/ask` stream, Gemma's included, sends a `{"type":"heartbeat"}` line after 15 s of
+  silence. Current and older frontends ignore unknown event types. `X-Accel-Buffering: no` and nginx's
+  600 s read timeout are compatible with this.
+- **Provenance v4:** every new answer record is schema version 4 (runtime key, experimental flag,
+  think value). Versions 1–3 stay readable, and the admin history returns raw JSONB, so an older
+  backend is not broken by v4 rows.
+- **Switch drain timeout:** it rises from 480 s to 960 s for every switch. The coordinator settings
+  take the longest job budget over all *registered* profiles, including disabled ones (Mistral's
+  900 s + 60 s).
+- **Registered experimental tags on the host Ollama block switches.** The barrier waits for every
+  registered generation model, including experimental tags, on the runtimes it reads, even with the
+  defaults. If another client loads `mistral-medium-3.5:128b` (the same digest `0341632a…` is in the
+  host store) on the host Ollama, Gemma↔Llama switches wait for it and abort at the residency
+  deadline. Operators should not run experimental tags on the host Ollama.
+- **Completion lines:** each verifier and helper call, Gemma's included, logs one
+  `[Generation] completion` line with counts only (role, profile, result, `done_reason`, token counts,
+  thinking and reply lengths), never text.
+
+## 7. Bounded candidate checks on the DGX
+
+These are runtime-compatibility results only. They are not quality, capacity, vision or
+citation-quality results. The Q&A-pair helper was **not exercised** in either run.
+
+| Run | Snapshot / tree | Result |
+| --- | --- | --- |
+| `xm-20261020T030140Z-dc2e7a43` | tree `b44896f9…` | **FAIL, 20/22 gates.** Qwen and Mistral passed. Nemotron's answer completed (1,530 of 2,048 tokens), but its verifier and insights calls generated exactly their allowances, 512 and 2,048, without a usable reply. This led to Nemotron's own allowances and the completion diagnostics |
+| `xm-20261020T192510Z-5a0f4ccc` (evidence archive SHA-256 `728b01ae…7482`) | tree `6a502336…` | **PASS.** Nemotron first: 14/14 gates. Then Qwen and Mistral: 18/18 gates |
+
+Details of the passing run (`xm-20261020T192510Z-5a0f4ccc`):
+
+| Profile | Answer prompt/generated tokens | Verifier (tokens of allowance) | Insights (tokens of allowance) | Residency | Answer total |
+| --- | --- | --- | --- | --- | --- |
+| Nemotron | 1,814 / 515 | 1,076 of 2,048, 1 claim judged | 4,088 of 4,096, stored | 100% (25.39 GiB) | 32 s |
+| Qwen | 1,740 / 97 | 143 of 512 | 655 of 2,048 | 100% (22.31 GiB) | 80 s |
+| Mistral | 2,338 / 185 | 302 of 512 | 601 of 2,048 | 83.62% (69.01 of 82.53 GiB) | 261 s, 16 heartbeats |
+
+Gemma's D17 answer and the D12/T6R table regression check passed in both runs. Each switch took
+about 300 s.
+
+**Notes from the passing run:**
+- **Nemotron's insights used 4,088 of its 4,096 tokens.** A slightly longer excerpt would be cut off; the
+  result would then, safely, not be stored.
+- **The compatibility runtime logged 10 GPU-discovery watchdog timeouts.** The cause is not
+  established.
+
+**What this evidence covers.** It validates tree `6a502336…` only. The later switch-coordinator
+correction (the B2 runtime set and the B1 return to control) changes the tree, and has offline tests
+but no DGX run.
+
 ## Limitations (recorded, not resolved)
 
 - **Swap limit:** the DGX kernel has no swap-limit support. The daemon records `MemorySwap=-1`, so `memswap_limit` is not enforced; `mem_limit` is.
 - **Mistral:** at most 91.27% GPU-resident in its smoke test (it uses CPU memory too). Its cold load was about 180 s. The backend gives it a 420 s per-read timeout within a 900 s job budget. A model switch can take several minutes.
 - **Public cold-load survival:** answer streams send a heartbeat line after every 15 s of silence, so that proxies with an idle limit (~100 s on the public route) keep the stream open. The sender's behaviour is unit-tested; the private candidate uses loopback only. Whether a Mistral cold load survives the real public route (nginx and Cloudflare) is a later deployment check, not yet proved.
-- **Switching on the shared GPU pool:** a switch waits until every registered generation model has left every runtime by its own keep-alive expiry. The only exception is the target model on the runtime that will serve it. A copy of the target on the other runtime blocks too, and nothing is unloaded.
+- **Switching on the shared GPU pool:** a switch waits until every registered generation model has left every runtime the barrier reads, by its own keep-alive expiry (see section 5 for which runtimes, and for the bounded return to control). The only exception is the target model on the runtime that will serve it. A copy of the target on the other runtime blocks too, and nothing is unloaded. Each switch took about 300 s in the DGX checks.
 - **Context and output limits:** only 2,048-token contexts were smoke-tested. The application uses 8,192 tokens with conservative output allowances, thinking included: answer 2,048 for all three; verifier 512 and helper 2,048 for Qwen and Mistral; verifier 2,048 and helper 4,096 for Nemotron. Nemotron's are its own because in the first bounded candidate check (`xm-20261020T030140Z-dc2e7a43`) its verifier generated exactly 512 tokens and its insights helper exactly 2,048, and neither reply was usable. Thinking stays on for every role: the runtime accepts `think: false` and effort levels for Nemotron, but neither has been tested with it. A reply that reaches its allowance is still cut off: never a verdict, never stored, never retried. Each verifier and helper reply logs one `[Generation] completion` line with the role, profile, `done_reason`, token counts and the lengths (never the text) of its thinking and final reply. These are initial limits, not measured capacity.
 - **Concurrency:** one combined answer-or-helper job at a time while an experimental profile is selected. Additional users get the existing bounded wait/busy behaviour. Not a measured capacity.
 - **Not established:** quality, comparative performance, vision, citation quality and capacity are all deferred.

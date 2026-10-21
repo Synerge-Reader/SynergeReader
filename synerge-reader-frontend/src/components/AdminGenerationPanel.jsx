@@ -36,6 +36,8 @@ const PHASES = {
   verifying_target: "checking the selected model",
   draining: "waiting for running answers to finish",
   awaiting_residency: "waiting for the previous model to unload (this can take several minutes)",
+  awaiting_residency_unverified:
+    "the previous model's runtime cannot be read; waiting the full residency window before returning (its unloading cannot be confirmed)",
   committing: "committing",
   aborting: "aborting",
   interrupted: "interrupted by a restart — abort it to resume answering",
@@ -43,6 +45,10 @@ const PHASES = {
 
 function outcomeText(last) {
   if (!last) return null;
+  if (last.outcome === "committed" && last.reason === "residency_unverified") {
+    return "Last switch committed with residency unverified: the previous model's runtime could not be read, " +
+      "so the switch waited out the full residency window. That does not confirm the previous model unloaded.";
+  }
   const reason = last.reason ? REASONS[last.reason] || "the switch failed" : null;
   if (last.outcome === "committed") return "Last switch committed.";
   if (last.outcome === "aborted") return `Last switch aborted${reason ? `: ${reason}` : ""}.`;

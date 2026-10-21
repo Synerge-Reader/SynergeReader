@@ -136,6 +136,35 @@ test("a pending switch can be aborted and the failure reason is shown in fixed w
   expect(screen.getByTestId("active-model")).toHaveTextContent("Llama 3.1 8B");
 });
 
+test("a return to control waiting on an unreadable runtime says unloading cannot be confirmed", async () => {
+  const waiting = status({
+    admission: "paused",
+    switch: { switch_id: "s-2", target_profile_id: "gemma_candidate", phase: "awaiting_residency_unverified",
+      abort_requested: false, origin: "this_process" },
+  });
+  backend({ statuses: [waiting] });
+  renderPanel({ pollMs: 100000 });
+  expect(await screen.findByTestId("switch-pending")).toHaveTextContent(
+    "the previous model's runtime cannot be read; waiting the full residency window before returning " +
+    "(its unloading cannot be confirmed)");
+  expect(screen.getByRole("button", { name: "Abort switch" })).toBeEnabled();
+});
+
+test("a commit with residency unverified is reported as such, never as a plain commit", async () => {
+  const recovered = status({
+    active: { profile_id: "gemma_candidate", display_name: "Gemma 4 31B", model: "gemma4:31b", epoch: 7, registered: true },
+    last_switch: { switch_id: "s-2", target_profile_id: "gemma_candidate", outcome: "committed",
+      reason: "residency_unverified" },
+    choices: CHOICES.map(c => ({ ...c, active: c.profile_id === "gemma_candidate" })),
+  });
+  backend({ statuses: [recovered] });
+  renderPanel({ pollMs: 100000 });
+  const outcome = await screen.findByTestId("switch-outcome");
+  expect(outcome).toHaveTextContent("Last switch committed with residency unverified");
+  expect(outcome).toHaveTextContent("That does not confirm the previous model unloaded.");
+  expect(outcome).not.toHaveTextContent(/^Last switch committed\.$/);
+});
+
 test("an unreadable status says so instead of guessing", async () => {
   global.fetch = jest.fn(() => Promise.reject(new TypeError("network down")));
   renderPanel();

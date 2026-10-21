@@ -944,8 +944,11 @@ class ModelRegistry:
     for) are fixed when the registry is built, at import, from server
     configuration -- never from a request. A profile whose runtime is not
     configured is refused, but stays registered, so a persisted selection
-    naming it is reported (and can be switched away from) rather than
-    silently replaced."""
+    naming it is reported rather than silently replaced. An administrator
+    can switch away from it to Gemma or Llama: when its runtime cannot be
+    read, the coordinator's bounded return to control commits only after the
+    full residency window and reports the residency as unverified (see
+    generation_coordinator.py)."""
 
     profiles: Tuple[ModelProfile, ...]
     default_profile_id: str

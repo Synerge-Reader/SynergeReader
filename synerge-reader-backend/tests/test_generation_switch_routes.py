@@ -271,6 +271,8 @@ class _Stream:
 
 
 class _Reply:
+    status_code = 200
+
     def __init__(self, body):
         self.body = body
 
@@ -279,6 +281,9 @@ class _Reply:
 
     def json(self):
         return dict(self.body)
+
+    def close(self):
+        pass
 
 
 @contextlib.contextmanager
@@ -481,7 +486,7 @@ def _ps_entry(tag, digest):
 def test_the_residency_barrier_trusts_only_a_readable_ollama_inventory(env, monkeypatch, payload, outcome, reason):
     reads = []
 
-    def ps(url, timeout=None):
+    def ps(url, timeout=None, **kwargs):
         reads.append(url)
         return _Reply(payload)
 

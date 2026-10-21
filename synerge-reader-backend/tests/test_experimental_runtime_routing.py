@@ -38,6 +38,7 @@ import json
 import os
 import sys
 import time
+from types import SimpleNamespace
 
 import dotenv
 from fastapi.testclient import TestClient
@@ -170,6 +171,8 @@ class _Stream:
 
 
 class _Reply:
+    status_code = 200
+
     def __init__(self, body):
         self.body = body
 
@@ -178,6 +181,9 @@ class _Reply:
 
     def json(self):
         return self.body
+
+    def close(self):
+        pass
 
 
 class _Transport:
@@ -855,6 +861,444 @@ def test_identity_and_residency_reads_go_to_the_named_runtime(monkeypatch, env, 
     assert main._resident_models(PRIMARY_RUNTIME) == []
     with pytest.raises(RuntimeError):
         main._runtime_base_url("elsewhere")
+
+
+# --- the residency read tells "did not answer" from "answered but unreadable" (review B1) ------
+#
+# The coordinator may excuse ONLY RuntimeInventoryUnavailable, and only for the previous
+# compatibility runtime on a return to Gemma or Llama. Everything else fails closed.
+
+class _HttpError:
+    def __init__(self, status):
+        self.status = status
+        self.status_code = status
+        self.body_read = False
+        self.closed = False
+
+    def raise_for_status(self):
+        import requests
+        raise requests.exceptions.HTTPError(f"{self.status} Server Error")
+
+    def json(self):
+        self.body_read = True
+        return {"error": "SECRET-DETAIL"}
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize("env", [{"compat_url": None}], indirect=True, ids=["no-endpoint"])
+def test_an_unconfigured_compat_runtime_is_unavailable_and_never_contacted(monkeypatch, env, transport):
+    main, client, db = env
+    from generation_coordinator import RuntimeInventoryUnavailable
+    with pytest.raises(RuntimeInventoryUnavailable):
+        main._resident_models(COMPAT_RUNTIME)
+    assert not [url for url in transport.gets if "/api/ps" in url and not url.startswith(PRIMARY_URL)]
+
+
+def _failing_ps(transport, failure):
+    real_get = transport.get
+
+    def get(url, timeout=None, **kwargs):
+        if url == f"{COMPAT_URL}/api/ps":
+            transport.gets.append(url)
+            if isinstance(failure, BaseException):
+                raise failure
+            return failure
+        return real_get(url, timeout=timeout, **kwargs)
+    return get
+
+
+def _new_connection_error():
+    """The exact shape Requests raises when a NEW connection cannot be opened."""
+    import requests
+    from urllib3.exceptions import MaxRetryError, NewConnectionError
+    return requests.exceptions.ConnectionError(
+        MaxRetryError(None, "/api/ps", NewConnectionError(None, "SECRET-DETAIL refused")))
+
+
+@pytest.mark.parametrize(
+    "failure, unavailable",
+    [
+        # Confirmed connection-establishment failures only.
+        ("new-connection-error", True),
+        ("connect-timeout", True),
+        # Ambiguous or after-connect failures: fail closed.
+        ("connection-error-without-a-cause", False),
+        ("connection-error-wrapping-a-body-read-timeout", False),
+        ("connection-error-wrapping-a-protocol-error", False),
+        ("builtin-connection-refused", False),
+        ("read-timeout", False),
+        ("http-500", False),
+        ("not-json", False),
+        ("malformed-list", False),
+    ],
+)
+def test_the_compat_residency_read_classifies_its_failure(monkeypatch, env, transport, failure, unavailable):
+    import http.client
+    import requests
+    from urllib3.exceptions import ProtocolError, ReadTimeoutError
+    from generation_coordinator import RuntimeInventoryUnavailable
+    main, client, db = env
+
+    class _NotJson:
+        closed = False
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            raise ValueError("Expecting value")
+
+        def close(self):
+            _NotJson.closed = True
+
+    failures = {
+        "new-connection-error": _new_connection_error(),
+        "connect-timeout": requests.exceptions.ConnectTimeout("SECRET-DETAIL"),
+        "connection-error-without-a-cause": requests.exceptions.ConnectionError("SECRET-DETAIL refused"),
+        "connection-error-wrapping-a-body-read-timeout": requests.exceptions.ConnectionError(
+            ReadTimeoutError(None, "/api/ps", "Read timed out.")),
+        "connection-error-wrapping-a-protocol-error": requests.exceptions.ConnectionError(
+            ProtocolError("Connection aborted.", http.client.RemoteDisconnected("closed"))),
+        "builtin-connection-refused": ConnectionRefusedError("SECRET-DETAIL"),
+        "read-timeout": requests.exceptions.ReadTimeout("SECRET-DETAIL"),
+        "http-500": _HttpError(500),
+        "not-json": _NotJson(),
+        "malformed-list": _Reply({"models": [{"size": 1}]}),
+    }
+    monkeypatch.setattr(main.requests, "get", _failing_ps(transport, failures[failure]))
+    with pytest.raises(Exception) as excinfo:
+        main._resident_models(COMPAT_RUNTIME)
+    assert isinstance(excinfo.value, RuntimeInventoryUnavailable) is unavailable, excinfo.value
+    assert "SECRET-DETAIL" not in str(excinfo.value)
+    assert f"{COMPAT_URL}/api/ps" in transport.gets
+    if failure == "http-500":
+        reply = failures[failure]
+        assert not reply.body_read, "the status is checked before the body is read"
+        assert reply.closed, "the response is closed"
+    if failure == "not-json":
+        assert _NotJson.closed, "the response is closed"
+
+
+# --- the same read with REAL Requests against a loopback server (review B1, second pass) -----
+#
+# A server that sends a status line, headers and the start of a JSON body, then stalls past the
+# read timeout. Requests can report that body read timeout as a ConnectionError; it must never
+# count as "the runtime did not answer", and it must never let the coordinator commit unverified.
+# Only 127.0.0.1 is reachable inside these tests (the socket guard stays in force otherwise).
+
+class _StallingServer:
+    def __init__(self, status):
+        import socket
+        import threading
+        self.status = status
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self.release = threading.Event()
+        self.conns = []
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        import threading
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            self.conns.append(conn)
+            # Every connection gets the same partial reply, so each poll meets a body stall.
+            threading.Thread(target=self._reply, args=(conn,), daemon=True).start()
+
+    def _reply(self, conn):
+        reason = "OK" if self.status == 200 else "Internal Server Error"
+        try:
+            conn.recv(65536)
+            conn.sendall((f"HTTP/1.1 {self.status} {reason}\r\nContent-Type: application/json\r\n"
+                          "Content-Length: 400\r\n\r\n").encode()
+                         + b'{"models": [{"name": "qwen3.8:27b", "model": "qwen3.8:27b", ')
+        except OSError:
+            return
+        self.release.wait(30)  # stall far beyond the read timeout
+
+    def client_closed(self, index=0, wait_s=3.0):
+        conn = self.conns[index]
+        conn.settimeout(wait_s)
+        try:
+            return conn.recv(1) == b""
+        except OSError:
+            return True  # reset by the client: also closed
+
+    def close(self):
+        self.release.set()
+        for conn in self.conns:
+            conn.close()
+        self.sock.close()
+
+
+@pytest.fixture
+def loopback(monkeypatch):
+    """Real sockets to 127.0.0.1 only. Ports in ``blackholes`` time out while connecting (a
+    socket-level connect timeout, classified by the real urllib3/Requests code)."""
+    import socket
+    guard = sys.modules.get("sitecustomize")
+    original = getattr(guard, "_ORIGINAL_CONNECT", None) or socket.socket.connect
+    blackholes = set()
+    connects = []  # every (host, port) a client tried to connect to
+
+    def connect(self, address):
+        if address[0] != "127.0.0.1":
+            raise AssertionError(f"only loopback is reachable in this test: {address[0]}")
+        connects.append((address[0], address[1]))
+        if address[1] in blackholes:
+            raise socket.timeout("timed out")
+        return original(self, address)
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    servers = []
+    yield SimpleNamespace(blackholes=blackholes, servers=servers, connects=connects)
+    for server in servers:
+        server.close()
+
+
+READ_TIMEOUT_S = 0.6
+
+
+def _real_requests_for(monkeypatch, main, port):
+    """main.requests.get is the REAL requests.get (only its read timeout shortened), pointed at a
+    loopback compatibility runtime."""
+    import requests.api
+    real_get = requests.api.get
+    calls = []
+
+    def get(url, timeout=None, **kwargs):
+        calls.append(dict(url=url, timeout=timeout, **kwargs))
+        return real_get(url, timeout=(timeout[0], READ_TIMEOUT_S), **kwargs)
+    monkeypatch.setattr(main.requests, "get", get)
+    monkeypatch.setattr(main, "_COMPAT_RUNTIME_URL", f"http://127.0.0.1:{port}")
+    return calls
+
+
+def _closed_port():
+    import socket
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    return port
+
+
+@pytest.mark.parametrize("status", [200, 500])
+def test_real_requests_partial_json_then_a_stall_is_never_unavailable(monkeypatch, env, loopback, status):
+    from generation_coordinator import RuntimeInventoryUnavailable
+    main, client, db = env
+    server = _StallingServer(status)
+    loopback.servers.append(server)
+    calls = _real_requests_for(monkeypatch, main, server.port)
+    started = time.monotonic()
+    with pytest.raises(Exception) as excinfo:
+        main._resident_models(COMPAT_RUNTIME)
+    elapsed = time.monotonic() - started
+    assert not isinstance(excinfo.value, RuntimeInventoryUnavailable), "the runtime answered: fail closed"
+    assert calls and calls[0]["stream"] is True, "the body is streamed so the status comes first"
+    if status == 200:
+        assert elapsed >= READ_TIMEOUT_S * 0.8, "the body read itself timed out"
+    else:
+        assert elapsed < READ_TIMEOUT_S, "HTTP 500 is refused from its status line, before the body is read"
+    assert server.client_closed(), "the response (and its connection) was closed"
+
+
+def test_real_requests_genuine_refusal_and_connect_timeout_are_unavailable(monkeypatch, env, loopback):
+    from generation_coordinator import RuntimeInventoryUnavailable
+    main, client, db = env
+    refused = _closed_port()
+    _real_requests_for(monkeypatch, main, refused)
+    with pytest.raises(RuntimeInventoryUnavailable):
+        main._resident_models(COMPAT_RUNTIME)
+
+    blackhole = _closed_port()
+    loopback.blackholes.add(blackhole)
+    _real_requests_for(monkeypatch, main, blackhole)
+    with pytest.raises(RuntimeInventoryUnavailable):
+        main._resident_models(COMPAT_RUNTIME)
+
+
+@pytest.mark.parametrize("case", ["stall-200", "stall-500", "refused"])
+def test_only_a_genuine_refusal_lets_the_coordinator_commit_unverified(monkeypatch, env, loopback, case):
+    """The packaged main._resident_models drives a real coordinator (controlled clock; the window
+    is the full 420 s) on Qwen -> Gemma with the compatibility runtime as given."""
+    import test_experimental_switch_coordinator as sc
+    from generation_coordinator import RESIDENCY_UNVERIFIED
+    main, client, db = env
+    if case == "refused":
+        port = _closed_port()
+    else:
+        server = _StallingServer(200 if case == "stall-200" else 500)
+        loopback.servers.append(server)
+        port = server.port
+    _real_requests_for(monkeypatch, main, port)
+    switch_env = sc._recovery(step=420.0)
+    real_reads = []
+
+    def resident(runtime_key):
+        switch_env.clock.on_read(runtime_key)
+        if runtime_key == COMPAT_RUNTIME:
+            real_reads.append(runtime_key)
+            return main._resident_models(COMPAT_RUNTIME)  # the real function, real Requests
+        return []  # the primary runtime: readable and clear
+    switch_env.coordinator._resident_models = resident
+    try:
+        assert switch_env.coordinator.request_switch(GEMMA_CANDIDATE).accepted
+        deadline = time.monotonic() + 20.0
+        while switch_env.coordinator.status()["last_switch"] is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        last = switch_env.coordinator.status()["last_switch"]
+    finally:
+        switch_env.coordinator.stop()
+    assert real_reads, "the compatibility runtime was really read"
+    if case == "refused":
+        assert (last["outcome"], last["reason"]) == ("committed", RESIDENCY_UNVERIFIED)
+    else:
+        assert (last["outcome"], last["reason"]) == ("aborted", "residency_unavailable")
+        assert switch_env.store.record.active_profile_id == QWEN38_EXPERIMENTAL
+        assert "commit" not in switch_env.store.writes
+        assert not any("residency unverified" in line for line in switch_env.logs)
+
+
+# --- redirects are never followed, and only HTTP 200 is an inventory (review B1, third pass) ---
+
+
+class _CannedServer:
+    """Answers every connection with fixed bytes, then closes it; counts connections."""
+
+    def __init__(self, reply):
+        import socket
+        import threading
+        self.reply = reply
+        self.accepted = 0
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            self.accepted += 1
+            try:
+                conn.recv(65536)
+                conn.sendall(self.reply)
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+    def close(self):
+        self.sock.close()
+
+
+_EMPTY_INVENTORY = b'{"models": []}'
+
+
+def _http(status_line, body, location=None):
+    head = f"HTTP/1.1 {status_line}\r\n"
+    if location is not None:
+        head += f"Location: {location}\r\n"
+    head += f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+    return head.encode() + body
+
+
+REDIRECTS = ["302-to-a-closed-port", "302-to-a-server-listing-no-models", "302-without-location-body-lists-no-models"]
+
+
+def _redirecting_runtime(loopback, case):
+    """(the redirecting server, the redirect destination's port, the destination server or None)."""
+    destination = None
+    if case == "302-to-a-closed-port":
+        target_port = _closed_port()
+    elif case == "302-to-a-server-listing-no-models":
+        destination = _CannedServer(_http("200 OK", _EMPTY_INVENTORY))
+        loopback.servers.append(destination)
+        target_port = destination.port
+    else:
+        target_port = None
+    location = None if target_port is None else f"http://127.0.0.1:{target_port}/api/ps"
+    # The redirect's own body is a readable, empty inventory: it must never be read as one.
+    server = _CannedServer(_http("302 Found", _EMPTY_INVENTORY, location))
+    loopback.servers.append(server)
+    return server, target_port, destination
+
+
+def _assert_destination_untouched(loopback, server, target_port, destination):
+    ports = {port for _host, port in loopback.connects}
+    assert server.port in ports and server.accepted >= 1, "the redirecting runtime was read"
+    if target_port is not None:
+        assert target_port not in ports, "the redirect destination was never contacted"
+    if destination is not None:
+        assert destination.accepted == 0
+
+
+@pytest.mark.parametrize("case", REDIRECTS)
+def test_a_redirected_residency_read_fails_closed_without_following(monkeypatch, env, loopback, case):
+    from generation_coordinator import RuntimeInventoryUnavailable
+    main, client, db = env
+    server, target_port, destination = _redirecting_runtime(loopback, case)
+    calls = _real_requests_for(monkeypatch, main, server.port)
+    with pytest.raises(Exception) as excinfo:
+        main._resident_models(COMPAT_RUNTIME)
+    assert not isinstance(excinfo.value, RuntimeInventoryUnavailable), "the runtime answered: fail closed"
+    assert str(excinfo.value) == "the runtime's loaded-model list could not be read", "the fixed error"
+    assert calls[0]["allow_redirects"] is False and calls[0]["stream"] is True
+    _assert_destination_untouched(loopback, server, target_port, destination)
+
+
+@pytest.mark.parametrize("case", REDIRECTS)
+def test_a_redirected_compat_read_never_commits_a_switch(monkeypatch, env, loopback, case):
+    """The packaged main._resident_models driving a real coordinator (Qwen -> Gemma, full 420 s
+    window, controlled clock): a redirect aborts residency_unavailable; nothing is committed,
+    verified or unverified, and the previous selection is kept."""
+    import test_experimental_switch_coordinator as sc
+    main, client, db = env
+    server, target_port, destination = _redirecting_runtime(loopback, case)
+    _real_requests_for(monkeypatch, main, server.port)
+    switch_env = sc._recovery(step=420.0)
+
+    def resident(runtime_key):
+        switch_env.clock.on_read(runtime_key)
+        if runtime_key == COMPAT_RUNTIME:
+            return main._resident_models(COMPAT_RUNTIME)  # the real function, real Requests
+        return []  # the primary runtime: readable and clear
+    switch_env.coordinator._resident_models = resident
+    try:
+        assert switch_env.coordinator.request_switch(GEMMA_CANDIDATE).accepted
+        deadline = time.monotonic() + 20.0
+        while switch_env.coordinator.status()["last_switch"] is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        last = switch_env.coordinator.status()["last_switch"]
+    finally:
+        switch_env.coordinator.stop()
+    assert (last["outcome"], last["reason"]) == ("aborted", "residency_unavailable")
+    assert switch_env.store.record.active_profile_id == QWEN38_EXPERIMENTAL, "the previous selection is kept"
+    assert "commit" not in switch_env.store.writes, "never committed, verified or unverified"
+    assert switch_env.ledger.snapshot().selection.profile_id == QWEN38_EXPERIMENTAL
+    assert not any("residency unverified" in line for line in switch_env.logs)
+    _assert_destination_untouched(loopback, server, target_port, destination)
+
+
+def test_the_deployed_residency_window_permits_the_bounded_return_to_control(env):
+    from generation_coordinator import UNVERIFIED_RECOVERY_MIN_WINDOW_S, keep_alive_seconds
+    main, client, db = env
+    window = main._coordinator_settings().residency_timeout_s
+    assert window >= UNVERIFIED_RECOVERY_MIN_WINDOW_S == 420.0
+    for profile in main._MODEL_REGISTRY.profiles:
+        if profile.experimental:
+            assert keep_alive_seconds(profile.keep_alive) < window, profile.profile_id
 
 
 # --- restart with the experimental tier switched off -------------------------------------------
