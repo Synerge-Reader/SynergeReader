@@ -50,6 +50,31 @@ The unqualified control (``llama_control``) is the existing production model:
 it is explicitly marked as not requiring qualification, so its answers cost no
 per-job inventory call. Whether a profile needs qualification never depends on
 which profile happens to be selected.
+
+Experimental profiles (19 October 2026) are a third, separate tier:
+
+* ``experimental`` -- the profile has only operator-reported runtime-smoke
+  evidence (``RuntimeSmokeEvidence``): one bounded synthetic request on the
+  runtime that will serve it. No quality, capacity or vision gate is recorded
+  or implied, and ``selectable`` (the qualified tier) stays False for it.
+  Whether it may be selected is a DEPLOYMENT decision the registry holds:
+  ``experimental_enabled`` (server-side, default off) and the profile's
+  runtime being configured. Every answer and helper job such a profile
+  produces, and every switch to it, still checks the installed identity on
+  the profile's own runtime first: ``requires_identity_check`` is decoupled
+  from ``requires_qualification``.
+* ``runtime_key`` -- a backend-owned key naming the generation runtime that
+  serves the profile. Server configuration maps keys to endpoints; no request
+  can supply or override an endpoint, a runtime key or a tag, and a runtime
+  that fails never falls back to another runtime or model.
+* ``think`` may additionally be ``True`` or one of ``THINK_LEVELS`` for an
+  experimental profile whose runtime smoke used exactly that value. Thinking
+  text is never returned, persisted or shown; only ``response`` is the answer.
+* the verifier and helper roles have explicit ``RolePolicy`` values (think
+  setting and output limit). A thinking model's short roles get a bounded
+  thinking-plus-final-output allowance instead of inheriting a 16-token limit
+  they would exhaust while thinking. The roles always use the job's own model
+  and runtime; nothing silently switches the verifier to another model.
 """
 
 from __future__ import annotations
@@ -58,7 +83,9 @@ import math
 import re
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Callable, Literal, Mapping, Optional, Tuple
+from typing import Callable, FrozenSet, Literal, Mapping, Optional, Tuple, Union
+
+from ollama_generation import completion_diagnostic
 
 # --------------------------------------------------------------------------
 # Profile ids, installed tags and pinned artifact identities
@@ -66,14 +93,47 @@ from typing import Callable, Literal, Mapping, Optional, Tuple
 
 LLAMA_CONTROL = "llama_control"
 GEMMA_CANDIDATE = "gemma_candidate"
+QWEN38_EXPERIMENTAL = "qwen38_27b_experimental"
+NEMOTRON35_EXPERIMENTAL = "nemotron35_lightning_30b_experimental"
+MISTRAL35_EXPERIMENTAL = "mistral_medium35_128b_experimental"
 
 LLAMA_CONTROL_TAG = "llama3.1:8b"
 GEMMA_CANDIDATE_TAG = "gemma4:31b"
+QWEN38_TAG = "qwen3.8:27b"
+NEMOTRON35_TAG = "nemotron-3.5-lightning:30b"
+MISTRAL35_TAG = "mistral-medium-3.5:128b"
 
 # Operator-verified full manifest digests of the installed artifacts. These are
 # expected identities (pins), never evidence about a particular answer.
 LLAMA_CONTROL_DIGEST = "42182419e9508c30c4b1fe55015f06b65f4ca4b9e28a744be55008d21998a093"
 GEMMA_CANDIDATE_DIGEST = "6316f0629137b426c9d9b853ffc4c8209589f30ee39aebede6285096c0ff47e7"
+QWEN38_DIGEST = "aaee06c39dcf2437cde036998d960e1fc1494b8191be7cc9657d01e509097813"
+NEMOTRON35_DIGEST = "e6905fffe2e2d9bbe325a9a2d2e074e3bd32683721bc6dfba409dede2f17f4dc"
+MISTRAL35_DIGEST = "0341632adb051badc332bd814779ab931ab78619750bebe3b7c7b1401e9d70df"
+
+# --------------------------------------------------------------------------
+# Generation runtimes
+# --------------------------------------------------------------------------
+#
+# Backend-owned keys. Which endpoint a key reaches is server configuration
+# (main.py); the keys themselves are a closed set, so a profile can never name
+# an endpoint, and nothing a client sends can choose one.
+#
+# ``primary``: the existing host Ollama that serves Llama, Gemma and the
+# configured embedder. ``compat_cuda121``: the separate, private CUDA 12.1 /
+# SM70 compatibility runtime (Ollama 0.32.12) for the experimental profiles.
+PRIMARY_RUNTIME = "primary"
+COMPAT_RUNTIME = "compat_cuda121"
+RUNTIME_KEYS = (PRIMARY_RUNTIME, COMPAT_RUNTIME)
+
+# The image the experimental profiles' runtime smoke ran on (operator-reported).
+COMPAT_RUNTIME_TESTED_IMAGE_ID = "sha256:96e3cc4e4155ef96d11578415f1ac36892d8bdc3a83c40623cc8ffdfbf4392ed"
+COMPAT_RUNTIME_OLLAMA_VERSION = "0.32.12"
+
+# The think values Ollama's native API defines: a bool, or an effort level.
+# A profile may send one only with evidence for exactly that value.
+THINK_LEVELS = ("low", "medium", "high")
+ThinkValue = Optional[Union[bool, str]]
 
 # --------------------------------------------------------------------------
 # Requested settings
@@ -106,6 +166,58 @@ GEMMA_VERIFIER_READ_TIMEOUT_S = 150.0
 GEMMA_HELPER_READ_TIMEOUT_S = 150.0
 _MIN_READ_TIMEOUT_S = 1.0
 _MAX_READ_TIMEOUT_S = 600.0
+
+# Experimental profiles: PROVISIONAL bounds, not measured at the application
+# context. The runtime smoke used a 2,048-token context; the application asks
+# for ANSWER_NUM_CTX (8,192), which the bounded candidate check must exercise.
+#
+# A streamed answer's read timeout covers the wait for the first record: the
+# load plus prompt evaluation (thinking records then arrive as bytes). Qwen
+# and Nemotron loaded in 9.28 s and 12.13 s at 2,048 tokens; 180 s leaves room
+# for a larger context and the full evidence prompt. Mistral's cold load alone
+# took 180.38 s at 2,048 tokens -- more than Gemma's 150 s -- so it gets 420 s.
+# Verifier and helper calls are NOT streamed: their read timeout covers the
+# whole bounded generation, thinking included, and is still clamped to the
+# job's remaining budget. Mistral's job budgets are raised to 900 s (the
+# shared default is 420 s) because one answer can include a cold load, a
+# thinking-plus-answer generation and two verifier calls.
+EXPERIMENTAL_READ_TIMEOUT_S = 180.0
+EXPERIMENTAL_HELPER_READ_TIMEOUT_S = 300.0
+MISTRAL35_READ_TIMEOUT_S = 420.0
+MISTRAL35_HELPER_READ_TIMEOUT_S = 600.0
+MISTRAL35_JOB_BUDGET_S = 900.0
+# Thinking and the final answer share one output limit (thinking tokens are
+# generated tokens). 2,048 keeps prompt plus output inside the 8,192-token
+# context for the largest evidence prompt; a reply that reaches it is reported
+# as cut off, never as an answer.
+EXPERIMENTAL_ANSWER_NUM_PREDICT = 2048
+# The short roles inherit the answer's tested think setting (no no-thinking
+# behaviour is evidenced for these models) with a bounded allowance for
+# thinking plus the status word / structured reply.
+EXPERIMENTAL_VERIFIER_NUM_PREDICT = 512
+EXPERIMENTAL_HELPER_NUM_PREDICT = 2048
+# Nemotron's own role allowances. In the bounded candidate check
+# (xm-20261020T030140Z-dc2e7a43) its answer finished at 1,530 of 2,048 tokens,
+# but its verifier generated exactly 512 and its insights helper exactly 2,048
+# tokens, and neither reply was usable; Qwen and Mistral used 166-706 tokens
+# for the same calls. Thinking stays on (think=False and effort levels are
+# accepted by the runtime but untested for this model). The verifier gets the
+# answer's own allowance: its prompt holds a subset of the answer's evidence, so
+# it fits the 8,192-token context by the answer's bound. The helper gets the
+# registry maximum: its excerpt is at most 6,000 characters (the Q&A helper's
+# 4,000); the check's insights prompt was 1,218 tokens. At the observed 110-118
+# generated tokens/s, 2,048 and 4,096 tokens take about 19 s and 37 s, inside
+# the unchanged 180 s and 300 s read timeouts and the 420 s job budget. Still
+# bounded: a reply that reaches either limit is cut off and is never a
+# judgment, nor stored.
+NEMOTRON35_VERIFIER_NUM_PREDICT = 2048
+NEMOTRON35_HELPER_NUM_PREDICT = 4096
+# One combined answer-or-helper job at a time while an experimental profile is
+# the shared selection: a conservative initial limit, not a capacity claim.
+EXPERIMENTAL_MAX_CONCURRENT_JOBS = 1
+_MAX_CONCURRENT_JOBS = 64
+_MIN_JOB_BUDGET_S = 1.0
+_MAX_JOB_BUDGET_S = 3600.0
 
 # A readiness probe: load the model and emit a few tokens. Kept apart from the
 # answer settings so a smoke run can never be mistaken for an answer profile.
@@ -160,6 +272,14 @@ class ModelIdentityUnavailableError(ModelSelectionError):
     """The installed model identity could not be read."""
 
 
+class ExperimentalProfileDisabledError(ProfileNotQualifiedError):
+    """An experimental profile while experimental profiles are disabled."""
+
+
+class ModelRuntimeUnavailableError(ModelSelectionError):
+    """The profile's generation runtime is not configured on this server."""
+
+
 # --------------------------------------------------------------------------
 # Validators
 # --------------------------------------------------------------------------
@@ -193,6 +313,38 @@ def _require_read_timeout(name: str, value: object) -> float:
             f"{name} must be a finite number in [{_MIN_READ_TIMEOUT_S}, {_MAX_READ_TIMEOUT_S}]"
         )
     return value
+
+
+def require_think_value(name: str, value: object) -> ThinkValue:
+    """``value`` if it is a think setting this backend can send: None (no
+    field), the bools False/True, or one of THINK_LEVELS. Anything else --
+    another string, a number, ``1`` or ``0`` posing as a bool -- is refused."""
+    if value is None or value is False or value is True:
+        return value
+    if type(value) is str and value in THINK_LEVELS:
+        return value
+    raise GenerationProfileError(f"{name} must be None, a bool or one of {THINK_LEVELS}; got {value!r}")
+
+
+def same_think(a: object, b: object) -> bool:
+    """Exact think equality: True is not "high", and 1 is not True."""
+    return type(a) is type(b) and a == b
+
+
+def require_runtime_key(name: str, value: object) -> str:
+    if not isinstance(value, str) or value not in RUNTIME_KEYS:
+        raise GenerationProfileError(f"{name} must be one of {RUNTIME_KEYS}; got {value!r}")
+    return value
+
+
+def _require_job_budget(name: str, value: object) -> Optional[float]:
+    if value is None:
+        return None
+    if not _is_real_number(value) or not _MIN_JOB_BUDGET_S <= value <= _MAX_JOB_BUDGET_S:
+        raise GenerationProfileError(
+            f"{name} must be None or a finite number in [{_MIN_JOB_BUDGET_S}, {_MAX_JOB_BUDGET_S}]"
+        )
+    return float(value)
 
 
 def normalize_digest(value: object) -> Optional[str]:
@@ -296,6 +448,74 @@ class Qualification:
             raise GenerationProfileError("qualification evidence_ref must be a non-empty string")
 
 
+RUNTIME_SMOKE_VERDICTS = ("PASS", "REVIEW_REQUIRED")
+
+
+@dataclass(frozen=True)
+class RuntimeSmokeEvidence:
+    """Operator-reported, bounded runtime smoke for an experimental profile.
+
+    What it records: on the runtime that will serve the profile, one
+    synthetic request with exactly ``tested_think`` and a ``tested_num_ctx``
+    context returned the expected final answer in the native ``response``
+    field, emitted a separate thinking field and ended with
+    ``done_reason == "stop"``. ``verdict`` is the original script verdict,
+    preserved as reported (REVIEW_REQUIRED keeps its ``review_note``).
+
+    What it does NOT record: answer quality, combined capacity, vision, the
+    application's own context or output budgets, or latency. Those gates are
+    deferred and are never implied by this evidence. The evidence was
+    supplied by the operator; offline tests do not reproduce inference.
+    """
+
+    tested_think: Tuple[ThinkValue, ...]
+    tested_num_ctx: int
+    runtime_version: str
+    runtime_image_id: str
+    verdict: str
+    evidence_ref: str
+    review_note: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        tested = tuple(self.tested_think)
+        if not tested:
+            raise GenerationProfileError("runtime smoke must name the think value(s) it tested")
+        for value in tested:
+            require_think_value("tested_think", value)
+        object.__setattr__(self, "tested_think", tested)
+        _require_int("tested_num_ctx", self.tested_num_ctx, _MIN_NUM_CTX, _MAX_NUM_CTX)
+        if not isinstance(self.runtime_version, str) or not re.match(r"^[0-9]+\.[0-9]+\.[0-9]+$", self.runtime_version):
+            raise GenerationProfileError("runtime_version must be a version like 0.32.12")
+        if not isinstance(self.runtime_image_id, str) or normalize_digest(self.runtime_image_id) is None \
+                or not self.runtime_image_id.startswith("sha256:"):
+            raise GenerationProfileError("runtime_image_id must be a sha256: image id")
+        if self.verdict not in RUNTIME_SMOKE_VERDICTS:
+            raise GenerationProfileError(f"verdict must be one of {RUNTIME_SMOKE_VERDICTS}")
+        if self.verdict == "REVIEW_REQUIRED" and (not isinstance(self.review_note, str) or not self.review_note.strip()):
+            raise GenerationProfileError("a REVIEW_REQUIRED verdict keeps its review note")
+        if self.review_note is not None and not isinstance(self.review_note, str):
+            raise GenerationProfileError("review_note must be a string or None")
+        if not isinstance(self.evidence_ref, str) or not self.evidence_ref.strip():
+            raise GenerationProfileError("runtime smoke evidence_ref must be a non-empty string")
+
+    def tested(self, think: object) -> bool:
+        return any(same_think(value, think) for value in self.tested_think)
+
+
+@dataclass(frozen=True)
+class RolePolicy:
+    """The think setting and output limit of one bounded role call (the claim
+    verifier, or a background helper). Format only; whether the profile may
+    send that think value is checked against the profile's own evidence."""
+
+    think: ThinkValue
+    num_predict: int
+
+    def __post_init__(self) -> None:
+        require_think_value("role think", self.think)
+        _require_int("role num_predict", self.num_predict, 1, _MAX_NUM_PREDICT)
+
+
 @dataclass(frozen=True)
 class ModelProfile:
     profile_id: str
@@ -313,10 +533,26 @@ class ModelProfile:
     requires_qualification: bool
     expected_digest: Optional[str] = None
     # None: no think field is sent. False is sent as ``think: false`` and is
-    # allowed only once that behaviour is evidenced. Thinking output is never
-    # requested, so True is not a valid value.
-    think: Optional[bool] = None
+    # allowed only once that behaviour is evidenced (Qualification). True or
+    # an effort level is allowed only for an experimental profile whose
+    # runtime smoke used exactly that value; its thinking text is never kept.
+    think: ThinkValue = None
     qualification: Optional[Qualification] = None
+    # The generation runtime that serves this profile (a backend-owned key).
+    runtime_key: str = PRIMARY_RUNTIME
+    # Experimental tier: runtime-smoke evidence only. Never qualified.
+    experimental: bool = False
+    runtime_smoke: Optional[RuntimeSmokeEvidence] = None
+    # Explicit role policies; None keeps the historical derivation (the
+    # profile's think setting with the shared verifier/helper output limits).
+    verifier_policy: Optional[RolePolicy] = None
+    helper_policy: Optional[RolePolicy] = None
+    # While this profile is the shared selection: at most this many admitted
+    # or unresolved jobs of either kind (None: the shared admission settings),
+    # and per-kind whole-job budgets (None: the shared settings).
+    max_concurrent_jobs: Optional[int] = None
+    answer_job_budget_s: Optional[float] = None
+    helper_job_budget_s: Optional[float] = None
 
     def __post_init__(self) -> None:
         _require_match("profile_id", _PROFILE_ID_PATTERN, self.profile_id)
@@ -332,6 +568,11 @@ class ModelProfile:
             raise GenerationProfileError("requires_qualification must be a bool")
         if self.qualification is not None and not isinstance(self.qualification, Qualification):
             raise GenerationProfileError("qualification must be a Qualification")
+        require_runtime_key("runtime_key", self.runtime_key)
+        if not isinstance(self.experimental, bool):
+            raise GenerationProfileError("experimental must be a bool")
+        if self.runtime_smoke is not None and not isinstance(self.runtime_smoke, RuntimeSmokeEvidence):
+            raise GenerationProfileError("runtime_smoke must be RuntimeSmokeEvidence")
         expected = None
         if self.expected_digest is not None:
             expected = normalize_digest(self.expected_digest)
@@ -341,18 +582,59 @@ class ModelProfile:
             raise GenerationProfileError(
                 "a profile that requires qualification needs an expected_digest to verify"
             )
-        if self.think is not None:
-            if self.think is not False:
-                raise GenerationProfileError("think may only be None or False")
+        if self.experimental:
+            # A separate tier, never a shortcut into the qualified one.
+            if self.requires_qualification or self.qualification is not None:
+                raise GenerationProfileError("an experimental profile carries no qualification tier")
+            if self.runtime_smoke is None:
+                raise GenerationProfileError("an experimental profile needs its runtime smoke evidence")
+            if expected is None:
+                raise GenerationProfileError("an experimental profile needs an expected_digest to verify")
+            if self.max_concurrent_jobs is None:
+                raise GenerationProfileError("an experimental profile needs an explicit job limit")
+        elif self.runtime_smoke is not None:
+            raise GenerationProfileError("runtime smoke evidence belongs to an experimental profile")
+        self._require_sendable_think("think", self.think)
+        for name in ("verifier_policy", "helper_policy"):
+            policy = getattr(self, name)
+            if policy is None:
+                continue
+            if not isinstance(policy, RolePolicy):
+                raise GenerationProfileError(f"{name} must be a RolePolicy")
+            self._require_sendable_think(f"{name}.think", policy.think)
+            if policy.num_predict >= self.answer_options.num_ctx:
+                raise GenerationProfileError(f"{name}.num_predict must be smaller than num_ctx")
+        if self.max_concurrent_jobs is not None:
+            _require_int("max_concurrent_jobs", self.max_concurrent_jobs, 1, _MAX_CONCURRENT_JOBS)
+        object.__setattr__(self, "answer_job_budget_s", _require_job_budget("answer_job_budget_s", self.answer_job_budget_s))
+        object.__setattr__(self, "helper_job_budget_s", _require_job_budget("helper_job_budget_s", self.helper_job_budget_s))
+        object.__setattr__(self, "expected_digest", expected)
+
+    def _require_sendable_think(self, name: str, value: object) -> None:
+        require_think_value(name, value)
+        if value is None:
+            return
+        if value is False:
             if self.qualification is None or not self.qualification.think_false_verified:
                 raise GenerationProfileError(
                     "think: false may only be sent once that behaviour is evidenced"
                 )
-        object.__setattr__(self, "expected_digest", expected)
+            return
+        # True or an effort level: only what this profile's runtime smoke used.
+        if not self.experimental or self.runtime_smoke is None or not self.runtime_smoke.tested(value):
+            raise GenerationProfileError(
+                f"{name} {value!r} may only be sent by an experimental profile whose runtime smoke used it"
+            )
 
     @property
     def selectable(self) -> bool:
-        """Whether this profile may answer at all, explicitly or as default."""
+        """Whether this profile is in the control or qualified tier: it may
+        answer, explicitly or as default, wherever its runtime is available.
+
+        False for every experimental profile: whether an experimental profile
+        may be selected is the deployment's decision (``ModelRegistry``)."""
+        if self.experimental:
+            return False
         if not self.requires_qualification:
             return True
         evidence = self.qualification
@@ -362,6 +644,29 @@ class ModelProfile:
             and evidence.quality_verified
         )
 
+    @property
+    def requires_identity_check(self) -> bool:
+        """Whether every answer, helper job and switch to this profile first
+        reads its installed identity on its own runtime. Decoupled from the
+        qualification tier: an experimental profile is checked too."""
+        return self.requires_qualification or self.experimental
+
+    @property
+    def evidence_tier(self) -> str:
+        if self.experimental:
+            return "experimental"
+        return "qualified" if self.requires_qualification else "control"
+
+    def verifier_role(self) -> RolePolicy:
+        if self.verifier_policy is not None:
+            return self.verifier_policy
+        return RolePolicy(think=self.think, num_predict=VERIFIER_NUM_PREDICT)
+
+    def helper_role(self) -> RolePolicy:
+        if self.helper_policy is not None:
+            return self.helper_policy
+        return RolePolicy(think=self.think, num_predict=HELPER_NUM_PREDICT)
+
 
 def build_generate_payload(
     model_tag: str,
@@ -370,17 +675,18 @@ def build_generate_payload(
     keep_alive: str,
     *,
     stream: bool,
-    think: Optional[bool] = None,
+    think: ThinkValue = None,
 ) -> dict:
     """One native ``/api/generate`` request body.
 
     Sampling, context and output limits travel inside ``options``, where Ollama
     reads them; ``keep_alive`` and ``think`` are top-level request fields.
     Nothing else is sent, so no stale top-level setting can masquerade as
-    policy.
+    policy. No endpoint, runtime or credential is ever part of a payload.
     """
     if not isinstance(prompt, str):
         raise GenerationProfileError("prompt must be a string")
+    require_think_value("think", think)
     payload = {
         "model": model_tag,
         "prompt": prompt,
@@ -415,11 +721,14 @@ class FixedModelCall:
     model_tag: str
     options: GenerationOptions
     keep_alive: str
-    # None: no think field is sent. False: ``think: false`` is sent.
-    think: Optional[bool]
+    # None: no think field is sent. Otherwise the exact value sent (False,
+    # True or an effort level), already checked against the profile.
+    think: ThinkValue
     read_timeout_s: float
     expected_digest: Optional[str]
     observed_digest: Optional[str]
+    # The runtime this call is sent to: always the job snapshot's own.
+    runtime_key: str = PRIMARY_RUNTIME
 
     def __post_init__(self) -> None:
         _require_match("profile_id", _PROFILE_ID_PATTERN, self.profile_id)
@@ -427,8 +736,8 @@ class FixedModelCall:
         _require_match("keep_alive", _KEEP_ALIVE_PATTERN, self.keep_alive)
         if not isinstance(self.options, GenerationOptions):
             raise GenerationProfileError("options must be GenerationOptions")
-        if self.think is not None and self.think is not False:
-            raise GenerationProfileError("think may only be None or False")
+        require_think_value("think", self.think)
+        require_runtime_key("runtime_key", self.runtime_key)
         _require_read_timeout("read_timeout_s", self.read_timeout_s)
         for name in ("expected_digest", "observed_digest"):
             value = getattr(self, name)
@@ -440,6 +749,12 @@ class FixedModelCall:
             self.model_tag, prompt, self.options, self.keep_alive, stream=stream, think=self.think
         )
 
+    def describe_completion(self, role: str, body) -> str:
+        """One log line for a reply to this call: its profile, the output
+        limit it requested, and the reply's counts and fixed words -- never
+        its text (see ollama_generation.completion_diagnostic)."""
+        return completion_diagnostic(role, self.profile_id, self.options.num_predict, body)
+
 
 def _role_call(
     *,
@@ -447,15 +762,17 @@ def _role_call(
     model_tag: str,
     num_ctx: int,
     keep_alive: str,
-    think: Optional[bool],
+    think: ThinkValue,
     expected_digest: Optional[str],
     observed_digest: Optional[str],
     temperature: float,
     num_predict: int,
     read_timeout_s: float,
+    runtime_key: str = PRIMARY_RUNTIME,
 ) -> FixedModelCall:
-    """One bounded role call. Only the role's temperature, output limit and
-    read timeout differ from the profile the identity fields come from."""
+    """One bounded role call. Only the role's temperature, output limit,
+    think policy and read timeout differ from the profile the identity and
+    runtime fields come from."""
     return FixedModelCall(
         profile_id=profile_id,
         model_tag=model_tag,
@@ -465,6 +782,7 @@ def _role_call(
         read_timeout_s=float(read_timeout_s),
         expected_digest=expected_digest,
         observed_digest=observed_digest,
+        runtime_key=runtime_key,
     )
 
 
@@ -510,6 +828,10 @@ class AnswerGenerationSnapshot:
     ``verifier`` is derived from this same profile and identity when the
     snapshot is built; ``helper_call`` derives a helper call from the values
     held here. Neither consults the registry.
+
+    ``runtime_key`` is the runtime every call of this job is sent to: the
+    answer, its verifier calls and every helper call. It is bound here, with
+    the model, and never re-resolved from a request or a later selection.
     """
 
     profile_id: str
@@ -517,7 +839,7 @@ class AnswerGenerationSnapshot:
     display_name: str
     options: GenerationOptions
     keep_alive: str
-    think: Optional[bool]
+    think: ThinkValue
     answer_read_timeout_s: float
     helper_read_timeout_s: float
     selection: Selection
@@ -525,6 +847,11 @@ class AnswerGenerationSnapshot:
     observed_digest: Optional[str]
     verifier: FixedModelCall
     selection_epoch: Optional[int] = None
+    runtime_key: str = PRIMARY_RUNTIME
+    experimental: bool = False
+    # None: the historical helper derivation (this snapshot's think setting
+    # with HELPER_NUM_PREDICT).
+    helper_policy: Optional[RolePolicy] = None
 
     def __post_init__(self) -> None:
         if self.selection not in _SELECTIONS:
@@ -533,6 +860,19 @@ class AnswerGenerationSnapshot:
             require_selection_epoch(self.selection_epoch)
         elif self.selection_epoch is not None:
             raise GenerationProfileError("only a shared selection carries an epoch")
+        require_think_value("think", self.think)
+        require_runtime_key("runtime_key", self.runtime_key)
+        if not isinstance(self.experimental, bool):
+            raise GenerationProfileError("experimental must be a bool")
+        if self.helper_policy is not None and not isinstance(self.helper_policy, RolePolicy):
+            raise GenerationProfileError("helper_policy must be a RolePolicy")
+        if not isinstance(self.verifier, FixedModelCall) or (
+            self.verifier.profile_id != self.profile_id
+            or self.verifier.model_tag != self.model_tag
+            or self.verifier.runtime_key != self.runtime_key
+        ):
+            # The verifier is this job's own model on this job's own runtime.
+            raise GenerationProfileError("the verifier must be derived from this snapshot's profile")
 
     def ollama_payload(self, prompt: str, *, stream: bool = True) -> dict:
         return build_generate_payload(
@@ -545,8 +885,12 @@ class AnswerGenerationSnapshot:
         )
 
     def public_metadata(self) -> dict:
-        """What the client is told produced this answer."""
-        return {"profile_id": self.profile_id, "model": self.model_tag}
+        """What the client is told produced this answer. An experimental
+        profile says so; no runtime, endpoint or digest is ever included."""
+        metadata = {"profile_id": self.profile_id, "model": self.model_tag}
+        if self.experimental:
+            metadata["experimental"] = True
+        return metadata
 
     def requested_settings(self) -> dict:
         settings = {"options": self.options.as_ollama_options(), "keep_alive": self.keep_alive}
@@ -554,20 +898,27 @@ class AnswerGenerationSnapshot:
             settings["think"] = self.think
         return settings
 
+    def helper_role(self) -> RolePolicy:
+        if self.helper_policy is not None:
+            return self.helper_policy
+        return RolePolicy(think=self.think, num_predict=HELPER_NUM_PREDICT)
+
     def helper_call(self, temperature: float) -> FixedModelCall:
         """One bounded background helper call (insights, KB Q&A import) from
-        this snapshot's profile and identity."""
+        this snapshot's profile, identity and runtime."""
+        role = self.helper_role()
         return _role_call(
             profile_id=self.profile_id,
             model_tag=self.model_tag,
             num_ctx=self.options.num_ctx,
             keep_alive=self.keep_alive,
-            think=self.think,
+            think=role.think,
             expected_digest=self.expected_digest,
             observed_digest=self.observed_digest,
             temperature=temperature,
-            num_predict=HELPER_NUM_PREDICT,
+            num_predict=role.num_predict,
             read_timeout_s=self.helper_read_timeout_s,
+            runtime_key=self.runtime_key,
         )
 
 
@@ -576,20 +927,46 @@ class AnswerGenerationSnapshot:
 # --------------------------------------------------------------------------
 
 
+INELIGIBLE_NOT_QUALIFIED = "not_qualified"
+INELIGIBLE_EXPERIMENTAL_DISABLED = "experimental_disabled"
+INELIGIBLE_RUNTIME_NOT_CONFIGURED = "runtime_not_configured"
+
+
 @dataclass(frozen=True)
 class ModelRegistry:
-    """The registered profiles and the default. There is no separate verifier
-    or helper profile: those role calls are derived from whichever profile a
-    snapshot resolved."""
+    """The registered profiles, the default, and the deployment facts that
+    decide which of them may be selected. There is no separate verifier or
+    helper profile: those role calls are derived from whichever profile a
+    snapshot resolved.
+
+    ``experimental_enabled`` (server-side, default off) and
+    ``configured_runtimes`` (the runtime keys this server has an endpoint
+    for) are fixed when the registry is built, at import, from server
+    configuration -- never from a request. A profile whose runtime is not
+    configured is refused, but stays registered, so a persisted selection
+    naming it is reported rather than silently replaced. An administrator
+    can switch away from it to Gemma or Llama: when its runtime cannot be
+    read, the coordinator's bounded return to control commits only after the
+    full residency window and reports the residency as unverified (see
+    generation_coordinator.py)."""
 
     profiles: Tuple[ModelProfile, ...]
     default_profile_id: str
+    experimental_enabled: bool = False
+    configured_runtimes: FrozenSet[str] = frozenset({PRIMARY_RUNTIME})
     _by_id: Mapping[str, ModelProfile] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         profiles = tuple(self.profiles)
         if not profiles or not all(isinstance(p, ModelProfile) for p in profiles):
             raise GenerationProfileError("a registry needs at least one ModelProfile")
+        if not isinstance(self.experimental_enabled, bool):
+            raise GenerationProfileError("experimental_enabled must be a bool")
+        runtimes = frozenset(self.configured_runtimes)
+        for key in runtimes:
+            require_runtime_key("configured runtime", key)
+        if PRIMARY_RUNTIME not in runtimes:
+            raise GenerationProfileError("the primary runtime is always configured")
         by_id = {}
         for profile in profiles:
             if profile.profile_id in by_id:
@@ -602,7 +979,10 @@ class ModelRegistry:
             raise GenerationProfileError(
                 "the default profile requires qualification and its evidence is incomplete"
             )
+        if default.experimental or default.runtime_key != PRIMARY_RUNTIME:
+            raise GenerationProfileError("the default profile is a primary-runtime, non-experimental profile")
         object.__setattr__(self, "profiles", profiles)
+        object.__setattr__(self, "configured_runtimes", runtimes)
         object.__setattr__(self, "_by_id", MappingProxyType(by_id))
 
     def get(self, profile_id: str) -> Optional[ModelProfile]:
@@ -612,8 +992,37 @@ class ModelRegistry:
     def default(self) -> ModelProfile:
         return self._by_id[self.default_profile_id]
 
+    def runtime_configured(self, runtime_key: object) -> bool:
+        return isinstance(runtime_key, str) and runtime_key in self.configured_runtimes
+
+    def ineligible_reason(self, profile: ModelProfile) -> Optional[str]:
+        """None when ``profile`` may be the shared selection on this server;
+        otherwise a fixed reason category."""
+        if not isinstance(profile, ModelProfile) or self._by_id.get(profile.profile_id) is not profile:
+            return INELIGIBLE_NOT_QUALIFIED
+        if not self.runtime_configured(profile.runtime_key):
+            return INELIGIBLE_RUNTIME_NOT_CONFIGURED
+        if profile.experimental:
+            return None if self.experimental_enabled else INELIGIBLE_EXPERIMENTAL_DISABLED
+        return None if profile.selectable else INELIGIBLE_NOT_QUALIFIED
+
     def is_selectable(self, profile: ModelProfile) -> bool:
-        return profile.selectable
+        return self.ineligible_reason(profile) is None
+
+    def admission_policy(self, profile_id: object) -> Optional[Tuple[Optional[int], Optional[float], Optional[float]]]:
+        """(max_concurrent_jobs, answer_job_budget_s, helper_job_budget_s)
+        for a registered profile, or None for an unknown id. Pure: the ledger
+        applies it while that profile is the shared selection."""
+        profile = self._by_id.get(profile_id) if isinstance(profile_id, str) else None
+        if profile is None:
+            return None
+        return (profile.max_concurrent_jobs, profile.answer_job_budget_s, profile.helper_job_budget_s)
+
+    def generation_identities(self) -> Tuple[Tuple[str, str, Optional[str]], ...]:
+        """(profile_id, model_tag, expected_digest) for every registered
+        generation profile: what the switch residency barrier treats as a
+        generation model on any runtime (an embedder is never listed)."""
+        return tuple((p.profile_id, p.model_tag, p.expected_digest) for p in self.profiles)
 
 
 # Every Gemma gate is recorded and reviewed: think:false accepted with thinking
@@ -642,13 +1051,161 @@ GEMMA_CANDIDATE_EVIDENCE = Qualification(
 )
 
 
-def default_model_registry() -> ModelRegistry:
-    """The production registry: Llama is the default; Gemma is qualified.
+_DGX_MODEL_TESTS = "/home/haihua/synergereader-model-tests"
+_SMOKE_SCOPE = (
+    "Operator-reported DGX runtime smoke, 19 October 2026: one synthetic invoice calculation "
+    "(BALANCE=200.00 USD returned in the native response field, separate thinking field emitted, "
+    "done_reason=stop) on the custom Ollama 0.32.12 / CUDA 12.1 / SM70 image "
+    f"{COMPAT_RUNTIME_TESTED_IMAGE_ID} (runtime build {_DGX_MODEL_TESTS}/"
+    "cuda121_build_20261019T155454Z_2Sxha4) at a 2,048-token context. Not reproduced by offline "
+    "tests. No quality, capacity, vision, application-context or latency gate."
+)
+
+QWEN38_RUNTIME_SMOKE = RuntimeSmokeEvidence(
+    tested_think=(True,),
+    tested_num_ctx=2048,
+    runtime_version=COMPAT_RUNTIME_OLLAMA_VERSION,
+    runtime_image_id=COMPAT_RUNTIME_TESTED_IMAGE_ID,
+    verdict="PASS",
+    evidence_ref=(
+        f"{_DGX_MODEL_TESTS}/qwen38_cuda121_generation_20261019T161846Z_zpCMYz for qwen3.8:27b "
+        "(digest aaee06c39dcf2437...e509097813): think=true, 100% GPU residency (20.42 GiB), "
+        "11.69 s request including a 9.28 s load. " + _SMOKE_SCOPE
+    ),
+)
+NEMOTRON35_RUNTIME_SMOKE = RuntimeSmokeEvidence(
+    tested_think=(True,),
+    tested_num_ctx=2048,
+    runtime_version=COMPAT_RUNTIME_OLLAMA_VERSION,
+    runtime_image_id=COMPAT_RUNTIME_TESTED_IMAGE_ID,
+    verdict="PASS",
+    evidence_ref=(
+        f"{_DGX_MODEL_TESTS}/nemotron35_cuda121_generation_20261019T164233Z_tMMcgC for "
+        "nemotron-3.5-lightning:30b (digest e6905fffe2e2d9bb...e2f17f4dc): think=true, 100% GPU "
+        "residency (23.65 GiB), 16.65 s request including a 12.13 s load (the separate 2,257.28 s "
+        "download is cached). " + _SMOKE_SCOPE
+    ),
+)
+MISTRAL35_RUNTIME_SMOKE = RuntimeSmokeEvidence(
+    tested_think=("high",),
+    tested_num_ctx=2048,
+    runtime_version=COMPAT_RUNTIME_OLLAMA_VERSION,
+    runtime_image_id=COMPAT_RUNTIME_TESTED_IMAGE_ID,
+    verdict="REVIEW_REQUIRED",
+    review_note=(
+        "Original verdict preserved: every functional check passed; only the original 99% "
+        "GPU-residency target failed (91.27%, 70.35 of 77.08 GiB). The model ran from GPU and CPU "
+        "memory; its 180.38 s cold load exceeds Gemma's 150 s per-read timeout."
+    ),
+    evidence_ref=(
+        f"{_DGX_MODEL_TESTS}/mistral35_cuda121_generation_20261019T163014Z_s56gYq for "
+        "mistral-medium-3.5:128b (digest 0341632adb051bad...931ab78619): think=\"high\", "
+        "OLLAMA_SCHED_SPREAD=1 over GPUs 0, 1 and 3, 200.72 s request including a 180.38 s load. "
+        + _SMOKE_SCOPE
+    ),
+)
+
+EXPERIMENTAL_ANSWER_OPTIONS = GenerationOptions(
+    temperature=ANSWER_TEMPERATURE,
+    num_ctx=ANSWER_NUM_CTX,
+    num_predict=EXPERIMENTAL_ANSWER_NUM_PREDICT,
+)
+
+
+def _experimental_profile(
+    *,
+    profile_id: str,
+    model_tag: str,
+    display_name: str,
+    digest: str,
+    think: ThinkValue,
+    evidence: RuntimeSmokeEvidence,
+    read_timeout_s: float,
+    helper_read_timeout_s: float,
+    job_budget_s: Optional[float] = None,
+    verifier_num_predict: int = EXPERIMENTAL_VERIFIER_NUM_PREDICT,
+    helper_num_predict: int = EXPERIMENTAL_HELPER_NUM_PREDICT,
+) -> ModelProfile:
+    return ModelProfile(
+        profile_id=profile_id,
+        model_tag=model_tag,
+        display_name=display_name,
+        answer_options=EXPERIMENTAL_ANSWER_OPTIONS,
+        keep_alive=ANSWER_KEEP_ALIVE,
+        answer_read_timeout_s=read_timeout_s,
+        verifier_read_timeout_s=read_timeout_s,
+        helper_read_timeout_s=helper_read_timeout_s,
+        requires_qualification=False,
+        expected_digest=digest,
+        think=think,
+        runtime_key=COMPAT_RUNTIME,
+        experimental=True,
+        runtime_smoke=evidence,
+        verifier_policy=RolePolicy(think=think, num_predict=verifier_num_predict),
+        helper_policy=RolePolicy(think=think, num_predict=helper_num_predict),
+        max_concurrent_jobs=EXPERIMENTAL_MAX_CONCURRENT_JOBS,
+        answer_job_budget_s=job_budget_s,
+        helper_job_budget_s=job_budget_s,
+    )
+
+
+def experimental_profiles() -> Tuple[ModelProfile, ...]:
+    """The three experimental profiles, served by the compatibility runtime.
+    Registered always; selectable only where the deployment enables them."""
+    return (
+        _experimental_profile(
+            profile_id=QWEN38_EXPERIMENTAL,
+            model_tag=QWEN38_TAG,
+            display_name="Qwen3.8 27B",
+            digest=QWEN38_DIGEST,
+            think=True,
+            evidence=QWEN38_RUNTIME_SMOKE,
+            read_timeout_s=EXPERIMENTAL_READ_TIMEOUT_S,
+            helper_read_timeout_s=EXPERIMENTAL_HELPER_READ_TIMEOUT_S,
+        ),
+        _experimental_profile(
+            profile_id=NEMOTRON35_EXPERIMENTAL,
+            model_tag=NEMOTRON35_TAG,
+            display_name="Nemotron 3.5 Lightning 30B",
+            digest=NEMOTRON35_DIGEST,
+            think=True,
+            evidence=NEMOTRON35_RUNTIME_SMOKE,
+            read_timeout_s=EXPERIMENTAL_READ_TIMEOUT_S,
+            helper_read_timeout_s=EXPERIMENTAL_HELPER_READ_TIMEOUT_S,
+            verifier_num_predict=NEMOTRON35_VERIFIER_NUM_PREDICT,
+            helper_num_predict=NEMOTRON35_HELPER_NUM_PREDICT,
+        ),
+        _experimental_profile(
+            profile_id=MISTRAL35_EXPERIMENTAL,
+            model_tag=MISTRAL35_TAG,
+            display_name="Mistral Medium 3.5 128B",
+            digest=MISTRAL35_DIGEST,
+            think="high",
+            evidence=MISTRAL35_RUNTIME_SMOKE,
+            read_timeout_s=MISTRAL35_READ_TIMEOUT_S,
+            helper_read_timeout_s=MISTRAL35_HELPER_READ_TIMEOUT_S,
+            job_budget_s=MISTRAL35_JOB_BUDGET_S,
+        ),
+    )
+
+
+def default_model_registry(
+    *,
+    experimental_enabled: bool = False,
+    configured_runtimes: FrozenSet[str] = frozenset({PRIMARY_RUNTIME}),
+) -> ModelRegistry:
+    """The production registry: Llama is the default; Gemma is qualified; the
+    three experimental profiles are registered on the compatibility runtime.
 
     The default only seeds the shared selection the first time ownership
     creates it; after that the persisted selection decides which profile
-    answers, and changing it is an administrator's coordinated switch."""
+    answers, and changing it is an administrator's coordinated switch.
+    ``experimental_enabled`` and ``configured_runtimes`` are the deployment's
+    server-side facts (main.py reads them once, at import); with the defaults
+    no experimental profile can be selected."""
     return ModelRegistry(
+        experimental_enabled=experimental_enabled,
+        configured_runtimes=configured_runtimes,
         profiles=(
             ModelProfile(
                 profile_id=LLAMA_CONTROL,
@@ -676,6 +1233,7 @@ def default_model_registry() -> ModelRegistry:
                 think=False,
                 qualification=GEMMA_CANDIDATE_EVIDENCE,
             ),
+            *experimental_profiles(),
         ),
         default_profile_id=LLAMA_CONTROL,
     )
@@ -692,20 +1250,22 @@ def _snapshot(
     observed_digest: Optional[str],
     selection_epoch: Optional[int] = None,
 ) -> AnswerGenerationSnapshot:
-    # The verifier is this exact profile and identity with the bounded
-    # verifier options, fixed here with the answer: verification never
-    # rebuilds it from whatever the registry holds later.
+    # The verifier is this exact profile, identity and runtime with the
+    # bounded verifier role policy, fixed here with the answer: verification
+    # never rebuilds it from whatever the registry holds later.
+    role = profile.verifier_role()
     verifier = _role_call(
         profile_id=profile.profile_id,
         model_tag=profile.model_tag,
         num_ctx=profile.answer_options.num_ctx,
         keep_alive=profile.keep_alive,
-        think=profile.think,
+        think=role.think,
         expected_digest=profile.expected_digest,
         observed_digest=observed_digest,
         temperature=VERIFIER_TEMPERATURE,
-        num_predict=VERIFIER_NUM_PREDICT,
+        num_predict=role.num_predict,
         read_timeout_s=profile.verifier_read_timeout_s,
+        runtime_key=profile.runtime_key,
     )
     return AnswerGenerationSnapshot(
         profile_id=profile.profile_id,
@@ -721,18 +1281,32 @@ def _snapshot(
         observed_digest=observed_digest,
         verifier=verifier,
         selection_epoch=selection_epoch,
+        runtime_key=profile.runtime_key,
+        experimental=profile.experimental,
+        helper_policy=profile.helper_policy,
     )
+
+
+def _refuse_ineligible(registry: ModelRegistry, profile: ModelProfile) -> None:
+    reason = registry.ineligible_reason(profile)
+    if reason is None:
+        return
+    if reason == INELIGIBLE_RUNTIME_NOT_CONFIGURED:
+        raise ModelRuntimeUnavailableError("the model profile's runtime is not configured on this server")
+    if reason == INELIGIBLE_EXPERIMENTAL_DISABLED:
+        raise ExperimentalProfileDisabledError("experimental model profiles are disabled on this server")
+    raise ProfileNotQualifiedError("model profile is not qualified for selection")
 
 
 def select_shared_profile(registry: ModelRegistry, profile_id: object) -> ModelProfile:
     """The registered, selectable profile a shared selection names, or a
-    ModelSelectionError. Pure: no lookup, no fallback to any other profile --
-    an unknown or unqualified selection refuses."""
+    ModelSelectionError. Pure: no lookup, no fallback to any other profile or
+    runtime -- an unknown, unqualified, disabled experimental or unconfigured
+    runtime selection refuses."""
     profile = registry.get(profile_id) if isinstance(profile_id, str) else None
     if profile is None:
         raise UnknownModelProfileError("unknown model profile")
-    if not profile.selectable:
-        raise ProfileNotQualifiedError("model profile is not qualified for selection")
+    _refuse_ineligible(registry, profile)
     return profile
 
 
@@ -742,8 +1316,10 @@ def check_installed_identity(
     """Read the installed digest of the profile's exact tag and require it to
     equal the profile's pinned digest; return what was observed.
 
-    Read-only: ``installed_digest`` is an inventory lookup. An absent tag or a
-    different digest is a mismatch; a failed or malformed lookup is
+    Read-only: ``installed_digest`` is an inventory lookup, and the caller
+    binds it to the profile's OWN runtime (``profile.runtime_key``): a tag
+    present on another runtime proves nothing about this one. An absent tag
+    or a different digest is a mismatch; a failed or malformed lookup is
     unavailable. A profile without a pin cannot be verified."""
     if profile.expected_digest is None:
         raise ModelIdentityUnavailableError("model profile has no pinned identity")
@@ -766,23 +1342,36 @@ def shared_generation_snapshot(
     *,
     epoch: int,
     observed_digest: Optional[str],
+    registry: Optional[ModelRegistry] = None,
 ) -> AnswerGenerationSnapshot:
     """The snapshot for one job admitted under the shared selection
     ``(profile, epoch)``.
 
     ``observed_digest`` must be what ``check_installed_identity`` returned for
-    THIS job when the profile requires qualification, and None otherwise: the
+    THIS job, on the profile's own runtime, when the profile requires an
+    identity check (qualified or experimental), and None otherwise: the
     unqualified control makes no per-job inventory call, and its pinned digest
     is never copied into the observed one. The verifier and every helper call
-    are derived from this same snapshot."""
+    are derived from this same snapshot, on its runtime.
+
+    ``registry`` is the deployment registry; when given, the profile must be
+    eligible there. An experimental profile is refused without it, so no
+    caller can build an experimental snapshot while the deployment has not
+    enabled experimental profiles."""
     if not isinstance(profile, ModelProfile):
         raise GenerationProfileError("expected a registered ModelProfile")
     require_selection_epoch(epoch)
-    if not profile.selectable:
+    if registry is not None:
+        if not isinstance(registry, ModelRegistry):
+            raise GenerationProfileError("registry must be a ModelRegistry")
+        _refuse_ineligible(registry, profile)
+    elif profile.experimental:
+        raise ExperimentalProfileDisabledError("an experimental profile needs the deployment registry")
+    elif not profile.selectable:
         raise ProfileNotQualifiedError("model profile is not qualified for selection")
-    if profile.requires_qualification:
+    if profile.requires_identity_check:
         if observed_digest is None or observed_digest != profile.expected_digest:
-            raise ModelIdentityUnavailableError("a qualified profile needs its observed identity")
+            raise ModelIdentityUnavailableError("this profile needs its observed identity")
     elif observed_digest is not None:
         raise GenerationProfileError("the unqualified control records no observed identity")
     return _snapshot(profile, SHARED_SELECTION, observed_digest, epoch)

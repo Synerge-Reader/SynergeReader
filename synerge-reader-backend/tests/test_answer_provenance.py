@@ -45,6 +45,7 @@ from generation_profiles import (
     GEMMA_CANDIDATE,
     LLAMA_CONTROL,
     LLAMA_CONTROL_DIGEST,
+    GenerationProfileError,
     ModelRegistry,
     Qualification,
     _snapshot,
@@ -141,7 +142,7 @@ def test_a_shared_llama_record_has_exactly_the_versioned_schema():
     record = _build()
 
     assert record == {
-        "schema_version": 3,
+        "schema_version": 4,
         "trace_id": TRACE_ID,
         "release": {"app_version": "0.1.0", "build_sha": SYNTHETIC_SHA},
         "generation": {
@@ -155,6 +156,8 @@ def test_a_shared_llama_record_has_exactly_the_versioned_schema():
             "think": None,
             "keep_alive": "5m",
             "answer_read_timeout_s": 60.0,
+            "runtime_key": "primary",
+            "experimental": False,
         },
         "prompt": {
             "answer_prompt_version": "rag-answer-v1",
@@ -170,6 +173,7 @@ def test_a_shared_llama_record_has_exactly_the_versioned_schema():
             "think": None,
             "keep_alive": "5m",
             "read_timeout_s": 30.0,
+            "runtime_key": "primary",
             "calls_attempted": 1,
         },
         "retrieval": {
@@ -198,7 +202,7 @@ def test_a_shared_llama_record_has_exactly_the_versioned_schema():
             "total_duration_ns": 4_000_000_000,
         },
     }
-    assert PROVENANCE_SCHEMA_VERSION == 3
+    assert PROVENANCE_SCHEMA_VERSION == 4
 
 
 def test_an_unknown_build_is_recorded_as_null_not_guessed():
@@ -239,6 +243,7 @@ def test_a_shared_gemma_selection_records_its_epoch_and_the_observed_digest():
         "think": False,
         "keep_alive": "5m",
         "read_timeout_s": 150.0,
+        "runtime_key": "primary",
         "calls_attempted": 1,
     }
 
@@ -288,7 +293,19 @@ def test_the_verifier_think_policy_is_recorded_as_sent():
 
 
 def test_a_stand_in_verifier_is_refused():
-    snapshot = dataclasses.replace(_llama_default(), verifier={"model_tag": "spoofed:latest", "read_timeout_s": 1})
+    # The snapshot itself refuses a verifier that is not its own model call.
+    with pytest.raises(GenerationProfileError):
+        dataclasses.replace(_llama_default(), verifier={"model_tag": "spoofed:latest", "read_timeout_s": 1})
+    # And no record is built from one smuggled into a frozen snapshot.
+    snapshot = _llama_default()
+    object.__setattr__(snapshot, "verifier", {"model_tag": "spoofed:latest", "read_timeout_s": 1})
+    with pytest.raises(AnswerProvenanceError):
+        _build(generation=snapshot)
+
+
+def test_a_verifier_on_another_runtime_is_refused():
+    snapshot = _llama_default()
+    object.__setattr__(snapshot, "verifier", dataclasses.replace(snapshot.verifier, runtime_key="compat_cuda121"))
     with pytest.raises(AnswerProvenanceError):
         _build(generation=snapshot)
 
@@ -297,7 +314,7 @@ def test_the_verification_and_selection_fields_survive_json_storage():
     record = _build(generation=_qualified_gemma_shared())
     text = answer_provenance_json(record)
     stored = json.loads(text)
-    assert stored["schema_version"] == 3
+    assert stored["schema_version"] == 4
     assert (stored["generation"]["selection"], stored["generation"]["selection_epoch"]) == ("shared_active", 3)
     assert stored["verification"] == record["verification"]
     assert stored["verification"]["think"] is False, "false is stored, not dropped"
@@ -531,6 +548,7 @@ def _stored_v2():
 def test_the_reader_vocabulary_is_explicit_per_schema_version():
     assert SELECTIONS_BY_SCHEMA_VERSION == {
         1: ("default", "admin_override"), 2: ("default", "admin_override"), 3: ("shared_active",),
+        4: ("shared_active",),
     }
 
 
@@ -538,30 +556,56 @@ def test_stored_v1_and_v2_records_read_with_their_own_vocabulary_and_stay_unchan
     for stored, expected in (
         (_stored_v1(), {"schema_version": 1, "selection": "default", "selection_epoch": None,
                         "profile_id": "llama_control", "model_tag": "llama3.1:8b",
-                        "expected_digest": LLAMA_CONTROL_DIGEST, "observed_digest": None}),
+                        "expected_digest": LLAMA_CONTROL_DIGEST, "observed_digest": None,
+                        "runtime_key": None}),
         (_stored_v2(), {"schema_version": 2, "selection": "admin_override", "selection_epoch": None,
                         "profile_id": "gemma_candidate", "model_tag": "gemma4:31b",
-                        "expected_digest": SYNTHETIC_DIGEST, "observed_digest": SYNTHETIC_DIGEST}),
+                        "expected_digest": SYNTHETIC_DIGEST, "observed_digest": SYNTHETIC_DIGEST,
+                        "runtime_key": None}),
     ):
         before = json.dumps(stored, sort_keys=True)
         assert read_answer_provenance(stored) == expected
         assert json.dumps(stored, sort_keys=True) == before, "reading never rewrites or fills in a record"
 
 
+def _stored_v3(epoch=5):
+    """A version 3 record as the previous release stored it: no runtime key."""
+    stored = json.loads(answer_provenance_json(_build(generation=_qualified_gemma_shared(epoch=epoch))))
+    stored["schema_version"] = 3
+    del stored["generation"]["runtime_key"]
+    del stored["generation"]["experimental"]
+    del stored["verification"]["runtime_key"]
+    return stored
+
+
 def test_a_v3_record_reads_back_its_shared_selection_and_epoch():
-    stored = json.loads(answer_provenance_json(_build(generation=_qualified_gemma_shared(epoch=5))))
+    stored = _stored_v3(epoch=5)
+    before = json.dumps(stored, sort_keys=True)
     view = read_answer_provenance(stored)
     assert (view["schema_version"], view["selection"], view["selection_epoch"]) == (3, "shared_active", 5)
     assert (view["expected_digest"], view["observed_digest"]) == (SYNTHETIC_DIGEST, SYNTHETIC_DIGEST)
+    assert view["runtime_key"] is None, "a version 3 record predates runtime keys: not recorded, never guessed"
+    assert json.dumps(stored, sort_keys=True) == before, "reading never rewrites or fills in a record"
+
+
+def test_a_v4_record_reads_back_its_runtime_key():
+    stored = json.loads(answer_provenance_json(_build(generation=_qualified_gemma_shared(epoch=5))))
+    view = read_answer_provenance(stored)
+    assert (view["schema_version"], view["selection_epoch"], view["runtime_key"]) == (4, 5, "primary")
 
 
 @pytest.mark.parametrize(
     "change",
     ["v1-with-shared", "v2-with-epoch", "v3-with-default", "v3-without-epoch", "v3-bool-epoch", "v4", "v0",
-     "string-version", "no-generation", "bad-digest"],
+     "string-version", "no-generation", "bad-digest", "v3-with-runtime", "v4-without-runtime",
+     "v4-unknown-runtime", "v5"],
 )
 def test_a_mixed_or_unknown_vocabulary_is_refused_not_guessed(change):
     if change.startswith("v3"):
+        stored = _stored_v3()
+        if change == "v3-with-runtime":
+            stored["generation"]["runtime_key"] = "primary"
+    elif change in ("v4-without-runtime", "v4-unknown-runtime", "v5"):
         stored = json.loads(answer_provenance_json(_build()))
     else:
         stored = _stored_v2() if change == "v2-with-epoch" else _stored_v1()
@@ -578,6 +622,14 @@ def test_a_mixed_or_unknown_vocabulary_is_refused_not_guessed(change):
         generation["selection_epoch"] = True
     elif change == "v4":
         stored["schema_version"] = 4
+    elif change == "v4-without-runtime":
+        del generation["runtime_key"]
+    elif change == "v4-unknown-runtime":
+        generation["runtime_key"] = "http://ollama.invalid:11434"
+    elif change == "v5":
+        stored["schema_version"] = 5
+    elif change == "v3-with-runtime":
+        pass
     elif change == "v0":
         stored["schema_version"] = 0
     elif change == "string-version":

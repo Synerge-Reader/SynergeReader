@@ -4,8 +4,9 @@ A switch request is validated in memory and queued; the HTTP route answers
 202 at once. The coordinator's own thread -- never a request worker or the
 event loop -- then, in order:
 
-1. reads the target's installed identity (read-only inventory) and refuses a
-   target whose tag is absent, re-pulled or unreadable;
+1. reads the target's installed identity (read-only inventory) on the
+   target's OWN runtime and refuses a target whose tag is absent, re-pulled
+   or unreadable there;
 2. pauses new generation admission in this process, then moves the persisted
    selection active -> switching with a compare-and-set on the exact state,
    active profile and epoch it paused;
@@ -13,13 +14,36 @@ event loop -- then, in order:
    the snapshot it was admitted under -- nothing is rerouted or cancelled;
    any job that ends with an unobserved model call, and any unresolved call
    row in the database, aborts the switch;
-4. waits, bounded, for the previous generation model to leave Ollama's
-   loaded-model list by its own keep-alive expiry (read-only ``/api/ps``).
-   An empty job count is not proof that weights left GPU memory, so a model
-   that stays listed, or a list that cannot be read -- a reply without an
-   explicit ``models`` list, or any entry without a usable model identity --
-   aborts the switch; only an explicitly empty list confirms that nothing is
-   loaded. No unload, warm-up or service operation is ever sent;
+4. waits, bounded, for the previous generation model to leave the
+   loaded-model list of the runtime that served it, by its own keep-alive
+   expiry (read-only ``/api/ps``). The runtimes share one GPU pool, so on
+   each poll the barrier reads the primary runtime and the previous and
+   target profiles' runtimes -- and, while the experimental tier is enabled,
+   every other configured runtime too (with the tier off nothing this backend
+   loads can be resident there, so a stopped compatibility runtime never
+   blocks a Gemma/Llama switch). It also waits for any other registered
+   generation model (the target's own excepted) to leave any runtime it
+   reads; querying only the destination would miss a model still holding
+   memory elsewhere. An embedding model or another client's model is not a
+   registered generation model and never blocks the barrier: no list has to
+   become empty. An empty job count is not proof that weights left GPU
+   memory, so a model that stays listed, or a list that cannot be read -- a
+   reply without an explicit ``models`` list, any entry without a usable
+   model identity, or a runtime that could not be read -- aborts the switch.
+   ONE bounded exception, the return to control (see
+   ``_unverified_recovery_allowed``): from an experimental profile on the
+   compatibility runtime to Gemma or Llama on the primary runtime, when only
+   that previous runtime is unavailable (a connection to it could not be
+   established, or it is not configured here), every other runtime it needs
+   stays readable and clean, and no lingering model was ever seen, the
+   switch commits after the FULL residency window -- which must exceed the
+   previous profile's configured keep-alive -- and reports
+   ``residency_unverified``: the timer does not prove the old model expired
+   or unloaded. A malformed inventory, an unreadable primary runtime, a
+   readable lingering model, uncertain work, or a switch toward or between
+   experimental profiles still aborts.
+   No unload, warm-up or service operation is ever sent, so a committed
+   switch selects the model; it does not claim the model was loaded;
 5. re-reads the target identity and commits switching -> active with a
    compare-and-set on state, target, epoch, switch id and switch-owner boot
    id; only then is admission reopened with the new profile and epoch.
@@ -47,11 +71,20 @@ from typing import Callable, Optional
 
 from generation_admission import GenerationLedger, JobKind, SharedSelection
 from generation_profiles import (
+    COMPAT_RUNTIME,
+    INELIGIBLE_EXPERIMENTAL_DISABLED,
+    INELIGIBLE_RUNTIME_NOT_CONFIGURED,
+    PRIMARY_RUNTIME,
     ModelIdentityMismatchError,
     ModelSelectionError,
     check_installed_identity,
     normalize_digest,
 )
+
+_INELIGIBLE_DETAILS = {
+    INELIGIBLE_EXPERIMENTAL_DISABLED: "Experimental model profiles are disabled on this server.",
+    INELIGIBLE_RUNTIME_NOT_CONFIGURED: "That model profile's runtime is not configured on this server.",
+}
 from generation_selection import (
     STATE_ACTIVE,
     STATE_SWITCHING,
@@ -59,8 +92,44 @@ from generation_selection import (
     SelectionRecord,
 )
 
-PHASES = ("queued", "verifying_target", "draining", "awaiting_residency", "committing", "aborting")
+PHASES = ("queued", "verifying_target", "draining", "awaiting_residency", "awaiting_residency_unverified",
+          "committing", "aborting")
 OUTCOMES = ("committed", "aborted", "failed")
+# The reason a committed switch carries when the return to control committed
+# on the timer alone: the previous runtime's list was never readable, so the
+# previous model's departure is NOT confirmed. Reported, never persisted (the
+# database keeps last_outcome 'committed').
+RESIDENCY_UNVERIFIED = "residency_unverified"
+# The return to control waits at least this long after draining -- and longer
+# than the previous profile's keep-alive -- before it commits unverified.
+UNVERIFIED_RECOVERY_MIN_WINDOW_S = 420.0
+_KEEP_ALIVE_UNITS = {"s": 1, "m": 60, "h": 3600}
+
+
+class RuntimeInventoryUnavailable(Exception):
+    """A runtime's loaded-model list could not be fetched at all: the runtime
+    is not configured, or a connection to it was confirmed NOT to have been
+    established (refused, unreachable, unresolved, connect timeout).
+    Everything else -- a connection that was made and then failed, a timeout
+    or protocol error while reading the reply, an HTTP error, a body that is
+    not JSON, a malformed list, or an ambiguous connection error -- raises
+    anything else and always fails closed."""
+
+
+def keep_alive_seconds(value: object) -> Optional[float]:
+    """Seconds of a profile's ``keep_alive`` ("5m", "300s", "1h"), or None."""
+    if not isinstance(value, str) or len(value) < 2 or value[-1] not in _KEEP_ALIVE_UNITS:
+        return None
+    number = value[:-1]
+    if not number.isdigit() or number.startswith("0"):
+        return None
+    return float(int(number) * _KEEP_ALIVE_UNITS[value[-1]])
+
+
+# What one residency poll found.
+_CLEAR = "clear"  # every runtime read; nothing that blocks is listed
+_BLOCKED = "blocked"  # a readable list still shows a blocking model
+_UNVERIFIED = "unverified"  # the previous runtime unavailable; all others read and clear
 
 
 @dataclass(frozen=True)
@@ -150,14 +219,19 @@ def loaded_model_entries(payload: object) -> list:
 
 
 class SwitchCoordinator:
+    """``installed_digest(tag, runtime_key)`` reads one runtime's installed
+    identity of ``tag``; ``resident_models(runtime_key)`` reads one runtime's
+    loaded-model list. Both are read-only and are always called with the
+    runtime a profile actually uses."""
+
     def __init__(
         self,
         *,
         ledger: GenerationLedger,
         owner: GenerationOwner,
         registry_provider: Callable[[], object],
-        installed_digest: Callable[[str], Optional[str]],
-        resident_models: Callable[[], list],
+        installed_digest: Callable[[str, str], Optional[str]],
+        resident_models: Callable[[str], list],
         settings: CoordinatorSettings = CoordinatorSettings(),
         clock: Callable[[], float] = time.monotonic,
         thread_factory: Callable[..., object] = threading.Thread,
@@ -213,8 +287,11 @@ class SwitchCoordinator:
         profile = registry.get(target_profile_id) if isinstance(target_profile_id, str) else None
         if profile is None:
             return SwitchRequestOutcome(False, 400, "Unknown model profile.")
-        if not profile.selectable:
-            return SwitchRequestOutcome(False, 409, "That model profile is not qualified for selection.")
+        reason = registry.ineligible_reason(profile)
+        if reason is not None:
+            return SwitchRequestOutcome(
+                False, 409, _INELIGIBLE_DETAILS.get(reason, "That model profile is not qualified for selection.")
+            )
         snap = self._ledger.snapshot()
         with self._lock:
             if self._stopping or not self._started or not snap.owner:
@@ -297,17 +374,29 @@ class SwitchCoordinator:
                 "model": profile.model_tag if profile is not None else None,
                 "epoch": snap.selection.epoch,
                 "registered": profile is not None,
+                "experimental": bool(profile is not None and profile.experimental),
+                "runtime": profile.runtime_key if profile is not None else None,
+                # A persisted selection this server would refuse to answer
+                # with (disabled experimental profile, unconfigured runtime).
+                "eligible": bool(profile is not None and registry.is_selectable(profile)),
             }
-        choices = [
-            {
+        choices = []
+        for profile in registry.profiles:
+            smoke = profile.runtime_smoke
+            choices.append({
                 "profile_id": profile.profile_id,
                 "display_name": profile.display_name,
                 "model": profile.model_tag,
-                "eligible": bool(profile.selectable),
+                "eligible": registry.is_selectable(profile),
+                "ineligible_reason": registry.ineligible_reason(profile),
                 "active": active is not None and profile.profile_id == active["profile_id"],
-            }
-            for profile in registry.profiles
-        ]
+                # Backend-owned key only; never an endpoint.
+                "runtime": profile.runtime_key,
+                "evidence": profile.evidence_tier,
+                "experimental": profile.experimental,
+                "runtime_smoke_verdict": smoke.verdict if smoke is not None else None,
+                "review_note": smoke.review_note if smoke is not None else None,
+            })
         return {
             "ownership": self._owner.state.value,
             "admission": snap.admission,
@@ -324,7 +413,9 @@ class SwitchCoordinator:
                 "total_slots": snap.total_slots,
                 "answer_slots": snap.answer_slots,
                 "helper_slots": snap.helper_slots,
+                "selection_job_limit": snap.selection_job_limit,
             },
+            "experimental_enabled": bool(getattr(registry, "experimental_enabled", False)),
             "settings_provisional": True,
         }
 
@@ -374,8 +465,9 @@ class SwitchCoordinator:
             self._work.wait_for(lambda: switch.abort_requested or self._stopping, timeout=max(0.0, seconds))
 
     def _verify_target(self, profile) -> Optional[str]:
+        runtime_key = profile.runtime_key
         try:
-            check_installed_identity(profile, self._installed_digest)
+            check_installed_identity(profile, lambda tag: self._installed_digest(tag, runtime_key))
         except ModelIdentityMismatchError:
             return "target_identity_mismatch"
         except ModelSelectionError:
@@ -386,7 +478,7 @@ class SwitchCoordinator:
         store = self._owner.store
         registry = self._registry()
         target = registry.get(switch.target_profile_id)
-        if store is None or target is None or not target.selectable:
+        if store is None or target is None or not registry.is_selectable(target):
             return self._finish(switch, "failed", "ownership_unavailable" if store is None else "target_unavailable")
 
         switch.phase = "verifying_target"
@@ -441,21 +533,48 @@ class SwitchCoordinator:
         previous = registry.get(old.profile_id)
         if previous is None:
             return self._abort(store, switch, "previous_profile_unknown")
+        recovery_allowed = self._unverified_recovery_allowed(previous, target)
+        # The window starts once the drain is complete: admission is paused and
+        # nothing this backend admitted can refresh the previous keep-alive.
         deadline = self._clock() + self._settings.residency_timeout_s
+        seen_blocking = False
+        unverified = False
         while True:
             try:
-                resident = self._is_resident(previous)
+                state = self._residency_state(registry, previous, target, recovery_allowed)
             except Exception:
                 return self._abort(store, switch, "residency_unavailable")
-            if not resident:
+            if state == _CLEAR:
                 break
+            if state == _BLOCKED:
+                # A readable list showed a blocking model: from here on only a
+                # verified clear reading may commit.
+                seen_blocking = True
+                switch.phase = "awaiting_residency"
+            else:
+                switch.phase = "awaiting_residency_unverified"
             if switch.abort_requested:
                 return self._abort(store, switch, "admin_abort")
             if self._clock() >= deadline:
+                if state == _UNVERIFIED and not seen_blocking:
+                    unverified = True
+                    break
                 return self._abort(store, switch, "residency_timeout")
             self._wait(switch, min(self._settings.residency_poll_s, max(0.0, deadline - self._clock())))
             if self._stopping:
                 return self._finish(switch, "failed", "stopped")
+
+        if unverified:
+            # Nothing the window cannot vouch for: no admitted or unresolved
+            # work may have appeared meanwhile.
+            if self._ledger.unknown_since_pause() or self._ledger.unresolved_total():
+                return self._abort(store, switch, "uncertain_work")
+            try:
+                unresolved_rows = store.count_unresolved()
+            except Exception:
+                unresolved_rows = None
+            if unresolved_rows != 0:
+                return self._abort(store, switch, "uncertain_work")
 
         switch.phase = "committing"
         refusal = self._verify_target(target)
@@ -476,21 +595,110 @@ class SwitchCoordinator:
         if committed is None:
             return self._abort(store, switch, "admin_abort" if switch.abort_requested else "selection_conflict")
         self._ledger.resume(switch.switch_id, committed.shared)
+        if unverified:
+            self._log(
+                f"[Generation] switch {switch.switch_id}: residency unverified -- the previous profile's runtime "
+                f"could not be read; committed after the full {self._settings.residency_timeout_s:g} s window, "
+                "which does not prove the previous model unloaded"
+            )
+            return self._finish(switch, "committed", RESIDENCY_UNVERIFIED)
         return self._finish(switch, "committed", None)
 
-    def _is_resident(self, profile) -> bool:
-        models = self._resident_models()
+    def _listed(self, runtime_key: str) -> list:
+        """One runtime's loaded-model entries as (tags, digest); ValueError
+        when the list is unreadable. Every entry must be identifiable before
+        any is trusted: one entry that names no model makes the list
+        unreadable."""
+        models = self._resident_models(runtime_key)
         if not isinstance(models, list):
             raise ValueError("unreadable loaded-model list")
-        # Every entry must be identifiable before any is trusted: one entry
-        # that names no model makes the whole list unreadable.
-        listed = [_listed_identity(entry) for entry in models]
-        for tags, digest in listed:
-            if profile.model_tag in tags:
+        return [_listed_identity(entry) for entry in models]
+
+    @staticmethod
+    def _matches(listed: list, model_tag: str, digest: Optional[str]) -> bool:
+        for tags, listed_digest in listed:
+            if model_tag in tags:
                 return True
-            if profile.expected_digest is not None and digest == profile.expected_digest:
+            if digest is not None and listed_digest == digest:
                 return True
         return False
+
+    def _unverified_recovery_allowed(self, previous, target) -> bool:
+        """Whether this switch may use the bounded return to control: an
+        experimental profile on the compatibility runtime back to a control
+        or qualified profile (Gemma, Llama) on the primary runtime, with a
+        residency window of at least UNVERIFIED_RECOVERY_MIN_WINDOW_S that
+        outlasts the previous profile's keep-alive. A switch toward or
+        between experimental profiles never qualifies."""
+        if not (previous.experimental and previous.runtime_key == COMPAT_RUNTIME):
+            return False
+        if target.experimental or target.runtime_key != PRIMARY_RUNTIME:
+            return False
+        keep_alive = keep_alive_seconds(previous.keep_alive)
+        window = self._settings.residency_timeout_s
+        return keep_alive is not None and window >= UNVERIFIED_RECOVERY_MIN_WINDOW_S and window > keep_alive
+
+    def _barrier_runtimes(self, registry, previous, target) -> set:
+        """The runtimes one residency poll reads: the primary runtime and the
+        previous and target profiles' runtimes always; every other configured
+        runtime only while the experimental tier is enabled. With the tier
+        off no experimental snapshot can be built, so nothing this backend
+        loads can be resident on a runtime outside that set; a persisted
+        experimental selection still reads its own runtime as ``previous``."""
+        runtimes = {PRIMARY_RUNTIME, previous.runtime_key, target.runtime_key}
+        if getattr(registry, "experimental_enabled", False):
+            runtimes |= set(registry.configured_runtimes)
+        return runtimes
+
+    def _residency_state(self, registry, previous, target, recovery_allowed: bool) -> str:
+        """``_CLEAR`` once no generation model that is not the target, where
+        the target will serve, holds memory on any runtime the barrier reads;
+        ``_BLOCKED`` while a readable list still shows one; ``_UNVERIFIED``
+        when the only runtime that could not be read is the previous
+        profile's, ``recovery_allowed`` holds, and every other runtime was
+        read and is clear. Anything else that cannot be read raises.
+
+        The previous profile is looked for on the runtime that served it.
+        Every runtime read is also checked for every registered generation
+        model, so a switch between runtimes -- either way -- and between two
+        compatibility profiles waits for whichever model is still loaded. The
+        target's own tag and digest are exempt ONLY on the target's runtime,
+        where it may already be resident: a copy of the target's model on any
+        other runtime is a conflicting generator and blocks like any other.
+        Unregistered models (the embedder, other clients) are never waited
+        for."""
+        configured = set(registry.configured_runtimes)
+        identities = [(tag, digest) for _profile_id, tag, digest in registry.generation_identities()]
+        previous_unavailable = False
+        for runtime_key in sorted(self._barrier_runtimes(registry, previous, target)):
+            excusable = recovery_allowed and runtime_key == previous.runtime_key
+            if runtime_key not in configured:
+                if excusable:
+                    previous_unavailable = True
+                    continue
+                raise ValueError("a runtime the switch needs is not configured")
+            try:
+                listed = self._listed(runtime_key)
+            except RuntimeInventoryUnavailable:
+                if excusable:
+                    previous_unavailable = True
+                    continue
+                raise
+            if runtime_key == previous.runtime_key and self._matches(
+                listed, previous.model_tag, previous.expected_digest
+            ):
+                return _BLOCKED
+            if runtime_key == target.runtime_key:
+                # Where the target serves, its own tag/digest never blocks.
+                listed = [
+                    (tags, digest) for tags, digest in listed
+                    if target.model_tag not in tags
+                    and not (target.expected_digest is not None and digest == target.expected_digest)
+                ]
+            for tag, digest in identities:
+                if self._matches(listed, tag, digest):
+                    return _BLOCKED
+        return _UNVERIFIED if previous_unavailable else _CLEAR
 
     def _read(self, store) -> Optional[SelectionRecord]:
         try:
@@ -592,7 +800,11 @@ __all__ = [
     "CoordinatorSettings",
     "GenerationRuntime",
     "JobKind",
+    "RESIDENCY_UNVERIFIED",
+    "RuntimeInventoryUnavailable",
     "SwitchCoordinator",
     "SwitchRequestOutcome",
+    "UNVERIFIED_RECOVERY_MIN_WINDOW_S",
+    "keep_alive_seconds",
     "loaded_model_entries",
 ]

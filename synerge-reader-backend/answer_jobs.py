@@ -37,6 +37,18 @@ short grace, longer while persistence is in progress) has passed -- even if
 the job thread is blocked before the first byte or inside a read. A timeout,
 a disconnect or a closed connection is never treated as proof that Ollama
 stopped: an unobserved call keeps its capacity as UNKNOWN.
+
+Heartbeats. While the job has produced nothing new -- a cold model load, a
+long prompt evaluation, a thinking phase whose text is never sent -- the
+sender writes a ``{"type": "heartbeat"}`` line once ``heartbeat_s`` has passed
+since its last write, so that an idle-timeout proxy in front of the server
+(the public proxy closes a response that is silent for about 100 s) keeps the
+stream open. That is the intent; the unit tests prove the sender's behaviour,
+and surviving the real public route (nginx and Cloudflare) through a cold
+model load is a separate deployment check. Heartbeats are written by the sender only, bounded like every
+send, never pass through the job's channel or its byte bound, carry no
+content, and stop with the terminal ``done``. Clients ignore event types
+they do not know.
 """
 
 from __future__ import annotations
@@ -89,6 +101,7 @@ DELIVERY_CANCELLED = "delivery_cancelled"
 
 _CONTROL_PREFIXES = ('{"type": "error"', '{"type": "entry_id"', '{"type": "done"')
 _DONE_PREFIX = '{"type": "done"'
+HEARTBEAT_LINE = b'{"type": "heartbeat"}\n'
 
 
 def _line(event_type: str, **payload) -> str:
@@ -114,6 +127,9 @@ class DeliverySettings:
     send_stall_s: float = 10.0
     deadline_grace_s: float = 2.0
     persist_grace_s: float = 15.0
+    # Idle interval after which the sender writes a heartbeat line; well
+    # inside the public proxy's ~100 s idle limit. Provisional.
+    heartbeat_s: float = 15.0
 
     def __post_init__(self) -> None:
         for name, low, high in (("max_buffered_bytes", 4096, 64 * 1024 * 1024), ("reserved_bytes", 512, 65536)):
@@ -123,7 +139,7 @@ class DeliverySettings:
         if self.reserved_bytes * 2 > self.max_buffered_bytes:
             raise ValueError("reserved_bytes must leave room for ordinary events")
         for name, low, high in (("send_stall_s", 0.01, 600.0), ("deadline_grace_s", 0.0, 60.0),
-                                ("persist_grace_s", 0.0, 120.0)):
+                                ("persist_grace_s", 0.0, 120.0), ("heartbeat_s", 0.01, 90.0)):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
                     or not low <= value <= high:
@@ -467,6 +483,9 @@ class AdmittedAnswerResponse(Response):
 
     async def _deliver(self, send, ready: asyncio.Event, disconnected) -> None:
         job = self.job
+        loop = asyncio.get_running_loop()
+        heartbeat_s = job.settings.heartbeat_s
+        last_write = loop.time()
         while True:
             if disconnected.done() or (job.channel.abandoned and job.channel.abandoned != DELIVERY_OVERFLOW):
                 return
@@ -477,12 +496,22 @@ class AdmittedAnswerResponse(Response):
                     if job.channel.terminate(ANSWER_TIMEOUT_ERROR):
                         self._log_timeout()
                     continue
+                if loop.time() - last_write >= heartbeat_s:
+                    # Nothing new for heartbeat_s: keep idle-timeout proxies
+                    # from closing the stream. No content, no channel bytes.
+                    if not await self._bounded_send(
+                        send, {"type": "http.response.body", "body": HEARTBEAT_LINE, "more_body": True}, job
+                    ):
+                        return
+                    last_write = loop.time()
+                    continue
                 ready.clear()
                 item = job.channel.take()
                 if item is None:
                     waiter = asyncio.ensure_future(ready.wait())
+                    wait_s = min(remaining, max(0.0, heartbeat_s - (loop.time() - last_write)))
                     try:
-                        await asyncio.wait({waiter, disconnected}, timeout=remaining,
+                        await asyncio.wait({waiter, disconnected}, timeout=wait_s,
                                            return_when=asyncio.FIRST_COMPLETED)
                     finally:
                         waiter.cancel()
@@ -490,6 +519,7 @@ class AdmittedAnswerResponse(Response):
             data, is_done = item
             if not await self._bounded_send(send, {"type": "http.response.body", "body": data, "more_body": True}, job):
                 return
+            last_write = loop.time()
             if is_done:
                 await self._bounded_send(send, {"type": "http.response.body", "body": b"", "more_body": False}, job)
                 return

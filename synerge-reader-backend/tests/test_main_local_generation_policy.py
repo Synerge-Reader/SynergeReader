@@ -206,7 +206,9 @@ def test_local_generation_exception_is_safe_and_has_no_fallback_call(main_tree):
     assert isinstance(assigned_value, ast.Constant) and assigned_value.value is True
 
     yields = [node for node in ast.walk(handler) if isinstance(node, ast.Yield)]
-    assert len(yields) == 2
+    # HTTP error; primary runtime unreachable; experimental runtime unreachable
+    # (which must not advise repointing OLLAMA_BASE_URL). All three literal.
+    assert len(yields) == 3
     yielded_text = [_literal_text(node.value).lower() for node in yields]
     # E2 transport migration. These two yields used to be ``__ERROR__...__``
     # sentinel strings; the /ask stream now carries NDJSON events, so the same
@@ -230,6 +232,10 @@ def test_local_generation_exception_is_safe_and_has_no_fallback_call(main_tree):
         "local llm server is not reachable" in text and "ollama_base_url" in text
         for text in yielded_text
     )
+    assert any(
+        "experimental" in text and "not reachable" in text and "ollama_base_url" not in text
+        for text in yielded_text
+    ), "an experimental-runtime failure never advises repointing the primary runtime"
     assert all(
         not any(isinstance(node, ast.Name) and node.id == handler.name for node in ast.walk(yielded.value))
         for yielded in yields

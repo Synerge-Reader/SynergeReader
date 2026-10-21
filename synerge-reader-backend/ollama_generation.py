@@ -20,6 +20,8 @@ What it guarantees:
   this module does not know -- is reported through ``failure``; after an error
   or malformed line no further text is returned. Error text from the server is
   never kept.
+* ``completion_diagnostic`` describes a non-streamed reply for the logs with
+  counts and fixed words only, never its text.
 
 Requiring ``"stop"`` assumes the target Ollama runtime reports it for a
 naturally finished native ``/api/generate`` reply. A runtime that reports
@@ -193,3 +195,67 @@ def completed_generate_response(body) -> Optional[str]:
     if not isinstance(text, str) or not text.strip():
         return None
     return text
+
+
+# Ollama's own completion reasons. Any other value is logged as "other", so a
+# diagnostic line never carries a string the server chose.
+_KNOWN_DONE_REASONS = ("stop", "length", "load", "unload")
+
+
+def _completion_category(body) -> str:
+    """Why completed_generate_response accepted or refused ``body``, as a
+    fixed word; it applies the same rules in the same order."""
+    if not isinstance(body, dict):
+        return "not_an_object"
+    if "error" in body:
+        return "model_error"
+    if body.get("done") is not True:
+        return "not_done"
+    reason = body.get("done_reason")
+    if reason == "length":
+        return FAILURE_OUTPUT_LIMIT
+    if not isinstance(reason, str) or reason != COMPLETED_DONE_REASON:
+        return "unfinished_reason"
+    text = body.get("response")
+    if not isinstance(text, str) or not text.strip():
+        return "empty_response"
+    return "completed"
+
+
+def completion_diagnostic(role: str, profile_id: str, num_predict: int, body) -> str:
+    """One log line describing a non-streamed role call's reply.
+
+    Counts and fixed words only: ``role`` is the caller's constant and
+    ``profile_id`` a validated profile id; ``done_reason`` is kept only when it
+    is one of Ollama's known reasons; ``thinking`` and ``response`` are reduced
+    to their lengths. No prompt, response, thinking or error text is included.
+    ``at_output_limit`` compares the generated token count with the limit the
+    call requested, which is how a reply cut off by its allowance shows."""
+    fields = body if isinstance(body, dict) else {}
+
+    def count(name):
+        value = fields.get(name)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    def length(name):
+        value = fields.get(name)
+        return str(len(value)) if isinstance(value, str) else "absent"
+
+    reason = fields.get("done_reason")
+    if not isinstance(reason, str):
+        reason = "missing"
+    elif reason not in _KNOWN_DONE_REASONS:
+        reason = "other"
+    prompt_count, eval_count = count("prompt_eval_count"), count("eval_count")
+    if eval_count is None:
+        at_limit = "unknown"
+    else:
+        at_limit = "yes" if eval_count >= num_predict else "no"
+    return (
+        f"[Generation] completion role={role} profile={profile_id} "
+        f"result={_completion_category(body)} done_reason={reason} "
+        f"prompt_eval_count={'unknown' if prompt_count is None else prompt_count} "
+        f"eval_count={'unknown' if eval_count is None else eval_count} num_predict={num_predict} "
+        f"at_output_limit={at_limit} thinking_chars={length('thinking')} "
+        f"response_chars={length('response')}"
+    )

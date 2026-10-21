@@ -70,7 +70,8 @@ def _synthetic_profile(profile):
 def _synthetic_registry():
     registry = default_model_registry()
     return ModelRegistry(
-        profiles=tuple(_synthetic_profile(p) for p in registry.profiles),
+        # The diagnostics run only the control and qualified profiles.
+        profiles=tuple(_synthetic_profile(p) for p in registry.profiles if not p.experimental),
         default_profile_id=LLAMA_CONTROL,
     )
 

@@ -522,7 +522,7 @@ def test_a_shared_llama_answer_is_saved_with_server_provenance(client, db, ollam
     trace_id = row["trace_id"]
     assert str(uuid.UUID(trace_id)) == trace_id and uuid.UUID(trace_id).version == 4
     provenance = row["answer_provenance"]
-    assert provenance["schema_version"] == 3
+    assert provenance["schema_version"] == 4
     assert provenance["trace_id"] == trace_id, "the column and the record name the same attempt"
     assert provenance["release"] == {"app_version": "0.1.0", "build_sha": SYNTHETIC_SHA}
     assert provenance["generation"] == {
@@ -536,6 +536,8 @@ def test_a_shared_llama_answer_is_saved_with_server_provenance(client, db, ollam
         "think": None,
         "keep_alive": "5m",
         "answer_read_timeout_s": 60.0,
+        "runtime_key": "primary",
+        "experimental": False,
     }
     assert provenance["prompt"] == {
         "answer_prompt_version": "rag-answer-v1",
@@ -551,6 +553,7 @@ def test_a_shared_llama_answer_is_saved_with_server_provenance(client, db, ollam
         "think": None,
         "keep_alive": "5m",
         "read_timeout_s": 30.0,
+        "runtime_key": "primary",
         "calls_attempted": len(ollama.verifications),
     }
     assert len(ollama.verifications) == 1
@@ -620,6 +623,7 @@ def test_a_shared_gemma_selection_records_its_epoch_and_observed_digest(
         "think": False,
         "keep_alive": "5m",
         "read_timeout_s": 150.0,
+        "runtime_key": "primary",
         "calls_attempted": 1,
     }, "the record matches the verifier call that actually ran"
     [verifier_call] = [call for call in ollama.calls if not call["stream"]]
@@ -915,7 +919,8 @@ def test_admin_history_returns_stored_v1_and_v2_records_exactly_as_saved(client,
     assert read_answer_provenance(items[3]["answer_provenance"])["selection"] == "default"
     assert read_answer_provenance(items[4]["answer_provenance"])["selection"] == "admin_override"
     current = items[new_id]["answer_provenance"]
-    assert current["schema_version"] == 3 and current["verification"]["read_timeout_s"] == 30.0
+    assert current["schema_version"] == 4 and current["verification"]["read_timeout_s"] == 30.0
+    assert current["generation"]["runtime_key"] == "primary" and "://" not in json.dumps(current)
     assert read_answer_provenance(current)["selection_epoch"] == 1
 
 

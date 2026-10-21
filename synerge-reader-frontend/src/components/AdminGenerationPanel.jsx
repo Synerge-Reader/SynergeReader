@@ -24,11 +24,20 @@ const REASONS = {
   coordinator_error: "the switch failed",
 };
 
+// Why a registered model cannot be chosen, from the backend's fixed codes.
+const INELIGIBLE = {
+  not_qualified: "not qualified",
+  experimental_disabled: "experimental models are disabled",
+  runtime_not_configured: "its runtime is not configured",
+};
+
 const PHASES = {
   queued: "queued",
   verifying_target: "checking the selected model",
   draining: "waiting for running answers to finish",
-  awaiting_residency: "waiting for the previous model to unload",
+  awaiting_residency: "waiting for the previous model to unload (this can take several minutes)",
+  awaiting_residency_unverified:
+    "the previous model's runtime cannot be read; waiting the full residency window before returning (its unloading cannot be confirmed)",
   committing: "committing",
   aborting: "aborting",
   interrupted: "interrupted by a restart — abort it to resume answering",
@@ -36,10 +45,39 @@ const PHASES = {
 
 function outcomeText(last) {
   if (!last) return null;
+  if (last.outcome === "committed" && last.reason === "residency_unverified") {
+    return "Last switch committed with residency unverified: the previous model's runtime could not be read, " +
+      "so the switch waited out the full residency window. That does not confirm the previous model unloaded.";
+  }
   const reason = last.reason ? REASONS[last.reason] || "the switch failed" : null;
   if (last.outcome === "committed") return "Last switch committed.";
   if (last.outcome === "aborted") return `Last switch aborted${reason ? `: ${reason}` : ""}.`;
   return `Last switch failed${reason ? `: ${reason}` : ""}.`;
+}
+
+function ineligibleText(choice) {
+  return INELIGIBLE[choice.ineligible_reason] || "not qualified";
+}
+
+const EXPERIMENTAL_BADGE = {
+  marginLeft: "6px", padding: "0 6px", borderRadius: "8px", fontSize: "10.5px", fontWeight: 600,
+  color: "#92400e", background: "#fef3c7", border: "1px solid #fcd34d",
+};
+
+// What an experimental model has and has not been through, stated plainly:
+// a runtime smoke test only. Its review note is shown as the backend sent it.
+function ExperimentalDetails({ choice, testId }) {
+  return (
+    <div data-testid={testId} style={{ color: "#92400e", background: "#fffbeb", border: "1px solid #fde68a",
+      borderRadius: "6px", padding: "6px 8px", marginTop: "6px", lineHeight: 1.45 }}>
+      <div>
+        Experimental: runtime smoke test only ({choice.runtime_smoke_verdict === "PASS" ? "passed" : "review required"}).
+        Not quality-, capacity- or vision-qualified. Runs on the {choice.runtime} runtime, one answer or
+        background job at a time. Loading it can take several minutes; a switch does not preload it.
+      </div>
+      {choice.review_note && <div data-testid={`${testId}-note`}>Review note: {choice.review_note}</div>}
+    </div>
+  );
 }
 
 /**
@@ -126,7 +164,10 @@ export default function AdminGenerationPanel({ backendUrl = DEFAULT_BACKEND, aut
   const choices = status?.choices || [];
   const eligible = choices.filter(c => c.eligible && !c.active);
   const selected = choice && eligible.some(c => c.profile_id === choice) ? choice : "";
+  const selectedChoice = choices.find(c => c.profile_id === selected);
+  const activeChoice = active ? choices.find(c => c.profile_id === active.profile_id) : null;
   const capacity = status?.capacity;
+  const jobLimit = capacity?.selection_job_limit;
 
   return (
     <section data-testid="admin-generation-panel" aria-label="Answer model" style={{
@@ -140,9 +181,19 @@ export default function AdminGenerationPanel({ backendUrl = DEFAULT_BACKEND, aut
           <div data-testid="active-model" style={{ marginBottom: "6px" }}>
             Active: {active ? `${active.display_name || active.profile_id} (${active.model || "unregistered"})` : "none"}
             {active ? <span style={{ color: "#9ca3af" }}> · epoch {active.epoch}</span> : null}
+            {active?.experimental ? <span data-testid="active-experimental" style={EXPERIMENTAL_BADGE}>Experimental</span> : null}
           </div>
-          <div style={{ color: "#6b7280", marginBottom: "6px" }}>
+          {active && active.eligible === false && (
+            <div data-testid="active-ineligible" role="status" style={{ color: "#b91c1c", marginBottom: "6px" }}>
+              This server will not answer with the active model
+              {activeChoice ? ` (${ineligibleText(activeChoice)})` : ""}. Answers are refused until an
+              administrator switches to an available model.
+            </div>
+          )}
+          {active?.experimental && activeChoice && <ExperimentalDetails choice={activeChoice} testId="active-experimental-details" />}
+          <div style={{ color: "#6b7280", margin: "6px 0" }}>
             Generation: {status.admission} · ownership: {status.ownership}
+            {jobLimit ? <span data-testid="job-limit"> · job limit: {jobLimit} at a time</span> : null}
             {capacity && (capacity.unresolved_answers || capacity.unresolved_helpers)
               ? <span style={{ color: "#b45309" }}> · unresolved model work: {capacity.unresolved_answers + capacity.unresolved_helpers}</span>
               : null}
@@ -171,7 +222,8 @@ export default function AdminGenerationPanel({ backendUrl = DEFAULT_BACKEND, aut
                 <option value="">Select a model</option>
                 {choices.filter(c => !c.active).map(c => (
                   <option key={c.profile_id} value={c.profile_id} disabled={!c.eligible}>
-                    {c.display_name} ({c.model}){c.eligible ? "" : " — not qualified"}
+                    {c.display_name} ({c.model}){c.experimental ? " — experimental" : ""}
+                    {c.eligible ? "" : ` — ${ineligibleText(c)}`}
                   </option>
                 ))}
               </select>
@@ -191,6 +243,7 @@ export default function AdminGenerationPanel({ backendUrl = DEFAULT_BACKEND, aut
               </button>
             )}
           </div>
+          {selectedChoice?.experimental && <ExperimentalDetails choice={selectedChoice} testId="selected-experimental-details" />}
           {notice && <div role="alert" style={{ color: "#b91c1c", marginTop: "6px" }}>{notice}</div>}
         </div>
       )}

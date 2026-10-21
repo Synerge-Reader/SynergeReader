@@ -49,6 +49,9 @@ const MODEL_LABEL = {
   "llama3.1:8b":  "Llama 3.1 8B",
   "gemma4:31b":   "Gemma 4 31B",
   "qwen3:latest": "Qwen3",
+  "qwen3.8:27b":                "Qwen3.8 27B",
+  "nemotron-3.5-lightning:30b": "Nemotron 3.5 Lightning 30B",
+  "mistral-medium-3.5:128b":    "Mistral Medium 3.5 128B",
 };
 
 const TASK_PROMPTS = {
@@ -3464,15 +3467,22 @@ export default function GridApp() {
           candidates = Array.isArray(event.citations) ? event.citations : [];
           // The model the backend actually resolved for THIS answer.
           const answeredBy = typeof event.generation?.model === "string" ? event.generation.model : null;
+          // Only the backend marks an answer experimental (runtime smoke
+          // tested, not quality-qualified); the label never comes from here.
+          const experimental = event.generation?.experimental === true;
           if (answeredBy) setAnswerModel(answeredBy);
           setMessages(prev => prev.map(msg =>
             msg.id === msgId
-              ? { ...msg, model: answeredBy, citations: [], evidenceMode: event.mode, sourcesPending: true }
+              ? { ...msg, model: answeredBy, experimental, citations: [], evidenceMode: event.mode, sourcesPending: true }
               : msg
           ));
+        } else if (event.type === "heartbeat") {
+          // The stream is alive but the model has written nothing yet (a cold
+          // load can take minutes). Content-free: only a notice, never text.
+          if (!full) setMessages(prev => prev.map(msg => msg.id === msgId ? { ...msg, loadingNotice: true } : msg));
         } else if (event.type === "delta") {
           full += typeof event.text === "string" ? event.text : "";
-          setMessages(prev => prev.map(msg => msg.id === msgId ? { ...msg, text: full } : msg));
+          setMessages(prev => prev.map(msg => msg.id === msgId ? { ...msg, text: full, loadingNotice: false } : msg));
         } else if (event.type === "verification") {
           verified = true;
           // Display numbers follow first use in the answer, which is the order
@@ -4719,7 +4729,20 @@ export default function GridApp() {
                                 fontSize: "10.5px", fontFamily: "'Courier New',monospace",
                                 color: task?.color || "#0891b2", fontWeight: 700,
                                 marginBottom: "4px", letterSpacing: ".04em", textTransform: "uppercase",
-                              }}>{MODEL_LABEL[msg.model] || msg.model}</div>
+                              }}>
+                                {MODEL_LABEL[msg.model] || msg.model}
+                                {msg.experimental && (
+                                  <span title="Runtime smoke tested only; not quality- or capacity-qualified" style={{
+                                    marginLeft: "8px", padding: "0 5px", borderRadius: "3px",
+                                    color: "#92400e", background: "#fef3c7", border: "1px solid #fcd34d",
+                                  }}>Experimental</span>
+                                )}
+                              </div>
+                            )}
+                            {msg.streaming && msg.loadingNotice && !msg.text && (
+                              <div role="status" style={{ fontSize: "12px", color: "#64748b", marginBottom: "4px" }}>
+                                The model is loading. This can take several minutes.
+                              </div>
                             )}
                             <div style={{
                               fontSize: "14.5px", color: "#1e293b", lineHeight: "1.7",

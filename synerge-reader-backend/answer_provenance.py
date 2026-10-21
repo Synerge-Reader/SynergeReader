@@ -35,9 +35,10 @@ Where each value comes from -- never from the request:
   final stream record. A value Ollama did not report is ``null``, never 0.
 
 Thinking text, prompt text, evidence text, credentials, endpoints, and paths
-are never part of a record: no input here carries them.
+are never part of a record: no input here carries them. A runtime is recorded
+only by its backend-owned key, never by its URL.
 
-Schema versions. New records are version 3. Stored records are never
+Schema versions. New records are version 4. Stored records are never
 rewritten, filled in or upgraded; ``read_answer_provenance`` reads every
 version with its own vocabulary:
 
@@ -47,7 +48,12 @@ version with its own vocabulary:
 * version 2: the same selection vocabulary; the verifier think, timeout and
   digest fields were added;
 * version 3: ``generation.selection`` is ``"shared_active"`` and
-  ``generation.selection_epoch`` is the shared selection's epoch.
+  ``generation.selection_epoch`` is the shared selection's epoch;
+* version 4: version 3 plus ``generation.runtime_key`` and
+  ``generation.experimental``, and ``verification.runtime_key`` for graded
+  answers. ``think`` may also be ``true`` or an effort level (for an
+  experimental profile whose runtime smoke used it). A version 1-3 record
+  has no runtime key: it is read as not recorded, never as ``primary``.
 """
 
 from __future__ import annotations
@@ -60,23 +66,29 @@ from typing import Callable, Optional
 from answer_evidence import EvidenceMode
 from citation_generation import AnswerMode
 from generation_profiles import (
+    RUNTIME_KEYS,
     SHARED_SELECTION,
     AnswerGenerationSnapshot,
     FixedModelCall,
+    GenerationProfileError,
     normalize_digest,
+    require_think_value,
 )
 from ollama_generation import OllamaGenerateStream
 from rag_model_profiles import EmbeddingProfile
 from release_metadata import ReleaseMetadata
 
-PROVENANCE_SCHEMA_VERSION = 3
+PROVENANCE_SCHEMA_VERSION = 4
 
 # The selection values each stored schema version may carry.
 SELECTIONS_BY_SCHEMA_VERSION = {
     1: ("default", "admin_override"),
     2: ("default", "admin_override"),
     3: (SHARED_SELECTION,),
+    4: (SHARED_SELECTION,),
 }
+# The first version that records which runtime generated the answer.
+RUNTIME_KEY_SCHEMA_VERSION = 4
 
 TIMING_ORIGIN = "ask_request_received"
 TIMING_MARKS = (
@@ -115,6 +127,19 @@ def _require_digest(value: object) -> Optional[str]:
     if value is not None and normalize_digest(value) != value:
         raise AnswerProvenanceError("a model digest must be None or 64 lowercase hex characters")
     return value
+
+
+def _require_runtime(value: object) -> str:
+    if not isinstance(value, str) or value not in RUNTIME_KEYS:
+        raise AnswerProvenanceError("a runtime is recorded by its backend-owned key")
+    return value
+
+
+def _require_think(value: object):
+    try:
+        return require_think_value("think", value)
+    except GenerationProfileError:
+        raise AnswerProvenanceError("think must be a think setting this backend can send") from None
 
 
 def _non_negative_int(value: object) -> Optional[int]:
@@ -205,6 +230,9 @@ def build_answer_provenance(
     # never call the verifier, so they record no verifier prompt or call.
     graded = answer_mode is AnswerMode.DOCUMENT_QA
     verifier = generation.verifier
+    runtime_key = _require_runtime(generation.runtime_key)
+    if _require_runtime(verifier.runtime_key) != runtime_key:
+        raise AnswerProvenanceError("the verifier runs on the answer's own runtime")
 
     return {
         "schema_version": PROVENANCE_SCHEMA_VERSION,
@@ -221,10 +249,14 @@ def build_answer_provenance(
             "expected_digest": _require_digest(generation.expected_digest),
             "observed_digest": _require_digest(generation.observed_digest),
             "requested_options": generation.options.as_ollama_options(),
-            # None: no think field was sent. False: ``think: false`` was sent.
-            "think": generation.think,
+            # None: no think field was sent. Otherwise the exact value sent
+            # (false, true or an effort level); thinking text is never kept.
+            "think": _require_think(generation.think),
             "keep_alive": generation.keep_alive,
             "answer_read_timeout_s": generation.answer_read_timeout_s,
+            # Backend-owned key, never an endpoint.
+            "runtime_key": runtime_key,
+            "experimental": bool(generation.experimental),
         },
         "prompt": {
             "answer_prompt_version": release.answer_prompt_version,
@@ -237,10 +269,11 @@ def build_answer_provenance(
             "expected_digest": _require_digest(verifier.expected_digest),
             "observed_digest": _require_digest(verifier.observed_digest),
             "requested_options": verifier.options.as_ollama_options(),
-            # None: no think field was sent. False: ``think: false`` was sent.
-            "think": verifier.think,
+            # None: no think field was sent. Otherwise the exact value sent.
+            "think": _require_think(verifier.think),
             "keep_alive": verifier.keep_alive,
             "read_timeout_s": verifier.read_timeout_s,
+            "runtime_key": runtime_key,
             "calls_attempted": verifier_calls,
         } if graded else None,
         "retrieval": {
@@ -259,7 +292,7 @@ def build_answer_provenance(
 
 def answer_provenance_json(provenance: dict) -> str:
     """Deterministic JSON text for the JSONB column. NaN/Infinity are refused.
-    Only a current (version 3) record is ever serialized for storage."""
+    Only a current (version 4) record is ever serialized for storage."""
     if not isinstance(provenance, dict) or provenance.get("schema_version") != PROVENANCE_SCHEMA_VERSION:
         raise AnswerProvenanceError("not an answer provenance record")
     return json.dumps(provenance, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
@@ -276,9 +309,11 @@ def read_answer_provenance(record: object) -> dict:
     Pure and read-only: the record is never modified, upgraded or filled in.
     A version 1 or 2 record reports its historical ``selection`` and a
     ``selection_epoch`` of None (those versions had no shared selection); a
-    version 3 record must carry ``"shared_active"`` and a positive epoch. Any
-    other version or value is refused rather than guessed. A NULL column
-    ("not recorded") is the caller's case and never reaches this reader.
+    version 3 or 4 record must carry ``"shared_active"`` and a positive epoch.
+    A version 4 record must also name a known ``runtime_key``; earlier
+    versions report ``runtime_key`` None (not recorded). Any other version or
+    value is refused rather than guessed. A NULL column ("not recorded") is
+    the caller's case and never reaches this reader.
     """
     if not isinstance(record, dict):
         raise AnswerProvenanceError("not an answer provenance record")
@@ -303,6 +338,14 @@ def read_answer_provenance(record: object) -> dict:
         value = generation.get(key)
         if value is not None and normalize_digest(value) != value:
             raise AnswerProvenanceError("a model digest must be None or 64 lowercase hex characters")
+    if version >= RUNTIME_KEY_SCHEMA_VERSION:
+        runtime_key = generation.get("runtime_key")
+        if not isinstance(runtime_key, str) or runtime_key not in RUNTIME_KEYS:
+            raise AnswerProvenanceError("a version 4 record names its runtime by a known key")
+    else:
+        if "runtime_key" in generation:
+            raise AnswerProvenanceError("a record before version 4 carries no runtime key")
+        runtime_key = None
     return {
         "schema_version": version,
         "selection": selection,
@@ -311,4 +354,5 @@ def read_answer_provenance(record: object) -> dict:
         "model_tag": generation.get("model_tag"),
         "expected_digest": generation.get("expected_digest"),
         "observed_digest": generation.get("observed_digest"),
+        "runtime_key": runtime_key,
     }

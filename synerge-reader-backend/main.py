@@ -63,9 +63,13 @@ from dbSetup import VectorSchemaError,init_db,connect_to_postgres,test_postgres_
 from rag_model_profiles import resolve_embedding_profile
 from ollama_embedding_provider import EmbeddingProviderError, OllamaEmbeddingProvider
 from generation_profiles import (
+    COMPAT_RUNTIME,
+    PRIMARY_RUNTIME,
     AnswerGenerationSnapshot,
+    ExperimentalProfileDisabledError,
     ModelIdentityMismatchError,
     ModelIdentityUnavailableError,
+    ModelRuntimeUnavailableError,
     ModelSelectionError,
     ProfileNotQualifiedError,
     UnknownModelProfileError,
@@ -94,6 +98,8 @@ from generation_admission import (
     GenerationLedger,
     GenerationTicket,
     HelperPool,
+    SelectionPolicy,
+    SharedSelection,
     current_dispatch_permitted,
     current_generation_ticket,
 )
@@ -110,7 +116,13 @@ from answer_jobs import (
     acquire_answer,
 )
 from generation_selection import GenerationOwner, OwnerSettings, PostgresGenerationStore
-from generation_coordinator import CoordinatorSettings, GenerationRuntime, SwitchCoordinator, loaded_model_entries
+from generation_coordinator import (
+    CoordinatorSettings,
+    GenerationRuntime,
+    RuntimeInventoryUnavailable,
+    SwitchCoordinator,
+    loaded_model_entries,
+)
 import requests
 import json
 import time
@@ -123,7 +135,7 @@ from google.oauth2 import id_token
 import resend
 import socket
 import ipaddress
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, urlsplit
 from lxml import html as lxml_html
 from email_validator import validate_email, EmailNotValidError
 from fastapi.responses import Response
@@ -191,10 +203,63 @@ OLLAMA_READ_TIMEOUT = float(os.getenv("OLLAMA_READ_TIMEOUT", "60"))
 # Embedding keep-alive only. Generation calls take theirs from the model
 # registry below, never from the environment or a request.
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
+
+# Generation runtimes (backend-owned keys; see generation_profiles.py). The
+# PRIMARY runtime is the existing host Ollama resolved above (OLLAMA_BASE_URL
+# or the host fallbacks); it keeps serving Llama, Gemma and the configured
+# embedder, and is never repointed. The COMPATIBILITY runtime serves only the
+# experimental profiles. Its endpoint comes from server configuration alone:
+# SYNERGE_COMPAT_OLLAMA_URL, a plain http://<private-alias>:<port> on the
+# backend's private runtime network. It has no fallback host, and a request
+# can never name it. Unset or malformed: the runtime is not configured and
+# every profile it serves is refused, while the primary runtime is unaffected.
+_COMPAT_HOST_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$")
+
+
+def _compat_runtime_url(value: str) -> Optional[str]:
+    """``http://host:port`` from a server setting, or None. No credentials,
+    path, query or fragment; an explicit port is required. The value itself
+    is never logged."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        parts = urlsplit(value)
+        port = parts.port
+    except ValueError:
+        return None
+    host = parts.hostname
+    if (
+        parts.scheme != "http" or not host or not _COMPAT_HOST_PATTERN.match(host) or port is None
+        or parts.username is not None or parts.password is not None
+        or parts.path not in ("", "/") or parts.query or parts.fragment
+    ):
+        return None
+    return f"http://{host}:{port}"
+
+
+_COMPAT_RUNTIME_SETTING = os.getenv("SYNERGE_COMPAT_OLLAMA_URL", "")
+_COMPAT_RUNTIME_URL = _compat_runtime_url(_COMPAT_RUNTIME_SETTING)
+if _COMPAT_RUNTIME_SETTING.strip() and _COMPAT_RUNTIME_URL is None:
+    print("[Generation] SYNERGE_COMPAT_OLLAMA_URL is not a valid private runtime URL; "
+          "the compatibility runtime is not configured")
+# Server-side enablement of the experimental profiles. Default off; only
+# 1/true/yes enable them.
+_EXPERIMENTAL_MODELS_ENABLED = os.getenv("SYNERGE_EXPERIMENTAL_MODELS", "").strip().lower() in ("1", "true", "yes")
+_CONFIGURED_RUNTIMES = frozenset({PRIMARY_RUNTIME} | ({COMPAT_RUNTIME} if _COMPAT_RUNTIME_URL else set()))
+print(
+    "[Generation] experimental profiles "
+    f"{'enabled' if _EXPERIMENTAL_MODELS_ENABLED else 'disabled'}; compatibility runtime "
+    f"{'configured' if _COMPAT_RUNTIME_URL else 'not configured'}"
+)
+
 # The one source of answer, verifier and helper model settings. Pure data,
 # built at import: no request can add a tag, change an option, or redirect a
 # call. See generation_profiles.py.
-_MODEL_REGISTRY = default_model_registry()
+_MODEL_REGISTRY = default_model_registry(
+    experimental_enabled=_EXPERIMENTAL_MODELS_ENABLED,
+    configured_runtimes=_CONFIGURED_RUNTIMES,
+)
 # This deployment's release identity: the app version, the prompt versions,
 # and the build commit the release operator injected as SYNERGE_BUILD_SHA.
 # Read once at import. Git is never run here; a missing or malformed SHA is
@@ -255,22 +320,64 @@ def get_active_ollama_base_url() -> str:
     raise RuntimeError("Ollama is not reachable. Checked " + " | ".join(errors))
 
 
+_COMPAT_RUNTIME_CHECKED_AT = 0.0
+_COMPAT_RUNTIME_REACHABLE = False
+
+
+def _compat_runtime_base_url() -> str:
+    """The compatibility runtime's configured endpoint once it answered a
+    read-only ``/api/version`` within the last 30 s (like the primary's
+    health cache). Raises when it is not configured or not reachable, BEFORE
+    any dispatch intent is recorded, so an unreachable runtime never leaves a
+    call unresolved. There is no fallback host."""
+    global _COMPAT_RUNTIME_CHECKED_AT, _COMPAT_RUNTIME_REACHABLE
+    if not _COMPAT_RUNTIME_URL:
+        raise RuntimeError("the compatibility runtime is not configured")
+    now = time.time()
+    if _COMPAT_RUNTIME_REACHABLE and now - _COMPAT_RUNTIME_CHECKED_AT < 30:
+        return _COMPAT_RUNTIME_URL
+    try:
+        resp = requests.get(f"{_COMPAT_RUNTIME_URL}/api/version", timeout=(OLLAMA_CONNECT_TIMEOUT, 5))
+        resp.raise_for_status()
+    except Exception:
+        _COMPAT_RUNTIME_REACHABLE = False
+        _COMPAT_RUNTIME_CHECKED_AT = now
+        raise RuntimeError("the compatibility runtime is not reachable") from None
+    _COMPAT_RUNTIME_REACHABLE = True
+    _COMPAT_RUNTIME_CHECKED_AT = now
+    return _COMPAT_RUNTIME_URL
+
+
+def _runtime_base_url(runtime_key: str) -> str:
+    """The endpoint for one backend-owned runtime key. The primary runtime
+    keeps its existing resolution; any other key is resolved only from
+    server configuration. Raises (never falls back) when unavailable."""
+    if runtime_key == PRIMARY_RUNTIME:
+        return get_active_ollama_base_url()
+    if runtime_key == COMPAT_RUNTIME:
+        return _compat_runtime_base_url()
+    raise RuntimeError("unknown generation runtime")
+
+
 def post_ollama(endpoint: str, payload: dict, *, stream: bool = False, timeout: float = 60):
-    """POST to the active local Ollama endpoint.
+    """POST to a local Ollama endpoint.
 
     ``timeout`` is the Requests READ timeout: the longest wait for any one
     read, including the first response byte (which covers a cold model load).
     The connect timeout stays the short OLLAMA_CONNECT_TIMEOUT. It bounds each
     wait, not a whole job.
 
-    A native generation call (``/api/generate``) is sent only for the admitted
-    job of the calling thread (an /ask answer job; see answer_jobs.py), and
-    only while that job may dispatch: its read timeout is clamped to the job's
-    remaining wall-clock budget, and a durable dispatch intent is recorded
-    immediately before the POST -- after the endpoint was resolved, so an
-    unreachable server never counts as a dispatch. Otherwise nothing is sent
-    (DispatchRefused). A non-streamed reply shows its decoded body to the job;
-    a streamed reply is observed by the job once it has been read.
+    Anything other than ``/api/generate`` (the embedder) goes to the primary
+    runtime, exactly as before. A native generation call is sent only for the
+    admitted job of the calling thread (an /ask answer job; see
+    answer_jobs.py), and only while that job may dispatch. It goes to the
+    runtime its job's snapshot holds -- never one a payload or request names
+    -- and only with that snapshot's own model tag. Its read timeout is clamped
+    to the job's remaining wall-clock budget, and a durable dispatch intent is
+    recorded immediately before the POST -- after the endpoint was resolved,
+    so an unreachable server never counts as a dispatch. Otherwise nothing is
+    sent (DispatchRefused). A non-streamed reply shows its decoded body to the
+    job; a streamed reply is observed by the job once it has been read.
     """
     if endpoint != "/api/generate":
         base_url = get_active_ollama_base_url()
@@ -283,7 +390,11 @@ def post_ollama(endpoint: str, payload: dict, *, stream: bool = False, timeout: 
     ticket = current_generation_ticket()
     if ticket is None or not current_dispatch_permitted():
         raise DispatchRefused("no admitted job may dispatch this generation call")
-    base_url = get_active_ollama_base_url()
+    snapshot = ticket.snapshot
+    if not isinstance(snapshot, AnswerGenerationSnapshot) or not isinstance(payload, dict) \
+            or payload.get("model") != snapshot.model_tag:
+        raise DispatchRefused("a generation call must use its own job's model")
+    base_url = _runtime_base_url(snapshot.runtime_key)
     read_timeout = ticket.read_timeout(timeout or OLLAMA_READ_TIMEOUT)
     ticket.dispatching("answer" if stream else "verifier")
     response = requests.post(
@@ -600,17 +711,20 @@ def _helper_generation(ticket: GenerationTicket) -> AnswerGenerationSnapshot:
     re-resolved per excerpt, and never a fallback model.
 
     The unqualified control makes no inventory call. A profile that requires
-    qualification has its installed identity read first, and an unknown,
-    ineligible, missing, unreadable or mismatched one raises, so the job
-    generates nothing.
+    an identity check (qualified or experimental) has its installed identity
+    read first, on its own runtime, and an unknown, ineligible, missing,
+    unreadable or mismatched one raises, so the job generates nothing.
     """
     if ticket.snapshot is not None:
         return ticket.snapshot
     profile = select_shared_profile(_MODEL_REGISTRY, ticket.selection.profile_id)
     observed = (
-        check_installed_identity(profile, _installed_model_digest) if profile.requires_qualification else None
+        check_installed_identity(profile, _identity_lookup(profile.runtime_key))
+        if profile.requires_identity_check else None
     )
-    snapshot = shared_generation_snapshot(profile, epoch=ticket.selection.epoch, observed_digest=observed)
+    snapshot = shared_generation_snapshot(
+        profile, epoch=ticket.selection.epoch, observed_digest=observed, registry=_MODEL_REGISTRY
+    )
     ticket.bind_snapshot(snapshot)
     return snapshot
 
@@ -662,7 +776,8 @@ def _qa_pairs_for_ticket(text: str, ticket: GenerationTicket) -> List[dict]:
         print(f"[KB] Helper model unavailable ({type(exc).__name__}); Q&A generation skipped")
         return []
     try:
-        base_url = get_active_ollama_base_url()
+        # The helper's own runtime, bound in its snapshot; never a fallback.
+        base_url = _runtime_base_url(generation.runtime_key)
     except Exception:
         print("[KB] Ollama not reachable; Q&A generation skipped")
         return []
@@ -711,6 +826,7 @@ Start with Q:"""
             resp.raise_for_status()
             body = resp.json()
             ticket.observed(body)
+            print(helper.describe_completion("qa_pairs", body))
             reply = completed_generate_response(body)
             if reply is None:
                 print(f"[KB] Excerpt {i+1}: reply was not a completed response; no pairs taken")
@@ -868,7 +984,8 @@ def _extract_insights_for_ticket(doc_id: int, filename: str, text: str, recorder
         print(f"[Insights] Helper model unavailable ({type(exc).__name__}); insight extraction skipped")
         return
     try:
-        base_url = get_active_ollama_base_url()
+        # The helper's own runtime, bound in its snapshot; never a fallback.
+        base_url = _runtime_base_url(generation.runtime_key)
     except Exception:
         print("[Insights] Ollama not reachable; insight extraction skipped")
         return
@@ -901,6 +1018,7 @@ JSON:"""
         resp.raise_for_status()
         body = resp.json()
         recorder.observed(body)
+        print(helper.describe_completion("insights", body))
         reply = completed_generate_response(body)
         if reply is None:
             print("[Insights] Reply was not a completed response; nothing stored")
@@ -1130,7 +1248,24 @@ class _PostCommitDispatchError(RuntimeError):
 # Constructing any of this starts no thread and does no I/O.
 _ADMISSION_SETTINGS = AdmissionSettings()
 _DELIVERY_SETTINGS = DeliverySettings()
-_GENERATION_LEDGER = GenerationLedger(_ADMISSION_SETTINGS, clock=time.monotonic)
+
+
+def _selection_policy(selection: SharedSelection) -> Optional[SelectionPolicy]:
+    """The admission policy of the profile a shared selection names (pure:
+    a registry lookup). An experimental profile admits one combined job and
+    may carry its own job budgets; every other profile keeps the shared
+    settings, so Gemma's and Llama's admission is unchanged."""
+    policy = _MODEL_REGISTRY.admission_policy(selection.profile_id)
+    if policy is None:
+        return None
+    max_jobs, answer_budget_s, helper_budget_s = policy
+    if max_jobs is None and answer_budget_s is None and helper_budget_s is None:
+        return None
+    return SelectionPolicy(max_jobs=max_jobs, answer_job_budget_s=answer_budget_s,
+                           helper_job_budget_s=helper_budget_s)
+
+
+_GENERATION_LEDGER = GenerationLedger(_ADMISSION_SETTINGS, clock=time.monotonic, selection_policy=_selection_policy)
 # A fresh id per process start: the owner row and every dispatch intent record
 # which boot wrote them.
 _BOOT_ID = str(uuid.uuid4())
@@ -1142,16 +1277,88 @@ def _new_generation_store() -> PostgresGenerationStore:
     return PostgresGenerationStore(lambda: connect_to_postgres(), boot_id=_BOOT_ID)
 
 
-def _resident_models() -> list:
-    """Read-only: the models Ollama currently reports as loaded (/api/ps).
-    Used only as the switch coordinator's residency barrier; it is a
-    point-in-time view and never proves exclusive GPU use. A successful
+def _resident_models(runtime_key: str = PRIMARY_RUNTIME) -> list:
+    """Read-only: the models one runtime currently reports as loaded
+    (/api/ps). Used only as the switch coordinator's residency barrier; it is
+    a point-in-time view and never proves exclusive GPU use. A successful
     response alone is not a readable inventory: a reply without an explicit
-    models list, or with an entry that names no model, raises."""
-    base_url = get_active_ollama_base_url()
-    response = requests.get(f"{base_url}/api/ps", timeout=(OLLAMA_CONNECT_TIMEOUT, 5))
-    response.raise_for_status()
-    return loaded_model_entries(response.json())
+    models list, or with an entry that names no model, raises.
+
+    Two kinds of failure are kept apart, because the coordinator may excuse
+    only the first, and only for the previous compatibility runtime on a
+    return to Gemma or Llama. RuntimeInventoryUnavailable is raised ONLY for
+    a compatibility runtime that is not configured here, or for a CONFIRMED
+    connection-establishment failure: a connect timeout, or a new connection
+    that could not be made (refused, unreachable, name not resolved). Every
+    other failure fails closed -- the runtime may have answered and may
+    still hold weights: a timeout or protocol error while reading the status
+    line, headers or body (Requests can report a body read timeout as a
+    ConnectionError), any other or ambiguous ConnectionError, an HTTP error
+    status, a body that is not JSON, or a malformed list.
+
+    The response is streamed so the HTTP status is checked BEFORE the body is
+    read, and it is always closed. Redirects are never followed, and only
+    HTTP 200 is accepted: any other status, a 3xx included (which
+    ``raise_for_status`` lets through), fails closed without its body being
+    read. The compatibility list is read directly from its configured
+    endpoint (no reachability cache) so a failure is classified by this read
+    itself."""
+    if runtime_key == COMPAT_RUNTIME:
+        if not _COMPAT_RUNTIME_URL:
+            raise RuntimeInventoryUnavailable("the compatibility runtime is not configured")
+        base_url = _COMPAT_RUNTIME_URL
+    else:
+        base_url = _runtime_base_url(runtime_key)
+    try:
+        response = requests.get(
+            f"{base_url}/api/ps", timeout=(OLLAMA_CONNECT_TIMEOUT, 5), stream=True, allow_redirects=False,
+        )
+    except requests.exceptions.ConnectTimeout:
+        raise RuntimeInventoryUnavailable("the runtime did not accept a connection") from None
+    except requests.exceptions.ConnectionError as exc:
+        if _connection_never_established(exc):
+            raise RuntimeInventoryUnavailable("the runtime did not accept a connection") from None
+        raise RuntimeError("the runtime's loaded-model list could not be read") from None
+    except Exception:
+        # A read timeout on the status line or headers, or anything else: fail closed.
+        raise RuntimeError("the runtime's loaded-model list could not be read") from None
+    try:
+        if response.status_code != 200:
+            raise ValueError("not HTTP 200")  # a redirect or any other status: fail closed
+        payload = response.json()
+    except Exception:
+        raise RuntimeError("the runtime's loaded-model list could not be read") from None
+    finally:
+        response.close()
+    return loaded_model_entries(payload)
+
+
+def _connection_never_established(exc: BaseException) -> bool:
+    """Whether a Requests ConnectionError is a confirmed failure to OPEN the
+    connection: urllib3's NewConnectionError (refused, unreachable, name not
+    resolved) as the reason of the MaxRetryError Requests wraps. Anything
+    else -- a protocol error, a dropped connection, a body read timeout that
+    Requests reports as a ConnectionError, or an error without that exact
+    cause -- is not confirmed and returns False."""
+    from urllib3.exceptions import MaxRetryError, NewConnectionError
+
+    cause = exc.args[0] if exc.args else None
+    return isinstance(cause, MaxRetryError) and isinstance(cause.reason, NewConnectionError)
+
+
+def _coordinator_settings() -> CoordinatorSettings:
+    """The drain wait must outlast the longest whole-job budget a running job
+    may have been granted (an experimental profile's may exceed the shared
+    420 s), or a switch would abort while that job is still legitimately
+    running. Residency keeps its provisional bound: the previous model leaves
+    by its own five-minute keep-alive. Provisional, unmeasured."""
+    longest = max(
+        [_ADMISSION_SETTINGS.answer_job_budget_s, _ADMISSION_SETTINGS.helper_job_budget_s]
+        + [budget for profile in _MODEL_REGISTRY.profiles
+           for budget in (profile.answer_job_budget_s, profile.helper_job_budget_s) if budget is not None]
+    )
+    defaults = CoordinatorSettings()
+    return CoordinatorSettings(drain_timeout_s=max(defaults.drain_timeout_s, float(longest) + 60.0))
 
 
 _GENERATION_OWNER = GenerationOwner(
@@ -1168,9 +1375,11 @@ _GENERATION_RUNTIME = GenerationRuntime(
         ledger=_GENERATION_LEDGER,
         owner=_GENERATION_OWNER,
         registry_provider=lambda: _MODEL_REGISTRY,
-        installed_digest=lambda tag: _installed_model_digest(tag),
-        resident_models=lambda: _resident_models(),
-        settings=CoordinatorSettings(),
+        # Both are read-only, and always called with the runtime the profile
+        # in question actually uses (see SwitchCoordinator).
+        installed_digest=lambda tag, runtime_key: _identity_lookup(runtime_key)(tag),
+        resident_models=lambda runtime_key: _resident_models(runtime_key),
+        settings=_coordinator_settings(),
     ),
 )
 
@@ -1787,7 +1996,8 @@ def _ollama_claim_verifier(claim: str, records, verifier) -> Optional[str]:
     status returns None (``verifier_malformed``). citation_generation turns
     either into ``unverified``, never ``supported``, and neither affects
     whether the answer itself completed. Only the ``response`` field is read,
-    so separate thinking text is ignored.
+    so separate thinking text is ignored. Each reply's completion is logged as
+    counts and fixed words only (``describe_completion``), never its text.
     """
     evidence = "\n\n".join(
         f"[{record.citation_id}] {record.evidence_text}" for record in records
@@ -1795,25 +2005,39 @@ def _ollama_claim_verifier(claim: str, records, verifier) -> Optional[str]:
     prompt = _CLAIM_VERIFIER_PROMPT.format(evidence=evidence, claim=claim.strip())
     response = post_ollama("/api/generate", verifier.ollama_payload(prompt), timeout=verifier.read_timeout_s)
     response.raise_for_status()
+    body = response.json()
+    print(verifier.describe_completion("verifier", body))
     # Raises with fixed text on a model error; None for an unfinished reply.
-    return _claim_verifier_status(completed_generate_response(response.json()))
+    return _claim_verifier_status(completed_generate_response(body))
 
 
-def _installed_model_digest(model_tag: str) -> Optional[str]:
-    """The manifest digest Ollama lists for exactly this tag, or None.
+def _installed_model_digest(model_tag: str, runtime_key: str = PRIMARY_RUNTIME) -> Optional[str]:
+    """The manifest digest one runtime's Ollama lists for exactly this tag,
+    or None.
 
-    Read-only (``/api/tags``). Consulted per answer and once per helper job
-    only for a profile that requires qualification -- so ordinary control
-    answers make no extra request -- and by the switch coordinator for a
-    switch's target.
+    Read-only (``/api/tags`` on ``runtime_key``'s endpoint). Consulted per
+    answer and once per helper job only for a profile that requires an
+    identity check -- so ordinary control answers make no extra request --
+    and by the switch coordinator for a switch's target, always on that
+    profile's own runtime.
     """
-    base_url = get_active_ollama_base_url()
+    base_url = _runtime_base_url(runtime_key)
     response = requests.get(f"{base_url}/api/tags", timeout=(OLLAMA_CONNECT_TIMEOUT, 5))
     response.raise_for_status()
     for model in response.json().get("models", []):
         if model.get("name") == model_tag or model.get("model") == model_tag:
             return model.get("digest")
     return None
+
+
+def _identity_lookup(runtime_key: str):
+    """A one-tag installed-identity lookup bound to ``runtime_key``. The
+    primary runtime keeps the original one-argument call; every other
+    runtime is named explicitly, so a tag installed on one runtime can never
+    vouch for another."""
+    if runtime_key == PRIMARY_RUNTIME:
+        return lambda tag: _installed_model_digest(tag)
+    return lambda tag: _installed_model_digest(tag, runtime_key)
 
 
 # Per-request model selection is retired: every answer uses the one shared
@@ -1830,6 +2054,8 @@ _MODEL_OVERRIDE_RETIRED = (
 _MODEL_SELECTION_REFUSALS = {
     UnknownModelProfileError: (503, "The selected answer model is not available on this server."),
     ProfileNotQualifiedError: (503, "The selected answer model is not qualified for use."),
+    ExperimentalProfileDisabledError: (503, "The selected experimental answer model is disabled on this server."),
+    ModelRuntimeUnavailableError: (503, "The selected answer model's runtime is not configured on this server."),
     ModelIdentityMismatchError: (503, "The selected answer model is not installed with its qualified identity."),
     ModelIdentityUnavailableError: (503, "Could not verify the model. Please try again shortly."),
 }
@@ -1870,19 +2096,22 @@ async def _answer_generation(ticket: GenerationTicket) -> AnswerGenerationSnapsh
     it starts, from the shared selection its ticket captured.
 
     The unqualified control needs no lookup (observed digest None). A
-    profile that requires qualification has its installed identity read for
-    THIS answer on the dedicated identity thread. Every refusal is a fixed
-    HTTP error raised before any evidence is read or any model is called;
-    the caller returns the ticket's slot."""
+    profile that requires an identity check (qualified or experimental) has
+    its installed identity read for THIS answer, on its own runtime, on the
+    dedicated identity thread. Every refusal is a fixed HTTP error raised
+    before any evidence is read or any model is called; the caller returns
+    the ticket's slot. No other model or runtime is ever tried instead."""
     refusal = category = None
     try:
         profile = select_shared_profile(_MODEL_REGISTRY, ticket.selection.profile_id)
         observed = None
-        if profile.requires_qualification:
+        if profile.requires_identity_check:
             observed = await asyncio.wrap_future(
-                _IDENTITY_LOOKUPS.submit(check_installed_identity, profile, _installed_model_digest)
+                _IDENTITY_LOOKUPS.submit(check_installed_identity, profile, _identity_lookup(profile.runtime_key))
             )
-        snapshot = shared_generation_snapshot(profile, epoch=ticket.selection.epoch, observed_digest=observed)
+        snapshot = shared_generation_snapshot(
+            profile, epoch=ticket.selection.epoch, observed_digest=observed, registry=_MODEL_REGISTRY
+        )
         ticket.bind_snapshot(snapshot)
         return snapshot
     except ModelSelectionError as exc:
@@ -2081,6 +2310,9 @@ async def ask_question(request: AskRequest):
             response = getattr(e, "response", None)
             if response is not None:
                 yield '{"type": "error", "code": "generation_http_error", "message": "The local model request failed. Check that the requested model is installed in Ollama."}\n'
+            elif generation.runtime_key != PRIMARY_RUNTIME:
+                # No fallback: the experimental model's own runtime failed.
+                yield '{"type": "error", "code": "generation_unreachable", "message": "The experimental model\'s Ollama runtime is not reachable. Please retry later or ask an administrator."}\n'
             else:
                 yield '{"type": "error", "code": "generation_unreachable", "message": "The local LLM server is not reachable. Start Ollama or update OLLAMA_BASE_URL / OLLAMA_PORT in .env."}\n'
 

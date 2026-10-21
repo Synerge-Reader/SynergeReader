@@ -107,8 +107,15 @@ def test_production_registry_has_the_two_installed_profiles_and_llama_default():
     assert registry.default.profile_id == LLAMA_CONTROL
     assert registry.get(LLAMA_CONTROL).model_tag == "llama3.1:8b"
     assert registry.get(GEMMA_CANDIDATE).model_tag == "gemma4:31b"
-    assert [p.profile_id for p in registry.profiles] == [LLAMA_CONTROL, GEMMA_CANDIDATE]
-    assert not any("qwen" in p.model_tag.lower() for p in registry.profiles)
+    # The control and qualified profiles are unchanged; the three
+    # experimental profiles are registered after them, on their own runtime.
+    assert [p.profile_id for p in registry.profiles if not p.experimental] == [LLAMA_CONTROL, GEMMA_CANDIDATE]
+    assert [p.profile_id for p in registry.profiles if p.experimental] == [
+        "qwen38_27b_experimental", "nemotron35_lightning_30b_experimental", "mistral_medium35_128b_experimental",
+    ]
+    assert {p.runtime_key for p in registry.profiles if not p.experimental} == {"primary"}
+    assert {p.runtime_key for p in registry.profiles if p.experimental} == {"compat_cuda121"}
+    assert "qwen3:latest" not in {p.model_tag for p in registry.profiles}, "the unapproved legacy tag stays out"
 
 
 def test_production_pins_equal_the_operator_supplied_digests():
@@ -601,8 +608,16 @@ def test_a_valid_role_call_is_accepted_as_given():
 @pytest.mark.parametrize(
     "fields",
     [
-        dict(think=True),
+        # True and the effort levels are sendable formats (a profile decides
+        # with evidence whether it may send one); these are not.
         dict(think="false"),
+        dict(think="HIGH"),
+        dict(think="max"),
+        dict(think=1),
+        dict(think=0),
+        dict(runtime_key="http://ollama.invalid:11434"),
+        dict(runtime_key=""),
+        dict(runtime_key=None),
         dict(read_timeout_s=0),
         dict(read_timeout_s=601),
         dict(read_timeout_s=math.inf),

@@ -23,6 +23,7 @@ from ollama_generation import (
     MODEL_ERROR_MESSAGE,
     OllamaGenerateStream,
     completed_generate_response,
+    completion_diagnostic,
 )
 
 _FINAL = {
@@ -299,6 +300,112 @@ def test_the_body_is_not_modified():
     body = dict(_STOP, thinking="hmm")
     before = json.dumps(body, sort_keys=True)
     completed_generate_response(body)
+    assert json.dumps(body, sort_keys=True) == before
+
+
+# --- completion_diagnostic: counts and fixed words, never text ---------------------
+
+_SECRET = "SECRET-PROMPT-OR-REASONING-7f3a"
+
+
+def _result(line):
+    return dict(field.split("=", 1) for field in line.split()[2:])["result"]
+
+
+def test_a_reply_cut_off_by_its_allowance_is_described_without_its_text():
+    """The shape of Nemotron's verifier reply in the candidate check, inferred
+    (its body was not kept): the whole allowance spent, no final reply."""
+    body = {"thinking": _SECRET * 10, "response": "", "done": True, "done_reason": "length",
+            "prompt_eval_count": 1259, "eval_count": 512}
+    line = completion_diagnostic("verifier", "nemotron35_lightning_30b_experimental", 512, body)
+    assert line == (
+        "[Generation] completion role=verifier profile=nemotron35_lightning_30b_experimental "
+        "result=output_limit done_reason=length prompt_eval_count=1259 eval_count=512 num_predict=512 "
+        f"at_output_limit=yes thinking_chars={len(_SECRET) * 10} response_chars=0"
+    )
+
+
+def test_a_finished_reply_is_described_by_its_counts():
+    body = {"thinking": "abc", "response": "supported", "done": True, "done_reason": "stop",
+            "prompt_eval_count": 1200, "eval_count": 300}
+    assert completion_diagnostic("insights", "qwen38_27b_experimental", 4096, body) == (
+        "[Generation] completion role=insights profile=qwen38_27b_experimental result=completed "
+        "done_reason=stop prompt_eval_count=1200 eval_count=300 num_predict=4096 at_output_limit=no "
+        "thinking_chars=3 response_chars=9"
+    )
+
+
+_DIAGNOSED_BODIES = {
+    "finished": (_STOP, "completed"),
+    "thinking-and-reply": (dict(_STOP, thinking="x"), "completed"),
+    "output-limit": ({"response": "supp", "done": True, "done_reason": "length"}, "output_limit"),
+    "load": ({"response": "supported", "done": True, "done_reason": "load"}, "unfinished_reason"),
+    "unknown-reason": ({"response": "supported", "done": True, "done_reason": _SECRET}, "unfinished_reason"),
+    "reason-missing": ({"response": "supported", "done": True}, "unfinished_reason"),
+    "reason-non-string": ({"response": "supported", "done": True, "done_reason": 7}, "unfinished_reason"),
+    "not-done": ({"response": "supported", "done": False, "done_reason": "stop"}, "not_done"),
+    "done-string": ({"response": "supported", "done": "true", "done_reason": "stop"}, "not_done"),
+    "blank": ({"response": "  ", "done": True, "done_reason": "stop"}, "empty_response"),
+    "thinking-only": ({"thinking": _SECRET, "response": "", "done": True, "done_reason": "stop"}, "empty_response"),
+    "non-string-response": ({"response": 5, "done": True, "done_reason": "stop"}, "empty_response"),
+    "error": ({"error": _SECRET, "response": "supported", "done": True, "done_reason": "stop"}, "model_error"),
+    "not-an-object": ([_SECRET], "not_an_object"),
+    "none": (None, "not_an_object"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_DIAGNOSED_BODIES))
+def test_the_diagnostic_result_agrees_with_the_completion_rule(case):
+    body, expected = _DIAGNOSED_BODIES[case]
+    line = completion_diagnostic("qa_pairs", "llama_control", 1200, body)
+    assert _result(line) == expected
+    if expected == "model_error":
+        with pytest.raises(RuntimeError):
+            completed_generate_response(body)
+    else:
+        assert (completed_generate_response(body) is not None) == (expected == "completed")
+    assert _SECRET not in line, "no text from the body reaches the line"
+
+
+@pytest.mark.parametrize(
+    "reason, logged",
+    [("stop", "stop"), ("length", "length"), ("load", "load"), ("unload", "unload"),
+     (_SECRET, "other"), ("STOP", "other"), (7, "missing"), (None, "missing")],
+    ids=repr,
+)
+def test_only_known_completion_reasons_are_logged(reason, logged):
+    body = {"response": "", "done": True}
+    if reason is not None:
+        body["done_reason"] = reason
+    line = completion_diagnostic("verifier", "llama_control", 16, body)
+    assert f" done_reason={logged} " in line and _SECRET not in line
+
+
+@pytest.mark.parametrize(
+    "eval_count, at_limit, shown",
+    [(2048, "yes", "2048"), (4096, "yes", "4096"), (2047, "no", "2047"), (0, "no", "0"),
+     (None, "unknown", "unknown"), (True, "unknown", "unknown"), (-1, "unknown", "unknown"),
+     ("2048", "unknown", "unknown"), (2048.0, "unknown", "unknown")],
+    ids=repr,
+)
+def test_the_output_limit_flag_compares_integer_counts_only(eval_count, at_limit, shown):
+    body = {"response": "", "done": True, "done_reason": "length", "prompt_eval_count": "many"}
+    if eval_count is not None:
+        body["eval_count"] = eval_count
+    line = completion_diagnostic("insights", "llama_control", 2048, body)
+    assert f" eval_count={shown} " in line and f" at_output_limit={at_limit} " in line
+    assert " prompt_eval_count=unknown " in line
+
+
+def test_absent_or_non_string_text_fields_are_reported_as_absent():
+    line = completion_diagnostic("verifier", "llama_control", 16, {"done": True, "thinking": ["x"]})
+    assert line.endswith(" thinking_chars=absent response_chars=absent")
+
+
+def test_the_diagnostic_does_not_modify_the_body():
+    body = dict(_STOP, thinking="hmm", eval_count=3)
+    before = json.dumps(body, sort_keys=True)
+    completion_diagnostic("verifier", "llama_control", 16, body)
     assert json.dumps(body, sort_keys=True) == before
 
 
