@@ -75,6 +75,12 @@ Experimental profiles (19 October 2026) are a third, separate tier:
   thinking-plus-final-output allowance instead of inheriting a 16-token limit
   they would exhaust while thinking. The roles always use the job's own model
   and runtime; nothing silently switches the verifier to another model.
+* document-insights helper calls may have their own ``RolePolicy`` only
+  together with ``RoleThinkEvidence`` for exactly that profile, purpose,
+  model, runtime build and call settings (22 October 2026: Nemotron's insights
+  send ``think: false``). It authorizes that one purpose. It is not a
+  qualification, and the profile's answers, verifier and knowledge-base
+  helper keep their own policies.
 """
 
 from __future__ import annotations
@@ -200,8 +206,10 @@ EXPERIMENTAL_HELPER_NUM_PREDICT = 2048
 # (xm-20261020T030140Z-dc2e7a43) its answer finished at 1,530 of 2,048 tokens,
 # but its verifier generated exactly 512 and its insights helper exactly 2,048
 # tokens, and neither reply was usable; Qwen and Mistral used 166-706 tokens
-# for the same calls. Thinking stays on (think=False and effort levels are
-# accepted by the runtime but untested for this model). The verifier gets the
+# for the same calls. Thinking stays on for its answer, verifier and
+# knowledge-base helper (think=False and effort levels are untested there);
+# only its document-insights calls send think=False, on their own role
+# evidence (NEMOTRON35_INSIGHTS_THINK_FALSE_EVIDENCE). The verifier gets the
 # answer's own allowance: its prompt holds a subset of the answer's evidence, so
 # it fits the 8,192-token context by the answer's bound. The helper gets the
 # registry maximum: its excerpt is at most 6,000 characters (the Q&A helper's
@@ -232,6 +240,10 @@ VERIFIER_NUM_PREDICT = 16
 # Background helpers (insight extraction, knowledge-base Q&A from an admin URL
 # import) ask for a short structured reply from a bounded excerpt.
 HELPER_NUM_PREDICT = 1200
+# The one helper purpose that may have its own evidenced policy
+# (RoleThinkEvidence). The knowledge-base Q&A import has none.
+INSIGHTS_PURPOSE = "insights"
+_ROLE_PURPOSES = (INSIGHTS_PURPOSE,)
 
 _MIN_NUM_CTX = 512
 _MAX_NUM_CTX = 32768
@@ -517,6 +529,87 @@ class RolePolicy:
 
 
 @dataclass(frozen=True)
+class RoleThinkEvidence:
+    """Operator-reported, bounded evidence that one helper ``purpose`` of one
+    experimental profile completed with exactly ``think`` and exactly
+    ``options``, on exactly this model (tag and digest) and runtime (key,
+    version and image).
+
+    It authorizes that think value for that purpose's calls and nothing else:
+    not the profile's answers, verifier or other helpers, and not other
+    settings, another model or another runtime build. A profile or snapshot
+    whose purpose policy it does not exactly cover is refused, and so is a
+    call whose options or observed identity differ from it.
+
+    What it does NOT record: answer quality, capacity, acceptance, or any
+    document beyond the ones the evidence names. It is not a Qualification
+    and leaves the profile in the experimental tier. The evidence was
+    supplied by the operator; offline tests do not reproduce inference.
+    """
+
+    purpose: str
+    profile_id: str
+    model_tag: str
+    digest: str
+    runtime_key: str
+    runtime_version: str
+    runtime_image_id: str
+    think: ThinkValue
+    options: GenerationOptions
+    evidence_ref: str
+
+    def __post_init__(self) -> None:
+        if self.purpose not in _ROLE_PURPOSES:
+            raise GenerationProfileError(f"purpose must be one of {_ROLE_PURPOSES}")
+        _require_match("profile_id", _PROFILE_ID_PATTERN, self.profile_id)
+        _require_match("model_tag", _MODEL_TAG_PATTERN, self.model_tag)
+        digest = normalize_digest(self.digest)
+        if digest is None:
+            raise GenerationProfileError("role evidence digest must be a sha256 manifest digest")
+        object.__setattr__(self, "digest", digest)
+        require_runtime_key("runtime_key", self.runtime_key)
+        if require_think_value("think", self.think) is None:
+            raise GenerationProfileError("role evidence must name the think value it tested")
+        if not isinstance(self.options, GenerationOptions):
+            raise GenerationProfileError("options must be GenerationOptions")
+        for name in ("runtime_version", "runtime_image_id", "evidence_ref"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise GenerationProfileError(f"role evidence {name} must be a non-empty string")
+
+
+def _require_insights_override(owner, num_ctx: int, runtime_smoke: Optional[RuntimeSmokeEvidence] = None) -> None:
+    """``owner`` -- a profile, or a snapshot built from one -- may carry an
+    insights policy only together with role evidence that exactly covers it
+    on the owner's own experimental model and runtime. Either one alone, or
+    evidence for anything else, is refused. ``runtime_smoke`` is the
+    profile's; a snapshot's runtime build was checked with its profile."""
+    policy, evidence = owner.insights_policy, owner.insights_evidence
+    if policy is None and evidence is None:
+        return
+    if not isinstance(policy, RolePolicy) or not isinstance(evidence, RoleThinkEvidence):
+        raise GenerationProfileError("an insights policy and its RoleThinkEvidence go together")
+    if owner.experimental is not True:
+        raise GenerationProfileError("insights role evidence belongs to an experimental profile")
+    checks = [
+        ("purpose", evidence.purpose == INSIGHTS_PURPOSE),
+        ("profile_id", evidence.profile_id == owner.profile_id),
+        ("model_tag", evidence.model_tag == owner.model_tag),
+        ("digest", evidence.digest == owner.expected_digest),
+        ("runtime_key", evidence.runtime_key == owner.runtime_key),
+        ("think", same_think(evidence.think, policy.think)),
+        ("num_ctx", evidence.options.num_ctx == num_ctx),
+        ("num_predict", evidence.options.num_predict == policy.num_predict),
+    ]
+    if runtime_smoke is not None:
+        checks.append(("runtime_version", evidence.runtime_version == runtime_smoke.runtime_version))
+        checks.append(("runtime_image_id", evidence.runtime_image_id == runtime_smoke.runtime_image_id))
+    mismatched = [name for name, ok in checks if not ok]
+    if mismatched:
+        raise GenerationProfileError("the insights evidence does not cover its " + ", ".join(mismatched))
+
+
+@dataclass(frozen=True)
 class ModelProfile:
     profile_id: str
     model_tag: str
@@ -553,6 +646,11 @@ class ModelProfile:
     max_concurrent_jobs: Optional[int] = None
     answer_job_budget_s: Optional[float] = None
     helper_job_budget_s: Optional[float] = None
+    # Document insights only: their own policy, accepted only with the role
+    # evidence that exactly covers it. None for both: insights use the helper
+    # policy, like the knowledge-base helper.
+    insights_policy: Optional[RolePolicy] = None
+    insights_evidence: Optional[RoleThinkEvidence] = None
 
     def __post_init__(self) -> None:
         _require_match("profile_id", _PROFILE_ID_PATTERN, self.profile_id)
@@ -609,6 +707,9 @@ class ModelProfile:
         object.__setattr__(self, "answer_job_budget_s", _require_job_budget("answer_job_budget_s", self.answer_job_budget_s))
         object.__setattr__(self, "helper_job_budget_s", _require_job_budget("helper_job_budget_s", self.helper_job_budget_s))
         object.__setattr__(self, "expected_digest", expected)
+        # Its own evidence, never this profile's think rules: those stay
+        # unchanged for the answer and every other role.
+        _require_insights_override(self, self.answer_options.num_ctx, self.runtime_smoke)
 
     def _require_sendable_think(self, name: str, value: object) -> None:
         require_think_value(name, value)
@@ -826,8 +927,9 @@ class AnswerGenerationSnapshot:
     selection values, which carry no shared epoch.
 
     ``verifier`` is derived from this same profile and identity when the
-    snapshot is built; ``helper_call`` derives a helper call from the values
-    held here. Neither consults the registry.
+    snapshot is built; ``helper_call`` and ``insights_call`` derive a helper
+    call from the values held here, including the profile's insights policy
+    and its role evidence. None of them consults the registry.
 
     ``runtime_key`` is the runtime every call of this job is sent to: the
     answer, its verifier calls and every helper call. It is bound here, with
@@ -852,6 +954,11 @@ class AnswerGenerationSnapshot:
     # None: the historical helper derivation (this snapshot's think setting
     # with HELPER_NUM_PREDICT).
     helper_policy: Optional[RolePolicy] = None
+    # The profile's insights policy and the role evidence covering it, bound
+    # with this job's model, identity and runtime. None for both: insights use
+    # the helper policy.
+    insights_policy: Optional[RolePolicy] = None
+    insights_evidence: Optional[RoleThinkEvidence] = None
 
     def __post_init__(self) -> None:
         if self.selection not in _SELECTIONS:
@@ -866,6 +973,7 @@ class AnswerGenerationSnapshot:
             raise GenerationProfileError("experimental must be a bool")
         if self.helper_policy is not None and not isinstance(self.helper_policy, RolePolicy):
             raise GenerationProfileError("helper_policy must be a RolePolicy")
+        _require_insights_override(self, self.options.num_ctx)
         if not isinstance(self.verifier, FixedModelCall) or (
             self.verifier.profile_id != self.profile_id
             or self.verifier.model_tag != self.model_tag
@@ -904,9 +1012,27 @@ class AnswerGenerationSnapshot:
         return RolePolicy(think=self.think, num_predict=HELPER_NUM_PREDICT)
 
     def helper_call(self, temperature: float) -> FixedModelCall:
-        """One bounded background helper call (insights, KB Q&A import) from
-        this snapshot's profile, identity and runtime."""
-        role = self.helper_role()
+        """One bounded background helper call (the KB Q&A import; insights
+        without an insights policy) from this snapshot's profile, identity
+        and runtime."""
+        return self._helper_role_call(self.helper_role(), temperature)
+
+    def insights_call(self, temperature: float) -> FixedModelCall:
+        """One document-insights helper call. Without an insights policy it
+        is exactly ``helper_call``. With one, the policy's think value and
+        output limit are sent only if its role evidence covers this very
+        call: the options it tested and the installed identity this job
+        observed. Otherwise the call is refused, never sent with another
+        think setting."""
+        if self.insights_policy is None:
+            return self.helper_call(temperature)
+        call = self._helper_role_call(self.insights_policy, temperature)
+        evidence = self.insights_evidence
+        if call.options != evidence.options or call.observed_digest != evidence.digest:
+            raise GenerationProfileError("the insights evidence does not cover this call's options or identity")
+        return call
+
+    def _helper_role_call(self, role: RolePolicy, temperature: float) -> FixedModelCall:
         return _role_call(
             profile_id=self.profile_id,
             model_tag=self.model_tag,
@@ -1105,6 +1231,34 @@ MISTRAL35_RUNTIME_SMOKE = RuntimeSmokeEvidence(
     ),
 )
 
+# Role evidence for Nemotron's document insights only. Its values are the
+# literal ones the diagnostic sent and observed, deliberately not this
+# module's pins: a changed digest, runtime build, context or output limit
+# refuses the profile instead of carrying this evidence along.
+NEMOTRON35_INSIGHTS_THINK_FALSE_EVIDENCE = RoleThinkEvidence(
+    purpose=INSIGHTS_PURPOSE,
+    profile_id=NEMOTRON35_EXPERIMENTAL,
+    model_tag="nemotron-3.5-lightning:30b",
+    digest="e6905fffe2e2d9bbe325a9a2d2e074e3bd32683721bc6dfba409dede2f17f4dc",
+    runtime_key=COMPAT_RUNTIME,
+    runtime_version="0.32.12",
+    runtime_image_id="sha256:96e3cc4e4155ef96d11578415f1ac36892d8bdc3a83c40623cc8ffdfbf4392ed",
+    think=False,
+    options=GenerationOptions(temperature=0.1, num_ctx=8192, num_predict=4096),
+    evidence_ref=(
+        "Operator-run bounded diagnostic pr58-prod-nemotron-diag-20261022T071320Z.tar.gz (sha256 "
+        "7246da7d235f18e17e37a0b89c993d10bbf315a794055e3bc7f54780fe35f3f8; tool 8de4a07d5befb16a) "
+        "on release fc985428, with the pinned model, image and runtime version above, GPUs 0, 1 and 3 "
+        "only: run VALID, decision THINK_FALSE. The deployed insights prompt on one 2,379-character "
+        "document (1,218 prompt tokens), each setting twice. C1/C2 (think=false, temperature 0.1, "
+        "num_ctx 8192, num_predict 4096) honoured think=false and stopped naturally after 336 and 332 "
+        "tokens, in 3.979 s and 4.066 s, with usable JSON (six facts each). Thinking on, at temperature "
+        "0.1 or 1.0, used 3,454-3,942 tokens and missed the predefined headroom. One document only: "
+        "not a quality, capacity or acceptance result. Record: "
+        "diagnostics/NEMOTRON_INSIGHTS_THINK_FALSE_20261022.md."
+    ),
+)
+
 EXPERIMENTAL_ANSWER_OPTIONS = GenerationOptions(
     temperature=ANSWER_TEMPERATURE,
     num_ctx=ANSWER_NUM_CTX,
@@ -1125,6 +1279,8 @@ def _experimental_profile(
     job_budget_s: Optional[float] = None,
     verifier_num_predict: int = EXPERIMENTAL_VERIFIER_NUM_PREDICT,
     helper_num_predict: int = EXPERIMENTAL_HELPER_NUM_PREDICT,
+    insights_policy: Optional[RolePolicy] = None,
+    insights_evidence: Optional[RoleThinkEvidence] = None,
 ) -> ModelProfile:
     return ModelProfile(
         profile_id=profile_id,
@@ -1146,6 +1302,8 @@ def _experimental_profile(
         max_concurrent_jobs=EXPERIMENTAL_MAX_CONCURRENT_JOBS,
         answer_job_budget_s=job_budget_s,
         helper_job_budget_s=job_budget_s,
+        insights_policy=insights_policy,
+        insights_evidence=insights_evidence,
     )
 
 
@@ -1174,6 +1332,8 @@ def experimental_profiles() -> Tuple[ModelProfile, ...]:
             helper_read_timeout_s=EXPERIMENTAL_HELPER_READ_TIMEOUT_S,
             verifier_num_predict=NEMOTRON35_VERIFIER_NUM_PREDICT,
             helper_num_predict=NEMOTRON35_HELPER_NUM_PREDICT,
+            insights_policy=RolePolicy(think=False, num_predict=NEMOTRON35_HELPER_NUM_PREDICT),
+            insights_evidence=NEMOTRON35_INSIGHTS_THINK_FALSE_EVIDENCE,
         ),
         _experimental_profile(
             profile_id=MISTRAL35_EXPERIMENTAL,
@@ -1284,6 +1444,8 @@ def _snapshot(
         runtime_key=profile.runtime_key,
         experimental=profile.experimental,
         helper_policy=profile.helper_policy,
+        insights_policy=profile.insights_policy,
+        insights_evidence=profile.insights_evidence,
     )
 
 

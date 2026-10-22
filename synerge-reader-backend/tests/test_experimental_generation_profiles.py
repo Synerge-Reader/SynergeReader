@@ -19,6 +19,10 @@ What these prove:
   own model and runtime, needs an observed identity, and sends only the
   validated think value -- arbitrary strings, numbers and client controls are
   refused;
+* Nemotron's document insights alone send think=false, and only with role
+  evidence that exactly covers that profile, purpose, model, runtime build,
+  call settings and the job's observed identity; missing or mismatched
+  evidence refuses, and every other role and profile is unchanged;
 * while an experimental profile is the shared selection the ledger admits one
   combined answer-or-helper job, applies that profile's budgets, and treats a
   failing policy resolver as one job at a time; Gemma's admission is
@@ -61,8 +65,10 @@ from generation_profiles import (  # noqa: E402
     PRIMARY_RUNTIME,
     QWEN38_DIGEST,
     QWEN38_EXPERIMENTAL,
+    NEMOTRON35_INSIGHTS_THINK_FALSE_EVIDENCE,
     ExperimentalProfileDisabledError,
     FixedModelCall,
+    GenerationOptions,
     GenerationProfileError,
     ModelIdentityMismatchError,
     ModelIdentityUnavailableError,
@@ -71,6 +77,7 @@ from generation_profiles import (  # noqa: E402
     ModelRuntimeUnavailableError,
     Qualification,
     RolePolicy,
+    RoleThinkEvidence,
     RuntimeSmokeEvidence,
     build_generate_payload,
     check_installed_identity,
@@ -145,8 +152,10 @@ def test_nemotron_has_its_own_finite_role_allowances_and_keeps_thinking_on():
     """The candidate check (xm-20261020T030140Z-dc2e7a43) saw Nemotron's
     verifier generate exactly 512 tokens and its insights helper exactly 2,048
     with no usable reply. Only those two allowances change: thinking stays on
-    for every role (the one value its smoke tested), and the context, answer
-    options, read timeouts and job budgets are the shared experimental ones."""
+    for the answer, verifier and helper policy (the one value its smoke
+    tested; document insights have their own evidenced policy, tested below),
+    and the context, answer options, read timeouts and job budgets are the
+    shared experimental ones."""
     nemotron = default_model_registry().get(NEMOTRON35_EXPERIMENTAL)
     assert nemotron.verifier_role() == RolePolicy(think=True, num_predict=2048)
     assert nemotron.helper_role() == RolePolicy(think=True, num_predict=4096)
@@ -401,6 +410,166 @@ def test_a_role_call_validates_its_runtime_key():
     for bad in ("", None, "http://compat:11434", "PRIMARY"):
         with pytest.raises(GenerationProfileError):
             dataclasses.replace(call, runtime_key=bad)
+
+
+# --- Nemotron's document insights: think=false on its own role evidence ------------------
+#
+# Diagnostic pr58-prod-nemotron-diag-20261022T071320Z (VALID, THINK_FALSE): with thinking on, its
+# insights helper used 3,454-3,942 of 4,096 tokens on one document; with think=false (C1, C2) it
+# stopped after 336 and 332 tokens with usable JSON. Only that purpose changes.
+
+# What C1 and C2 sent, from their call records (the prompt left out).
+_C_REQUEST = {"keep_alive": "5m", "model": "nemotron-3.5-lightning:30b",
+              "options": {"num_ctx": 8192, "num_predict": 4096, "temperature": 0.1},
+              "stream": False, "think": False}
+
+
+def _nemotron():
+    return default_model_registry().get(NEMOTRON35_EXPERIMENTAL)
+
+
+def test_nemotron_insights_send_exactly_the_evidenced_request_from_the_captured_job():
+    snapshot = _snapshot(_enabled(), NEMOTRON35_EXPERIMENTAL, epoch=7)
+    call = snapshot.insights_call(0.1)
+    payload = call.ollama_payload("PROMPT", stream=False)
+    assert payload.pop("prompt") == "PROMPT"
+    assert payload == _C_REQUEST
+    assert (call.profile_id, call.runtime_key, call.read_timeout_s) == (NEMOTRON35_EXPERIMENTAL, COMPAT_RUNTIME, 300.0)
+    assert call.expected_digest == call.observed_digest == NEMOTRON35_DIGEST, "the identity this job observed"
+    assert (snapshot.selection, snapshot.selection_epoch) == ("shared_active", 7)
+
+
+def test_only_nemotron_insights_change_and_nemotron_stays_experimental():
+    nemotron = _nemotron()
+    assert nemotron.insights_policy == RolePolicy(think=False, num_predict=4096)
+    assert nemotron.insights_evidence is NEMOTRON35_INSIGHTS_THINK_FALSE_EVIDENCE
+    snapshot = _snapshot(_enabled(), NEMOTRON35_EXPERIMENTAL)
+    kb = snapshot.helper_call(0.2)
+    assert snapshot.ollama_payload("q")["think"] is True, "the answer keeps thinking on"
+    assert (snapshot.verifier.think, snapshot.verifier.options.num_predict) == (True, 2048)
+    assert (kb.think, kb.options.num_predict, kb.read_timeout_s) == (True, 4096, 300.0), "the KB helper too"
+    # No qualification, never selectable as qualified; the runtime smoke record is untouched.
+    assert nemotron.experimental and nemotron.qualification is None and nemotron.selectable is False
+    assert nemotron.think is True and nemotron.runtime_smoke.tested_think == (True,)
+    assert "think=true" in nemotron.runtime_smoke.evidence_ref
+    evidence = nemotron.insights_evidence
+    for fact in ("7246da7d235f18e17e37a0b89c993d10bbf315a794055e3bc7f54780fe35f3f8", "VALID", "THINK_FALSE",
+                 "336 and 332", "One document only", "not a quality, capacity or acceptance result"):
+        assert fact in evidence.evidence_ref
+    # The evidence names a reviewable record kept in the repository.
+    record = "diagnostics/NEMOTRON_INSIGHTS_THINK_FALSE_20261022.md"
+    assert record in evidence.evidence_ref
+    assert os.path.isfile(os.path.join(os.path.dirname(__file__), "..", *record.split("/")))
+
+
+@pytest.mark.parametrize("profile_id", [LLAMA_CONTROL, GEMMA_CANDIDATE, QWEN38_EXPERIMENTAL, MISTRAL35_EXPERIMENTAL])
+def test_every_other_profiles_insights_call_is_its_helper_call(profile_id):
+    registry = _enabled()
+    profile = registry.get(profile_id)
+    assert profile.insights_policy is None and profile.insights_evidence is None
+    observed = profile.expected_digest if profile.requires_identity_check else None
+    snapshot = shared_generation_snapshot(profile, epoch=2, observed_digest=observed, registry=registry)
+    for temperature in (0.1, 0.2):
+        assert snapshot.insights_call(temperature) == snapshot.helper_call(temperature)
+
+
+def test_think_false_for_insights_needs_its_role_evidence_and_relaxes_nothing_else():
+    nemotron = _nemotron()
+    with pytest.raises(GenerationProfileError, match="go together"):
+        dataclasses.replace(nemotron, insights_evidence=None)
+    with pytest.raises(GenerationProfileError, match="go together"):
+        dataclasses.replace(nemotron, insights_policy=None)
+    # The answer, verifier and helper keep the profile's own think rules.
+    for changes in (dict(think=False), dict(verifier_policy=RolePolicy(think=False, num_predict=2048)),
+                    dict(helper_policy=RolePolicy(think=False, num_predict=4096))):
+        with pytest.raises(GenerationProfileError, match="think: false may only be sent"):
+            dataclasses.replace(nemotron, **changes)
+    # No other profile can borrow it.
+    override = dict(insights_policy=nemotron.insights_policy, insights_evidence=nemotron.insights_evidence)
+    for profile_id in (QWEN38_EXPERIMENTAL, MISTRAL35_EXPERIMENTAL):
+        with pytest.raises(GenerationProfileError, match="does not cover its profile_id, model_tag, digest"):
+            dataclasses.replace(default_model_registry().get(profile_id), **override)
+    for profile_id in (LLAMA_CONTROL, GEMMA_CANDIDATE):
+        with pytest.raises(GenerationProfileError, match="belongs to an experimental profile"):
+            dataclasses.replace(default_model_registry().get(profile_id), **override)
+
+
+def test_role_evidence_is_validated():
+    evidence = NEMOTRON35_INSIGHTS_THINK_FALSE_EVIDENCE
+    for changes in (dict(purpose="kb_qa"), dict(purpose="answer"), dict(think=None), dict(think="max"),
+                    dict(digest="e6905fff"), dict(model_tag="nemotron"), dict(runtime_key="http://compat:11434"),
+                    dict(options={"temperature": 0.1}), dict(runtime_version=" "), dict(evidence_ref="")):
+        with pytest.raises(GenerationProfileError):
+            dataclasses.replace(evidence, **changes)
+    assert isinstance(evidence, RoleThinkEvidence) and evidence.digest == NEMOTRON35_DIGEST
+
+
+@pytest.mark.parametrize(
+    "changes, uncovered",
+    [
+        (dict(profile_id=QWEN38_EXPERIMENTAL), "profile_id"),
+        (dict(model_tag="qwen3.8:27b"), "model_tag"),
+        (dict(digest=QWEN38_DIGEST), "digest"),
+        (dict(runtime_key=PRIMARY_RUNTIME), "runtime_key"),
+        (dict(runtime_version="0.32.13"), "runtime_version"),
+        (dict(runtime_image_id="sha256:" + "ab" * 32), "runtime_image_id"),
+        (dict(think=True), "think"),
+        (dict(think="high"), "think"),
+        (dict(options=GenerationOptions(temperature=0.1, num_ctx=4096, num_predict=2048)), "num_ctx"),
+        (dict(options=GenerationOptions(temperature=0.1, num_ctx=8192, num_predict=2048)), "num_predict"),
+    ],
+)
+def test_mismatched_insights_evidence_refuses_the_profile(changes, uncovered):
+    nemotron = _nemotron()
+    evidence = dataclasses.replace(nemotron.insights_evidence, **changes)
+    with pytest.raises(GenerationProfileError, match=f"does not cover its .*{uncovered}"):
+        dataclasses.replace(nemotron, insights_evidence=evidence)
+
+
+@pytest.mark.parametrize(
+    "changes, uncovered",
+    [
+        (dict(expected_digest=QWEN38_DIGEST), "digest"),
+        (dict(model_tag="nemotron-3.5-lightning:30b-q8"), "model_tag"),
+        (dict(runtime_key=PRIMARY_RUNTIME), "runtime_key"),
+        (dict(answer_options=GenerationOptions(temperature=0.2, num_ctx=16384, num_predict=2048)), "num_ctx"),
+        (dict(insights_policy=RolePolicy(think=False, num_predict=2048)), "num_predict"),
+        (dict(insights_policy=RolePolicy(think=True, num_predict=4096)), "think"),
+    ],
+)
+def test_a_profile_its_insights_evidence_no_longer_covers_is_refused(changes, uncovered):
+    with pytest.raises(GenerationProfileError, match=f"does not cover its .*{uncovered}"):
+        dataclasses.replace(_nemotron(), **changes)
+
+
+@pytest.mark.parametrize("build", [dict(runtime_version="0.33.0"), dict(runtime_image_id="sha256:" + "cd" * 32)])
+def test_insights_evidence_from_another_runtime_build_is_refused(build):
+    nemotron = _nemotron()
+    smoke = dataclasses.replace(nemotron.runtime_smoke, **build)
+    with pytest.raises(GenerationProfileError, match=f"does not cover its .*{next(iter(build))}"):
+        dataclasses.replace(nemotron, runtime_smoke=smoke)
+
+
+def test_a_snapshot_carries_the_insights_policy_only_with_evidence_that_covers_it():
+    snapshot = _snapshot(_enabled(), NEMOTRON35_EXPERIMENTAL)
+    assert snapshot.insights_policy == RolePolicy(think=False, num_predict=4096)
+    assert snapshot.insights_evidence is NEMOTRON35_INSIGHTS_THINK_FALSE_EVIDENCE
+    for changes in (dict(insights_evidence=None), dict(insights_policy=None), dict(experimental=False),
+                    dict(insights_evidence=dataclasses.replace(snapshot.insights_evidence, digest=QWEN38_DIGEST)),
+                    dict(insights_policy=RolePolicy(think=False, num_predict=2048))):
+        with pytest.raises(GenerationProfileError):
+            dataclasses.replace(snapshot, **changes)
+
+
+def test_an_insights_call_outside_its_evidence_is_refused_never_sent_another_way():
+    snapshot = _snapshot(_enabled(), NEMOTRON35_EXPERIMENTAL)
+    for temperature in (0.0, 0.2, 1.0):
+        with pytest.raises(GenerationProfileError, match="options or identity"):
+            snapshot.insights_call(temperature)
+    for observed in (None, QWEN38_DIGEST):
+        with pytest.raises(GenerationProfileError, match="options or identity"):
+            dataclasses.replace(snapshot, observed_digest=observed).insights_call(0.1)
+    assert snapshot.helper_call(0.2).think is True, "the KB helper is unaffected"
 
 
 # --- admission while an experimental profile is the shared selection --------------------

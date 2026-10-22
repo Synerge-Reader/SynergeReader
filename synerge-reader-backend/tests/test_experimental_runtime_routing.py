@@ -20,6 +20,9 @@ What these prove:
 * the tested think settings are sent, thinking text never reaches the
   stream, the saved answer or its provenance, and a thinking-only or
   length-limited reply is not an answer;
+* Nemotron's document-insights calls alone send think=false, exactly as its
+  role evidence recorded, from the job's captured snapshot even after a
+  switch; outside that evidence they are refused before any call;
 * provenance version 4 records the runtime key (never a URL), the experimental
   flag and the think value that was sent;
 * a restart with the experimental tier off (or without its endpoint) keeps
@@ -642,6 +645,9 @@ def test_a_helper_on_an_unreachable_compatibility_runtime_sends_nothing(monkeypa
 # There its verifier generated exactly 512 tokens and its insights helper exactly 2,048, and
 # neither reply was usable. Only those two allowances change; strict completion and parsing,
 # one call per claim or excerpt, and the refusal to store an unfinished reply all stay.
+#
+# Its document-insights calls then send think=false on their own role evidence (diagnostic
+# pr58-prod-nemotron-diag-20261022T071320Z, C1/C2); its answer, verifier and KB helper keep thinking on.
 
 _HELPER_TEXT = "The lease between Alice and Bob runs for two years from the first of January. " * 10
 _NEMOTRON_ID = NEMOTRON35_EXPERIMENTAL
@@ -719,7 +725,7 @@ def test_a_finished_but_malformed_nemotron_verdict_stays_unverified(monkeypatch,
     assert f" response_chars={len(reply)}" in line and reply not in line
 
 
-def test_nemotron_helpers_get_its_own_allowance_with_thinking_on(monkeypatch, env, transport):
+def test_nemotron_insights_send_think_false_and_its_kb_helper_keeps_thinking_on(monkeypatch, env, transport):
     main, client, db = env
     _install(monkeypatch, main, _NEMOTRON_ID)
     insights = _InsightsDB()
@@ -731,10 +737,15 @@ def test_nemotron_helpers_get_its_own_allowance_with_thinking_on(monkeypatch, en
     helper_posts = transport.generation_posts()
     assert len(helper_posts) == 3, "one insights call and one call per Q&A excerpt"
     for post in helper_posts:
-        assert post["payload"]["model"] == "nemotron-3.5-lightning:30b" and post["payload"]["think"] is True
-        assert post["payload"]["options"]["num_predict"] == 4096
-        assert post["payload"]["options"]["num_ctx"] == 8192
+        assert post["base"] == COMPAT_URL and post["stream"] is False
+        assert post["payload"]["model"] == "nemotron-3.5-lightning:30b"
         assert post["timeout"][1] <= 300.0, "the helper read timeout is unchanged"
+    insights_post, *qa_posts = helper_posts
+    assert insights_post["payload"]["think"] is False, "the evidenced no-thinking insights call"
+    assert insights_post["payload"]["options"] == {"temperature": 0.1, "num_ctx": 8192, "num_predict": 4096}
+    for post in qa_posts:
+        assert post["payload"]["think"] is True, "the KB helper keeps its policy"
+        assert post["payload"]["options"] == {"temperature": 0.2, "num_ctx": 8192, "num_predict": 4096}
     assert len(insights.writes) == 1 and pairs
 
 
@@ -764,7 +775,9 @@ def test_an_unusable_nemotron_insights_reply_is_never_stored_or_retried(monkeypa
     main._extract_document_insights(10, "alice-lease.txt", _HELPER_TEXT)
 
     assert insights.writes == [], "nothing is stored"
-    assert len(transport.generation_posts()) == 1, "one call: no automatic retry"
+    posts = transport.generation_posts()
+    assert len(posts) == 1, "one call: no automatic retry"
+    assert posts[0]["payload"]["think"] is False, "the evidenced no-thinking call is judged just as strictly"
     printed = capsys.readouterr().out
     [line] = _completion_lines(printed, "insights")
     assert f" profile={_NEMOTRON_ID} " in line and " num_predict=4096 " in line
@@ -817,6 +830,58 @@ def test_a_failed_nemotron_insights_write_stores_nothing_and_is_logged(monkeypat
     assert len(transport.generation_posts()) == 1
 
 
+def test_nemotron_insights_outside_their_evidence_are_refused_before_any_call(monkeypatch, env, transport, capsys):
+    main, client, db = env
+    ledger, intents = _install(monkeypatch, main, _NEMOTRON_ID)
+    insights = _InsightsDB()
+    monkeypatch.setattr(main, "connect_to_postgres", insights.connect)
+    monkeypatch.setattr(main, "_INSIGHTS_HELPER_TEMPERATURE", 0.2)  # not the evidenced 0.1
+    capsys.readouterr()
+
+    main._extract_document_insights(10, "alice-lease.txt", _HELPER_TEXT)
+
+    assert transport.generation_posts() == [] and insights.writes == []
+    assert [event for event in intents.events if event[0] == "dispatch"] == [], "nothing was dispatched"
+    assert "[Insights] Helper call refused by its profile policy; insight extraction skipped" \
+        in capsys.readouterr().out
+    assert ledger.snapshot().unresolved_helpers == 0
+    assert main._generate_qa_pairs_from_text(_HELPER_TEXT * 3, "alice-lease.txt"), "the KB helper is unaffected"
+
+
+def test_a_later_switch_cannot_change_a_captured_nemotron_insights_job(monkeypatch, env, transport):
+    main, client, db = env
+    ledger, intents = _install(monkeypatch, main, _NEMOTRON_ID, epoch=3)
+    insights = _InsightsDB()
+    monkeypatch.setattr(main, "connect_to_postgres", insights.connect)
+    ticket = ledger.try_acquire_helper()
+    captured = main._helper_generation(ticket)
+
+    assert ledger.pause("switch-under-test") is not None
+    assert ledger.resume("switch-under-test", SharedSelection(GEMMA_CANDIDATE, 4))
+    try:
+        main._extract_insights_for_ticket(10, "alice-lease.txt", _HELPER_TEXT, ticket)
+    finally:
+        ledger.release(ticket)
+
+    assert ticket.snapshot is captured
+    assert (captured.profile_id, captured.selection_epoch, captured.observed_digest) == (
+        _NEMOTRON_ID, 3, NEMOTRON35_DIGEST)
+    [post] = transport.generation_posts()
+    assert post["base"] == COMPAT_URL and post["payload"]["model"] == "nemotron-3.5-lightning:30b"
+    assert post["payload"]["think"] is False
+    assert post["payload"]["options"] == {"temperature": 0.1, "num_ctx": 8192, "num_predict": 4096}
+    assert [event for event in intents.events if event[0] == "dispatch"] == [
+        ("dispatch", "helper", _NEMOTRON_ID, "nemotron-3.5-lightning:30b")]
+    assert len(insights.writes) == 1
+
+    # A job admitted after the switch uses the new selection and its own helper policy.
+    main._extract_document_insights(10, "alice-lease.txt", _HELPER_TEXT)
+    _, gemma = transport.generation_posts()
+    assert gemma["base"] == PRIMARY_URL and gemma["payload"]["model"] == "gemma4:31b"
+    assert gemma["payload"]["think"] is False
+    assert gemma["payload"]["options"] == {"temperature": 0.1, "num_ctx": 8192, "num_predict": 1200}
+
+
 def test_a_nemotron_qa_reply_cut_off_at_its_allowance_gives_no_pairs(monkeypatch, env, transport, capsys):
     main, client, db = env
     _install(monkeypatch, main, _NEMOTRON_ID)
@@ -841,6 +906,7 @@ def test_qwen_and_mistral_role_calls_keep_the_shared_allowances(monkeypatch, env
     main._extract_document_insights(10, "alice-lease.txt", _HELPER_TEXT)
     [helper] = transport.generation_posts()
     assert helper["payload"]["options"]["num_predict"] == 2048
+    assert helper["payload"]["think"] == {QWEN38_EXPERIMENTAL: True, MISTRAL35_EXPERIMENTAL: "high"}[profile_id]
 
     monkeypatch.setattr(main, "connect_to_postgres", db.connect)
     assert _events(_ask(client))[-1] == {"type": "done", "ok": True}
