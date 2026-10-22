@@ -67,6 +67,7 @@ from generation_profiles import (
     PRIMARY_RUNTIME,
     AnswerGenerationSnapshot,
     ExperimentalProfileDisabledError,
+    GenerationProfileError,
     ModelIdentityMismatchError,
     ModelIdentityUnavailableError,
     ModelRuntimeUnavailableError,
@@ -990,7 +991,13 @@ def _extract_insights_for_ticket(doc_id: int, filename: str, text: str, recorder
         print("[Insights] Ollama not reachable; insight extraction skipped")
         return
 
-    helper = generation.helper_call(_INSIGHTS_HELPER_TEMPERATURE)
+    try:
+        # Insights' own evidenced policy where the job's profile has one,
+        # otherwise the helper policy; refused before anything is dispatched.
+        helper = generation.insights_call(_INSIGHTS_HELPER_TEMPERATURE)
+    except GenerationProfileError:
+        print("[Insights] Helper call refused by its profile policy; insight extraction skipped")
+        return
 
     excerpt = text[:6000].strip()
     prompt = f"""Read the legal document excerpt below and respond with ONLY a JSON object — no markdown, no commentary, no code fences. Use exactly this shape:
